@@ -5,7 +5,7 @@ No Qt imports — keep this module independently testable.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import h5py
@@ -121,6 +121,10 @@ class MatchedStructure:
     l: int
     probability: float
     peaks: PeakTable
+    # Indices into the frame's ``fitted_peaks`` table that produced ``peaks``.
+    # Kept so matched overlays can be re-derived after an in-memory edit of a
+    # fitted peak without a second file read.
+    peak_list: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=int))
 
     @property
     def unique_id(self) -> str:
@@ -199,6 +203,127 @@ def load_matched_peaks(
                         l=int(arr["l"][i]),
                         probability=float(arr["probability"][i]),
                         peaks=subset,
+                        peak_list=idx,
                     )
                 )
     return out
+
+
+def add_fitted_peak_row(
+    file_path: Path,
+    entry: str,
+    frame: int,
+    *,
+    angle: float,
+    angle_width: float,
+    radius: float,
+    radius_width: float,
+    amplitude: float,
+    is_ring: bool = False,
+    theta: float = 0.0,
+    score: float = 0.0,
+    A: float = 0.0,
+    B: float = 0.0,
+    C: float = 0.0,
+    is_cut_qz: bool = False,
+    is_cut_qxy: bool = False,
+    visibility: int = 0,
+) -> int:
+    """Append a new row to the frame's ``fitted_peaks`` dataset.
+
+    Mirrors mlgidbase's row layout (see pygid.datasaver pygid_results_dtype):
+    polar geometry + amplitude + 2D-Gaussian shape params (A, B, C, theta)
+    + flags + an auto-assigned id. q_xy/q_z are recomputed from polar.
+
+    Caller-supplied fields drive only the meaningful values; the 2D-shape
+    params (A/B/C/theta) and score default to zero because a 1D-fit-derived
+    row carries no 2D context. Returns the new peak's ``id``.
+    """
+    frame_key = FRAME_KEY_FMT.format(frame)
+    with h5py.File(file_path, "r+") as f:
+        ds_path = f"{entry}/{ANALYSIS_REL}/{frame_key}/fitted_peaks"
+        if ds_path not in f:
+            raise KeyError(
+                f"fitted_peaks dataset missing at {ds_path} — run fitting "
+                "at least once on this frame before adding manual fitted rows."
+            )
+        ds = f[ds_path]
+        arr = ds[()]
+        new_id = int(arr["id"].max() + 1) if len(arr) > 0 else 0
+        # Build the new row by name to stay schema-resilient if the dtype
+        # ever gains/loses a field.
+        new_row = np.zeros(1, dtype=arr.dtype)
+        fields = {
+            "amplitude": amplitude,
+            "angle": angle,
+            "angle_width": angle_width,
+            "radius": radius,
+            "radius_width": radius_width,
+            "q_z": radius * np.sin(np.deg2rad(angle)),
+            "q_xy": radius * np.cos(np.deg2rad(angle)),
+            "theta": theta,
+            "score": score,
+            "A": A,
+            "B": B,
+            "C": C,
+            "is_ring": is_ring,
+            "is_cut_qz": is_cut_qz,
+            "is_cut_qxy": is_cut_qxy,
+            "visibility": visibility,
+            "id": new_id,
+        }
+        for name, value in fields.items():
+            if name in arr.dtype.names:
+                new_row[name] = value
+        new_arr = np.concatenate([arr, new_row])
+        # pygid creates fixed-shape datasets (maxshape == shape), so resize
+        # is unavailable — delete and recreate, preserving any attrs.
+        attrs = dict(ds.attrs)
+        del f[ds_path]
+        new_ds = f.create_dataset(ds_path, data=new_arr)
+        for k, v in attrs.items():
+            new_ds.attrs[k] = v
+        return new_id
+
+
+def update_peak_row(
+    file_path: Path,
+    entry: str,
+    frame: int,
+    kind: str,
+    peak_id: int,
+    *,
+    angle: float,
+    angle_width: float,
+    radius: float,
+    radius_width: float,
+) -> None:
+    """Mutate one row of detected_peaks/fitted_peaks in place, keyed by `id`.
+
+    The id field is unique within a frame (mlgidbase reindexes on delete), so
+    finding a row by id is unambiguous. Polar fields are written verbatim;
+    q_xy/q_z are recomputed from the new (radius, angle).
+
+    Raises KeyError when no row with ``peak_id`` exists — the caller should
+    treat this as "the file moved on under us" and clear the undo stack.
+    """
+    if kind not in ("detected", "fitted"):
+        raise ValueError(f"update_peak_row only handles detected/fitted, not {kind!r}")
+    ds_name = f"{kind}_peaks"
+    frame_key = FRAME_KEY_FMT.format(frame)
+    with h5py.File(file_path, "r+") as f:
+        ds = f[f"{entry}/{ANALYSIS_REL}/{frame_key}/{ds_name}"]
+        arr = ds[()]
+        matches = np.where(arr["id"] == peak_id)[0]
+        if matches.size == 0:
+            raise KeyError(
+                f"peak_id={peak_id} not found in {entry}/{frame_key}/{ds_name}"
+            )
+        idx = int(matches[0])
+        arr["radius"][idx] = radius
+        arr["radius_width"][idx] = radius_width
+        arr["angle"][idx] = angle
+        arr["angle_width"][idx] = angle_width
+        arr["q_xy"][idx] = radius * np.cos(np.deg2rad(angle))
+        arr["q_z"][idx] = radius * np.sin(np.deg2rad(angle))
+        ds[...] = arr

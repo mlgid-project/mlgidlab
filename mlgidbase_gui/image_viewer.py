@@ -6,6 +6,7 @@ import os
 os.environ.setdefault("PYQTGRAPH_QT_LIB", "PySide6")
 
 from dataclasses import dataclass
+from typing import Protocol
 
 import numpy as np
 import pyqtgraph as pg
@@ -49,6 +50,17 @@ OVERLAY_STYLE: dict[str, dict] = {
 }
 
 SELECTION_STYLE = {"color": "#ffffff", "style": Qt.PenStyle.SolidLine, "width": 2.5}
+
+# Faint preview of the would-be fitted_peaks box for the currently selected
+# manual peak. Same hue as the fitted overlay so the user reads the
+# relationship at a glance, but dashed + reduced opacity so it's clearly a
+# preview rather than a stored peak.
+FITTED_PREVIEW_STYLE = {
+    "color": OVERLAY_STYLE["fitted"]["color"],
+    "style": Qt.PenStyle.DashLine,
+    "width": 1.4,
+}
+FITTED_PREVIEW_OPACITY = 0.45
 
 # Distinct, dark-mode-legible palette for matched structures. Cycled by
 # insertion order so multiple structures in one frame are easy to tell apart.
@@ -105,6 +117,120 @@ class ManualPeak:
     angle_width: float
     is_ring: bool = False
     temp_id: int = 0
+
+
+@dataclass
+class SelectedPeak:
+    """Snapshot of the currently-selected peak, regardless of source.
+
+    Carries enough geometry for the ROI and parameter panel without forcing
+    callers to know which overlay holds the underlying data. ``manual_ref``
+    is set only when ``kind == "manual"`` and is the same instance held by
+    ``_manual_peaks`` — mutating it propagates to the manual overlay.
+    """
+
+    kind: str  # "manual" | "detected" | "fitted" | "matched"
+    frame: int
+    peak_id: int
+    radius: float
+    angle: float
+    radius_width: float
+    angle_width: float
+    is_ring: bool = False
+    structure_uid: str | None = None
+    manual_ref: ManualPeak | None = None
+
+    @classmethod
+    def from_manual(cls, peak: ManualPeak, frame: int) -> SelectedPeak:
+        return cls(
+            kind="manual",
+            frame=frame,
+            peak_id=peak.temp_id,
+            radius=peak.radius,
+            angle=peak.angle,
+            radius_width=peak.radius_width,
+            angle_width=peak.angle_width,
+            is_ring=peak.is_ring,
+            manual_ref=peak,
+        )
+
+    def polar_tuple(self) -> tuple[float, float, float, float]:
+        return (self.radius, self.angle, self.radius_width, self.angle_width)
+
+
+# -- Undo/redo actions -----------------------------------------------------
+#
+# Each action carries the data needed to flip the viewer + (for FileGeom)
+# the file. ``undo`` and ``redo`` mirror each other so we can move back and
+# forth on the stack without special-casing.
+
+
+class _Action(Protocol):
+    def undo(self, viewer: "GIWAXSImageViewer") -> None: ...
+    def redo(self, viewer: "GIWAXSImageViewer") -> None: ...
+
+
+@dataclass
+class ManualAddAction:
+    frame: int
+    peak: ManualPeak
+
+    def undo(self, viewer: "GIWAXSImageViewer") -> None:
+        viewer._undoable_remove_manual(self.frame, self.peak)
+
+    def redo(self, viewer: "GIWAXSImageViewer") -> None:
+        viewer._undoable_add_manual(self.frame, self.peak)
+
+
+@dataclass
+class ManualRemoveAction:
+    frame: int
+    peak: ManualPeak
+
+    def undo(self, viewer: "GIWAXSImageViewer") -> None:
+        viewer._undoable_add_manual(self.frame, self.peak)
+
+    def redo(self, viewer: "GIWAXSImageViewer") -> None:
+        viewer._undoable_remove_manual(self.frame, self.peak)
+
+
+@dataclass
+class ManualGeomAction:
+    frame: int
+    peak: ManualPeak
+    before: tuple[float, float, float, float]  # (r, a, dr, da)
+    after: tuple[float, float, float, float]
+
+    def undo(self, viewer: "GIWAXSImageViewer") -> None:
+        viewer._apply_manual_geom(self.frame, self.peak, self.before)
+
+    def redo(self, viewer: "GIWAXSImageViewer") -> None:
+        viewer._apply_manual_geom(self.frame, self.peak, self.after)
+
+
+@dataclass
+class FileGeomAction:
+    frame: int
+    kind: str  # "detected" | "fitted"
+    peak_id: int
+    before: tuple[float, float, float, float]
+    after: tuple[float, float, float, float]
+
+    def undo(self, viewer: "GIWAXSImageViewer") -> None:
+        viewer._apply_file_geom(self.frame, self.kind, self.peak_id, self.before)
+
+    def redo(self, viewer: "GIWAXSImageViewer") -> None:
+        viewer._apply_file_geom(self.frame, self.kind, self.peak_id, self.after)
+
+
+def _action_targets_manual(action: _Action, peak: ManualPeak) -> bool:
+    """True when ``action`` references the ManualPeak ``peak`` by identity.
+
+    Used by ``commit_manual_peak`` to scrub any stale stack entries that
+    point at a peak we just persisted to the file.
+    """
+    target = getattr(action, "peak", None)
+    return target is peak
 
 
 def _peaks_from_manual(manual: list[ManualPeak]) -> PeakTable:
@@ -277,6 +403,26 @@ class _PeakShapeItem(pg.GraphicsObject):
         painter.drawPath(self._path)
 
 
+def _polar_box_contains(peak: ManualPeak, x: float, y: float) -> bool:
+    """Hit-test the polar bounding box of a ManualPeak."""
+    r_lo = peak.radius - peak.radius_width / 2.0
+    r_hi = peak.radius + peak.radius_width / 2.0
+    a_lo = peak.angle - peak.angle_width / 2.0
+    a_hi = peak.angle + peak.angle_width / 2.0
+    return r_lo <= x <= r_hi and a_lo <= y <= a_hi
+
+
+def _polar_table_row_contains(table: PeakTable, i: int, x: float, y: float) -> bool:
+    """Hit-test row ``i`` of a PeakTable in polar coordinates."""
+    r = float(table.radius[i])
+    dr = float(table.radius_width[i])
+    a = float(table.angle[i])
+    da = float(table.angle_width[i])
+    r_lo, r_hi = r - dr / 2.0, r + dr / 2.0
+    a_lo, a_hi = a - da / 2.0, a + da / 2.0
+    return r_lo <= x <= r_hi and a_lo <= y <= a_hi
+
+
 def _clip_angle(a_deg: float, da_deg: float) -> tuple[float, float] | None:
     """Clip a polar angular box to the viewer's visible range.
 
@@ -333,8 +479,14 @@ class GIWAXSImageViewer(QWidget):
     modeChanged = Signal(str)
     manualPeakAdded = Signal(int, object)     # frame, ManualPeak
     manualPeakRemoved = Signal(int, object)   # frame, ManualPeak
-    selectionChanged = Signal(object)         # ManualPeak | None
-    peakGeometryChanged = Signal(object)      # ManualPeak whose r/dr/a/da changed
+    selectionChanged = Signal(object)         # SelectedPeak | None
+    peakGeometryChanged = Signal(object)      # SelectedPeak whose r/dr/a/da changed
+    # Emitted on drag-end for non-manual peaks: (frame, kind, peak_id,
+    # polar_kwargs). MainWindow drives the actual h5py mutation since it
+    # owns the silx tree handle that needs releasing first.
+    peakRowWriteRequested = Signal(int, str, int, dict)
+    # Emitted when the user presses Delete on a non-manual peak.
+    deletePeakRequested = Signal(object)      # SelectedPeak
     # Emitted whenever the *current* frame's matched-structure list might be
     # different from what the UI showed last (frame change, fresh load,
     # re-render after pipeline run). Args: (frame, list[MatchedStructure]).
@@ -384,11 +536,14 @@ class GIWAXSImageViewer(QWidget):
         self._fitted = _PeakShapeItem(**OVERLAY_STYLE["fitted"])
         self._manual = _PeakShapeItem(**OVERLAY_STYLE["manual"])
         self._selection = _PeakShapeItem(**SELECTION_STYLE)
+        self._fitted_preview = _PeakShapeItem(**FITTED_PREVIEW_STYLE)
+        self._fitted_preview.setOpacity(FITTED_PREVIEW_OPACITY)
         vb = self._plot.getViewBox()
         vb.addItem(self._detected, ignoreBounds=True)
         vb.addItem(self._fitted, ignoreBounds=True)
         vb.addItem(self._manual, ignoreBounds=True)
         vb.addItem(self._selection, ignoreBounds=True)
+        vb.addItem(self._fitted_preview, ignoreBounds=True)
 
         self._preview_item = pg.QtWidgets.QGraphicsRectItem()
         preview_pen = pg.mkPen(QColor("#ffeb3b"), width=1.0)
@@ -434,10 +589,22 @@ class GIWAXSImageViewer(QWidget):
         self._stack: EntryStack | None = None
         self._polar_cache: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
         self._next_manual_id = -1  # negative IDs distinguish manual from detected
-        self._selected: ManualPeak | None = None
+        self._selected: SelectedPeak | None = None
         self._roi_item: pg.ROI | None = None
-        # Undo stack of (action, peak, frame). `action` is "add" or "remove".
-        self._undo_stack: list[tuple[str, ManualPeak, int]] = []
+        # Stacks of `_Action` objects. Pushing to undo clears redo. ROI drags
+        # populate _roi_drag_before on sigRegionChangeStarted and consume it
+        # on sigRegionChangeFinished — partial state never lands on the stack.
+        self._undo_stack: list[_Action] = []
+        self._redo_stack: list[_Action] = []
+        self._roi_drag_before: tuple[float, float, float, float] | None = None
+        # Set during a pipeline run so we don't allow concurrent ROI edits or
+        # Delete keypresses while mlgidbase has the file open for writes.
+        self._busy: bool = False
+
+        # Geometry of the fitted-preview box for the current manual selection
+        # (radius_center, fwhm_radial, angle_center, fwhm_angular). Cleared
+        # whenever the selection isn't a manual peak with valid 1D fits.
+        self._fitted_preview_geom: tuple[float, float, float, float] | None = None
 
         self._view.sigTimeChanged.connect(self._on_time_changed)
 
@@ -461,10 +628,14 @@ class GIWAXSImageViewer(QWidget):
         item = self._overlay_item(kind)
         if item is not None:
             item.setVisible(visible)
-        if kind == "manual" and not visible:
-            # Hiding manual overlay also clears any active selection highlight.
-            self._selected = None
-            self._selection.clear_path()
+        # Hiding the overlay that owns the current selection also clears the
+        # selection highlight so it doesn't dangle.
+        if (
+            not visible
+            and self._selected is not None
+            and self._selected.kind == kind
+        ):
+            self.clear_selection()
 
     # -- Matched-structure API --
 
@@ -555,15 +726,19 @@ class GIWAXSImageViewer(QWidget):
         self._fitted.clear_path()
         self._manual.clear_path()
         self._selection.clear_path()
+        self._fitted_preview.clear_path()
+        self._fitted_preview_geom = None
         self._frame_peaks.clear()
         self._manual_peaks.clear()
         self._undo_stack.clear()
+        self._redo_stack.clear()
         # Tear down all matched items and forget per-frame state.
         self._teardown_matched_items()
         self._matched_per_frame.clear()
         self._matched_visibility.clear()
         had_selection = self._selected is not None
         self._selected = None
+        self._roi_drag_before = None
         self._sync_roi()
         self._stack = None
         self._polar_cache = None
@@ -576,42 +751,33 @@ class GIWAXSImageViewer(QWidget):
         return list(self._manual_peaks.get(frame, []))
 
     def add_manual_peak(self, frame: int, peak: ManualPeak) -> None:
-        self._manual_peaks.setdefault(frame, []).append(peak)
-        self._undo_stack.append(("add", peak, frame))
-        if frame == self.current_frame:
-            self._render_overlays(frame)
-        self.manualPeakAdded.emit(frame, peak)
+        self._undoable_add_manual(frame, peak)
+        self._push_undo(ManualAddAction(frame=frame, peak=peak))
 
     def remove_manual_peak(self, frame: int, peak: ManualPeak) -> None:
-        peaks = self._manual_peaks.get(frame, [])
-        if peak in peaks:
-            peaks.remove(peak)
-            self._undo_stack.append(("remove", peak, frame))
-            was_selected = peak is self._selected
-            if was_selected:
-                self._selected = None
-                self._sync_roi()
-            if frame == self.current_frame:
-                self._render_overlays(frame)
-            if was_selected:
-                self.selectionChanged.emit(None)
-            self.manualPeakRemoved.emit(frame, peak)
+        if peak not in self._manual_peaks.get(frame, []):
+            return
+        self._undoable_remove_manual(frame, peak)
+        self._push_undo(ManualRemoveAction(frame=frame, peak=peak))
 
     def commit_manual_peak(self, frame: int, peak: ManualPeak) -> None:
         """Drop a manual peak that has been persisted to the NeXus file.
 
         Like ``remove_manual_peak`` but does not push to the undo stack — the
         peak now lives in the detected/fitted overlay, so undoing back to its
-        manual state would resurrect a duplicate. Any existing undo entries
-        referencing this peak are scrubbed for the same reason.
+        manual state would resurrect a duplicate. Any existing undo/redo
+        entries referencing this peak are scrubbed for the same reason.
         """
         peaks = self._manual_peaks.get(frame, [])
         if peak in peaks:
             peaks.remove(peak)
-        self._undo_stack = [
-            entry for entry in self._undo_stack if entry[1] is not peak
-        ]
-        was_selected = peak is self._selected
+        self._undo_stack = [a for a in self._undo_stack if not _action_targets_manual(a, peak)]
+        self._redo_stack = [a for a in self._redo_stack if not _action_targets_manual(a, peak)]
+        was_selected = (
+            self._selected is not None
+            and self._selected.kind == "manual"
+            and self._selected.manual_ref is peak
+        )
         if was_selected:
             self._selected = None
             self._sync_roi()
@@ -622,36 +788,216 @@ class GIWAXSImageViewer(QWidget):
         self.manualPeakRemoved.emit(frame, peak)
 
     def undo_last_action(self) -> None:
-        """Reverse the most recent add or remove. Silently no-ops if empty."""
-        if not self._undo_stack:
+        """Reverse the most recent action. No-ops if empty."""
+        if self._busy or not self._undo_stack:
             return
-        action, peak, frame = self._undo_stack.pop()
-        if action == "add":
-            peaks = self._manual_peaks.get(frame, [])
-            if peak in peaks:
-                peaks.remove(peak)
-            was_selected = peak is self._selected
-            if was_selected:
-                self._selected = None
-                self._sync_roi()
-            if frame == self.current_frame:
-                self._render_overlays(frame)
-            if was_selected:
-                self.selectionChanged.emit(None)
-            self.manualPeakRemoved.emit(frame, peak)
-        elif action == "remove":
-            self._manual_peaks.setdefault(frame, []).append(peak)
-            if frame == self.current_frame:
-                self._render_overlays(frame)
-            self.manualPeakAdded.emit(frame, peak)
+        action = self._undo_stack.pop()
+        action.undo(self)
+        self._redo_stack.append(action)
+
+    def redo_last_action(self) -> None:
+        """Re-apply the most recently undone action."""
+        if self._busy or not self._redo_stack:
+            return
+        action = self._redo_stack.pop()
+        action.redo(self)
+        self._undo_stack.append(action)
+
+    def clear_history(self) -> None:
+        """Drop both undo and redo stacks. Called after pipeline ops that
+        reshuffle peak ids — pending FileGeomActions would key off stale ids.
+        """
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+
+    def clear_selection(self) -> None:
+        if self._selected is None:
+            return
+        self._selected = None
+        self._fitted_preview_geom = None
+        self._sync_roi()
+        self._render_overlays(self.current_frame)
+        self.selectionChanged.emit(None)
+
+    def set_fitted_preview(
+        self,
+        center_r: float | None,
+        fwhm_r: float | None,
+        center_a: float | None,
+        fwhm_a: float | None,
+    ) -> None:
+        """Show / hide the faint preview of the would-be fitted_peaks box.
+
+        Pass any None to clear. When set, paints a dashed cyan box of size
+        ``FWHM_r × 2·FWHM_a`` centered at ``(center_r, center_a)`` — the
+        same convention ``Add to fitted`` uses to compute ``radius_width``
+        and ``angle_width``. Visible only while a manual peak is selected;
+        the parameter panel's selection-changed slot calls this with None
+        for any other kind.
+        """
+        if (
+            center_r is None or fwhm_r is None
+            or center_a is None or fwhm_a is None
+            or not (np.isfinite(center_r) and np.isfinite(fwhm_r) and fwhm_r > 0)
+            or not (np.isfinite(center_a) and np.isfinite(fwhm_a) and fwhm_a > 0)
+        ):
+            self._fitted_preview_geom = None
+        else:
+            self._fitted_preview_geom = (
+                float(center_r), float(fwhm_r),
+                float(center_a), float(fwhm_a),
+            )
+        self._render_overlays(self.current_frame)
+
+    def set_busy(self, busy: bool) -> None:
+        """Disable interactive editing while a pipeline run is in flight."""
+        self._busy = busy
+        self._sync_roi()
 
     @property
     def current_frame(self) -> int:
         return int(self._view.currentIndex)
 
     @property
-    def selected_peak(self) -> ManualPeak | None:
+    def selected_peak(self) -> SelectedPeak | None:
         return self._selected
+
+    # -- Action helpers (used by both public API and undo/redo) --
+
+    def _push_undo(self, action: _Action) -> None:
+        self._undo_stack.append(action)
+        self._redo_stack.clear()
+
+    def _undoable_add_manual(self, frame: int, peak: ManualPeak) -> None:
+        """Insert a manual peak without touching the undo stack."""
+        bucket = self._manual_peaks.setdefault(frame, [])
+        if peak not in bucket:
+            bucket.append(peak)
+        if frame == self.current_frame:
+            self._render_overlays(frame)
+        self.manualPeakAdded.emit(frame, peak)
+
+    def _undoable_remove_manual(self, frame: int, peak: ManualPeak) -> None:
+        """Remove a manual peak without touching the undo stack."""
+        bucket = self._manual_peaks.get(frame, [])
+        if peak in bucket:
+            bucket.remove(peak)
+        was_selected = (
+            self._selected is not None
+            and self._selected.kind == "manual"
+            and self._selected.manual_ref is peak
+        )
+        if was_selected:
+            self._selected = None
+            self._sync_roi()
+        if frame == self.current_frame:
+            self._render_overlays(frame)
+        if was_selected:
+            self.selectionChanged.emit(None)
+        self.manualPeakRemoved.emit(frame, peak)
+
+    def _apply_manual_geom(
+        self, frame: int, peak: ManualPeak,
+        polar: tuple[float, float, float, float],
+    ) -> None:
+        r, a, dr, da = polar
+        peak.radius = r
+        peak.angle = a
+        peak.radius_width = dr
+        peak.angle_width = da
+        # If this peak is the active selection, mirror it on the SelectedPeak
+        # snapshot and refresh the ROI without retriggering its signals.
+        if (
+            self._selected is not None
+            and self._selected.kind == "manual"
+            and self._selected.manual_ref is peak
+        ):
+            self._selected.radius = r
+            self._selected.angle = a
+            self._selected.radius_width = dr
+            self._selected.angle_width = da
+            self._sync_roi_geometry()
+        if frame == self.current_frame:
+            self._render_overlays(frame)
+        if (
+            self._selected is not None
+            and self._selected.kind == "manual"
+            and self._selected.manual_ref is peak
+        ):
+            self.peakGeometryChanged.emit(self._selected)
+
+    def _apply_file_geom(
+        self, frame: int, kind: str, peak_id: int,
+        polar: tuple[float, float, float, float],
+    ) -> None:
+        r, a, dr, da = polar
+        # Update the in-memory PeakTable so overlays paint the new box right
+        # away; the disk write is fired separately via peakRowWriteRequested.
+        peaks_for_frame = self._frame_peaks.get(frame) or {}
+        table = peaks_for_frame.get(kind)
+        if table is not None and len(table) > 0:
+            matches = np.where(table.ids == peak_id)[0]
+            if matches.size > 0:
+                idx = int(matches[0])
+                table.radius[idx] = r
+                table.angle[idx] = a
+                table.radius_width[idx] = dr
+                table.angle_width[idx] = da
+                table.q_xy[idx] = r * np.cos(np.deg2rad(a))
+                table.q_z[idx] = r * np.sin(np.deg2rad(a))
+        # If the user edited a fitted peak, every matched solution that
+        # references it must re-slice from the updated fitted table.
+        if kind == "fitted":
+            self._refresh_matched_for(frame)
+        # Reflect the change on the SelectedPeak if it's the active selection.
+        if (
+            self._selected is not None
+            and self._selected.kind in (kind, "matched")
+            and self._selected.frame == frame
+            and self._selected.peak_id == peak_id
+        ):
+            self._selected.radius = r
+            self._selected.angle = a
+            self._selected.radius_width = dr
+            self._selected.angle_width = da
+            self._sync_roi_geometry()
+        if frame == self.current_frame:
+            self._render_overlays(frame)
+        # Fire the file-write so undo/redo also persist.
+        self.peakRowWriteRequested.emit(
+            frame, kind, int(peak_id),
+            {"radius": r, "angle": a, "radius_width": dr, "angle_width": da},
+        )
+        if (
+            self._selected is not None
+            and self._selected.peak_id == peak_id
+            and self._selected.frame == frame
+        ):
+            self.peakGeometryChanged.emit(self._selected)
+
+    def _refresh_matched_for(self, frame: int) -> None:
+        """Re-slice the frame's fitted PeakTable into each MatchedStructure
+        using its cached ``peak_list`` indices. Cheap (numpy fancy index).
+        """
+        peaks_for_frame = self._frame_peaks.get(frame) or {}
+        fitted = peaks_for_frame.get("fitted")
+        structures = self._matched_per_frame.get(frame, [])
+        if fitted is None or not structures:
+            return
+        n_fit = len(fitted)
+        for s in structures:
+            idx = s.peak_list
+            idx = idx[(idx >= 0) & (idx < n_fit)]
+            s.peaks = PeakTable(
+                q_xy=fitted.q_xy[idx],
+                q_z=fitted.q_z[idx],
+                angle=fitted.angle[idx],
+                radius=fitted.radius[idx],
+                angle_width=fitted.angle_width[idx],
+                radius_width=fitted.radius_width[idx],
+                is_ring=fitted.is_ring[idx],
+                ids=fitted.ids[idx],
+            )
 
     def polar_data(
         self,
@@ -764,16 +1110,47 @@ class GIWAXSImageViewer(QWidget):
 
         manual_list = list(self._manual_peaks.get(frame, []))
         # When an ROI is active the selected peak is shown via the ROI handles —
-        # exclude it from the path overlay so it doesn't render twice.
+        # exclude the manual peak from the manual-overlay path so it doesn't
+        # render twice. (Detected/fitted overlays still draw the underlying
+        # row; the white SELECTION_STYLE highlight is what's suppressed.)
         roi_active = self._roi_item is not None and self._selected is not None
-        if roi_active:
-            manual_list = [m for m in manual_list if m is not self._selected]
+        if roi_active and self._selected.kind == "manual":
+            manual_list = [
+                m for m in manual_list if m is not self._selected.manual_ref
+            ]
         manual_table = _peaks_from_manual(manual_list)
-        sel_table = (
-            _peaks_from_manual([self._selected])
-            if self._selected and not roi_active
-            else None
-        )
+        # Selection highlight: a one-row PeakTable from whatever's selected,
+        # except suppressed when the ROI is doing the highlighting itself.
+        sel_table: PeakTable | None = None
+        if self._selected is not None and not roi_active:
+            sel_table = _peaks_from_manual([
+                ManualPeak(
+                    radius=self._selected.radius,
+                    angle=self._selected.angle,
+                    radius_width=self._selected.radius_width,
+                    angle_width=self._selected.angle_width,
+                    is_ring=self._selected.is_ring,
+                    temp_id=self._selected.peak_id,
+                )
+            ])
+
+        # Fitted-preview overlay: only meaningful while a manual peak is
+        # the active selection. Hide whenever the selection switches away.
+        preview_table: PeakTable | None = None
+        if (
+            self._fitted_preview_geom is not None
+            and self._selected is not None
+            and self._selected.kind == "manual"
+        ):
+            cr, fr, ca, fa = self._fitted_preview_geom
+            preview_table = _peaks_from_manual([
+                ManualPeak(
+                    radius=cr, angle=ca,
+                    radius_width=fr,            # FWHM_r
+                    angle_width=2.0 * fa,       # 2 × FWHM_a
+                    is_ring=False, temp_id=0,
+                )
+            ])
 
         if self._mode == MODE_POLAR:
             self._detected.set_polar(det)
@@ -783,6 +1160,10 @@ class GIWAXSImageViewer(QWidget):
                 self._selection.set_polar(sel_table)
             else:
                 self._selection.clear_path()
+            if preview_table is not None:
+                self._fitted_preview.set_polar(preview_table)
+            else:
+                self._fitted_preview.clear_path()
         else:
             self._detected.set_cartesian(det)
             self._fitted.set_cartesian(fit)
@@ -791,6 +1172,10 @@ class GIWAXSImageViewer(QWidget):
                 self._selection.set_cartesian(sel_table)
             else:
                 self._selection.clear_path()
+            if preview_table is not None:
+                self._fitted_preview.set_cartesian(preview_table)
+            else:
+                self._fitted_preview.clear_path()
 
         self._detected.setVisible(self._visibility["detected"])
         self._fitted.setVisible(self._visibility["fitted"])
@@ -868,7 +1253,7 @@ class GIWAXSImageViewer(QWidget):
 
     def _on_draw_finished(self, origin: QPointF, end: QPointF) -> None:
         self._preview_item.setVisible(False)
-        if self._mode != MODE_POLAR:
+        if self._mode != MODE_POLAR or self._busy:
             return
         # In polar mode: x = radius (Å⁻¹), y = angle (deg).
         rect = QRectF(origin, end).normalized()
@@ -885,36 +1270,104 @@ class GIWAXSImageViewer(QWidget):
         self._next_manual_id -= 1
         self.add_manual_peak(self.current_frame, peak)
         # Auto-select the freshly drawn peak so the user can adjust edges.
-        self._set_selected(peak)
+        self._set_selected(SelectedPeak.from_manual(peak, self.current_frame))
 
     def _on_select_at(self, pos: QPointF) -> None:
-        if self._mode != MODE_POLAR:
+        if self._mode != MODE_POLAR or self._busy:
             return
         x, y = float(pos.x()), float(pos.y())
-        for peak in reversed(self._manual_peaks.get(self.current_frame, [])):
-            r_lo = peak.radius - peak.radius_width / 2
-            r_hi = peak.radius + peak.radius_width / 2
-            a_lo = peak.angle - peak.angle_width / 2
-            a_hi = peak.angle + peak.angle_width / 2
-            if r_lo <= x <= r_hi and a_lo <= y <= a_hi:
-                self._set_selected(peak)
-                return
+        frame = self.current_frame
+        peaks_for_frame = self._frame_peaks.get(frame) or {}
+
+        # Priority order: manual > fitted > detected > matched. Matched is
+        # last because it's a subset of fitted; the rare case where the user
+        # wants the matched-context selection is still reachable by hiding
+        # the fitted overlay.
+        # 1) manual
+        if self._visibility.get("manual", True):
+            for peak in reversed(self._manual_peaks.get(frame, [])):
+                if _polar_box_contains(peak, x, y):
+                    self._set_selected(SelectedPeak.from_manual(peak, frame))
+                    return
+
+        # 2) fitted, 3) detected — same hit-test against the PeakTable rows.
+        for kind in ("fitted", "detected"):
+            if not self._visibility.get(kind, True):
+                continue
+            table = peaks_for_frame.get(kind)
+            if table is None or len(table) == 0:
+                continue
+            for i in reversed(range(len(table))):
+                if _polar_table_row_contains(table, i, x, y):
+                    self._set_selected(SelectedPeak(
+                        kind=kind,
+                        frame=frame,
+                        peak_id=int(table.ids[i]),
+                        radius=float(table.radius[i]),
+                        angle=float(table.angle[i]),
+                        radius_width=float(table.radius_width[i]),
+                        angle_width=float(table.angle_width[i]),
+                        is_ring=bool(table.is_ring[i]),
+                    ))
+                    return
+
+        # 4) matched — only when the master toggle is on. The hit's peak_id
+        # is the underlying fitted id (which is what delete_peak consumes).
+        if self._matched_master_visible:
+            for s in reversed(self._matched_per_frame.get(frame, [])):
+                if not self._is_matched_item_visible(s.unique_id):
+                    continue
+                tbl = s.peaks
+                for i in reversed(range(len(tbl))):
+                    if _polar_table_row_contains(tbl, i, x, y):
+                        self._set_selected(SelectedPeak(
+                            kind="matched",
+                            frame=frame,
+                            peak_id=int(tbl.ids[i]),
+                            radius=float(tbl.radius[i]),
+                            angle=float(tbl.angle[i]),
+                            radius_width=float(tbl.radius_width[i]),
+                            angle_width=float(tbl.angle_width[i]),
+                            is_ring=bool(tbl.is_ring[i]),
+                            structure_uid=s.unique_id,
+                        ))
+                        return
+
         # Click on empty space → deselect
         if self._selected is not None:
             self._set_selected(None)
 
-    def _set_selected(self, peak: ManualPeak | None) -> None:
+    def _set_selected(self, sel: SelectedPeak | None) -> None:
         """Update the selection and sync the ROI + emit selectionChanged once."""
-        if peak is self._selected:
+        if sel is None and self._selected is None:
             return
-        self._selected = peak
+        if (
+            sel is not None
+            and self._selected is not None
+            and sel.kind == self._selected.kind
+            and sel.frame == self._selected.frame
+            and sel.peak_id == self._selected.peak_id
+            and sel.structure_uid == self._selected.structure_uid
+        ):
+            return
+        self._selected = sel
         self._sync_roi()
         self._render_overlays(self.current_frame)
-        self.selectionChanged.emit(peak)
+        self.selectionChanged.emit(sel)
 
     def keyPressEvent(self, ev) -> None:  # type: ignore[override]
-        if ev.key() == Qt.Key.Key_Delete and self._selected is not None:
-            self.remove_manual_peak(self.current_frame, self._selected)
+        if (
+            ev.key() == Qt.Key.Key_Delete
+            and self._selected is not None
+            and not self._busy
+        ):
+            sel = self._selected
+            if sel.kind == "manual" and sel.manual_ref is not None:
+                self.remove_manual_peak(self.current_frame, sel.manual_ref)
+            else:
+                # File-resident peaks go through MainWindow → mlgidbase
+                # delete_peak (cascading + with confirmation).
+                self.deletePeakRequested.emit(sel)
             ev.accept()
             return
         super().keyPressEvent(ev)
@@ -924,46 +1377,123 @@ class GIWAXSImageViewer(QWidget):
     def _sync_roi(self) -> None:
         """Create / update / destroy the resize ROI to match the selection.
 
-        Polar mode only: a ``pg.ROI`` with edge handles wraps the selected
-        ``ManualPeak`` so the user can drag any edge to adjust radius/angle.
-        """
-        if self._roi_item is not None:
-            try:
-                self._roi_item.sigRegionChanged.disconnect(self._on_roi_changed)
-            except (RuntimeError, TypeError):
-                pass
-            self._plot.getViewBox().removeItem(self._roi_item)
-            self._roi_item = None
+        Polar mode only, and only for editable kinds (manual / detected /
+        fitted). Matched selections show the box but no ROI — editing the
+        underlying fitted peak is the way to change geometry.
 
-        if self._selected is None or self._mode != MODE_POLAR:
+        Handles ring peaks (``is_ring`` true or non-finite ``angle_width``)
+        and peaks whose box edges fall outside the visible polar range:
+        the ROI is clamped to the data axes so the handles are reachable,
+        and ring peaks get only the radial (left/right) handles since their
+        angular extent is the whole quadrant by definition.
+        """
+        self._teardown_roi()
+
+        if (
+            self._selected is None
+            or self._mode != MODE_POLAR
+            or self._busy
+            or self._selected.kind == "matched"
+        ):
             return
 
-        peak = self._selected
-        pos = (
-            peak.radius - peak.radius_width / 2.0,
-            peak.angle - peak.angle_width / 2.0,
-        )
-        size = (peak.radius_width, peak.angle_width)
+        # Need the polar axes to clamp against; bail if not yet computed.
+        if self._polar_cache is None:
+            return
+        _, radius_axis, angle_axis = self._polar_cache
+        if radius_axis.size == 0 or angle_axis.size == 0:
+            return
+        r_min, r_max = float(radius_axis[0]), float(radius_axis[-1])
+        a_min, a_max = float(angle_axis[0]), float(angle_axis[-1])
 
-        style = OVERLAY_STYLE["manual"]
-        pen = pg.mkPen(QColor(style["color"]), width=style["width"] + 0.4)
+        sel = self._selected
+        is_ring_box = sel.is_ring or not np.isfinite(sel.angle_width)
+
+        if is_ring_box:
+            a_lo, a_hi = a_min, a_max
+        else:
+            a_lo = max(sel.angle - sel.angle_width / 2.0, a_min)
+            a_hi = min(sel.angle + sel.angle_width / 2.0, a_max)
+            if a_hi <= a_lo:
+                return  # peak entirely outside visible angular range
+        r_lo = max(sel.radius - sel.radius_width / 2.0, r_min)
+        r_hi = min(sel.radius + sel.radius_width / 2.0, r_max)
+        if r_hi <= r_lo:
+            return
+
+        pos = (r_lo, a_lo)
+        size = (r_hi - r_lo, a_hi - a_lo)
+
+        # ROI pen colored by the source overlay's hue so the user keeps a
+        # visual link to which list the peak came from.
+        roi_color = OVERLAY_STYLE.get(sel.kind, OVERLAY_STYLE["manual"])["color"]
+        pen = pg.mkPen(QColor(roi_color), width=2.0)
         pen.setStyle(Qt.PenStyle.SolidLine)
         pen.setCosmetic(True)
-        hover_pen = pg.mkPen(QColor(SELECTION_STYLE["color"]), width=SELECTION_STYLE["width"])
+        hover_pen = pg.mkPen(
+            QColor(SELECTION_STYLE["color"]), width=SELECTION_STYLE["width"]
+        )
         hover_pen.setCosmetic(True)
 
         roi = pg.ROI(pos=pos, size=size, pen=pen, hoverPen=hover_pen, movable=True)
         # Edge-only handles (no corners): each handle drags one edge while the
-        # opposite edge stays anchored.
+        # opposite edge stays anchored. Rings have only radial handles — the
+        # angular bounds are the whole quadrant by construction.
         roi.addScaleHandle([1.0, 0.5], [0.0, 0.5])  # right
         roi.addScaleHandle([0.0, 0.5], [1.0, 0.5])  # left
-        roi.addScaleHandle([0.5, 1.0], [0.5, 0.0])  # top
-        roi.addScaleHandle([0.5, 0.0], [0.5, 1.0])  # bottom
+        if not is_ring_box:
+            roi.addScaleHandle([0.5, 1.0], [0.5, 0.0])  # top
+            roi.addScaleHandle([0.5, 0.0], [0.5, 1.0])  # bottom
         roi.setZValue(60)
+        # Track which dimensions are user-editable for _on_roi_changed.
+        roi._mlgid_ring_box = is_ring_box  # type: ignore[attr-defined]
+        roi.sigRegionChangeStarted.connect(self._on_roi_drag_started)
         roi.sigRegionChanged.connect(self._on_roi_changed)
+        roi.sigRegionChangeFinished.connect(self._on_roi_drag_finished)
 
         self._plot.getViewBox().addItem(roi, ignoreBounds=True)
         self._roi_item = roi
+
+    def _teardown_roi(self) -> None:
+        if self._roi_item is None:
+            return
+        roi = self._roi_item
+        for sig_name in (
+            "sigRegionChangeStarted", "sigRegionChanged", "sigRegionChangeFinished",
+        ):
+            try:
+                getattr(roi, sig_name).disconnect()
+            except (RuntimeError, TypeError):
+                pass
+        self._plot.getViewBox().removeItem(roi)
+        self._roi_item = None
+
+    def _sync_roi_geometry(self) -> None:
+        """Adjust the existing ROI to match the SelectedPeak without rebuilding.
+
+        Used by undo/redo and external geometry updates — blocks signals so we
+        don't recursively re-enter ``_on_roi_changed``.
+        """
+        if self._roi_item is None or self._selected is None:
+            return
+        roi = self._roi_item
+        roi.blockSignals(True)
+        try:
+            roi.setPos(
+                [
+                    self._selected.radius - self._selected.radius_width / 2.0,
+                    self._selected.angle - self._selected.angle_width / 2.0,
+                ],
+                update=False,
+            )
+            roi.setSize([self._selected.radius_width, self._selected.angle_width])
+        finally:
+            roi.blockSignals(False)
+
+    def _on_roi_drag_started(self) -> None:
+        if self._selected is None:
+            return
+        self._roi_drag_before = self._selected.polar_tuple()
 
     def _on_roi_changed(self) -> None:
         if self._selected is None or self._roi_item is None:
@@ -977,33 +1507,100 @@ class GIWAXSImageViewer(QWidget):
         # then derive the new center from the (possibly flipped) bottom-left.
         x0 = float(pos[0]) + min(float(size[0]), 0.0)
         y0 = float(pos[1]) + min(float(size[1]), 0.0)
-        self._selected.radius_width = w
-        self._selected.angle_width = h
-        self._selected.radius = x0 + w / 2.0
-        self._selected.angle = y0 + h / 2.0
-        # Manual overlay path skips the selected peak (the ROI shows it),
-        # but other overlays may need a refresh — keep current frame's render synced.
+        new_r = x0 + w / 2.0
+        new_a = y0 + h / 2.0
+
+        sel = self._selected
+        # Ring peaks have only radial handles — the angular extent is fixed
+        # at the whole visible quadrant (and the underlying angle_width is
+        # often inf). Don't propagate the ROI's angular pos/size into the
+        # peak's geometry, or we'd corrupt the ring on every drag.
+        is_ring_box = bool(getattr(roi, "_mlgid_ring_box", False))
+
+        sel.radius = new_r
+        sel.radius_width = w
+        if not is_ring_box:
+            sel.angle = new_a
+            sel.angle_width = h
+
+        if sel.kind == "manual" and sel.manual_ref is not None:
+            sel.manual_ref.radius = new_r
+            sel.manual_ref.radius_width = w
+            if not is_ring_box:
+                sel.manual_ref.angle = new_a
+                sel.manual_ref.angle_width = h
+        else:
+            # Mutate the in-memory PeakTable so the colored detected/fitted
+            # outline tracks the drag live. Disk + matched-resync happen on
+            # drag-end via _on_roi_drag_finished. For ring boxes we don't
+            # touch angle / angle_width since those handles aren't shown.
+            peaks_for_frame = self._frame_peaks.get(sel.frame) or {}
+            table = peaks_for_frame.get(sel.kind)
+            if table is not None and len(table) > 0:
+                matches = np.where(table.ids == sel.peak_id)[0]
+                if matches.size > 0:
+                    idx = int(matches[0])
+                    table.radius[idx] = new_r
+                    table.radius_width[idx] = w
+                    if not is_ring_box:
+                        table.angle[idx] = new_a
+                        table.angle_width[idx] = h
+                    cur_a = float(table.angle[idx])
+                    table.q_xy[idx] = new_r * np.cos(np.deg2rad(cur_a))
+                    table.q_z[idx] = new_r * np.sin(np.deg2rad(cur_a))
+
         self._render_overlays(self.current_frame)
-        self.peakGeometryChanged.emit(self._selected)
+        self.peakGeometryChanged.emit(sel)
+
+    def _on_roi_drag_finished(self) -> None:
+        if self._selected is None or self._roi_drag_before is None:
+            return
+        before = self._roi_drag_before
+        after = self._selected.polar_tuple()
+        self._roi_drag_before = None
+        if before == after:
+            return  # idle release — nothing to record
+
+        sel = self._selected
+        if sel.kind == "manual" and sel.manual_ref is not None:
+            self._push_undo(ManualGeomAction(
+                frame=sel.frame, peak=sel.manual_ref,
+                before=before, after=after,
+            ))
+        elif sel.kind in ("detected", "fitted"):
+            self._push_undo(FileGeomAction(
+                frame=sel.frame, kind=sel.kind, peak_id=sel.peak_id,
+                before=before, after=after,
+            ))
+            # Re-derive matched overlays if a fitted edit changed an
+            # underlying row used by any matched solution.
+            if sel.kind == "fitted":
+                self._refresh_matched_for(sel.frame)
+                self._render_overlays(self.current_frame)
+            # Persist to the file via MainWindow (see peakRowWriteRequested).
+            self.peakRowWriteRequested.emit(
+                sel.frame, sel.kind, int(sel.peak_id),
+                {"radius": after[0], "angle": after[1],
+                 "radius_width": after[2], "angle_width": after[3]},
+            )
 
     def update_peak_geometry_external(self, peak: ManualPeak) -> None:
         """Sync the ROI to a peak whose geometry was changed elsewhere
         (e.g. by dragging a profile region). Suppresses ROI signals so this
         doesn't loop back into ``_on_roi_changed``.
         """
-        if peak is not self._selected or self._roi_item is None:
+        if (
+            self._selected is None
+            or self._selected.kind != "manual"
+            or self._selected.manual_ref is not peak
+            or self._roi_item is None
+        ):
             return
-        roi = self._roi_item
-        roi.blockSignals(True)
-        try:
-            roi.setPos(
-                [
-                    peak.radius - peak.radius_width / 2.0,
-                    peak.angle - peak.angle_width / 2.0,
-                ],
-                update=False,
-            )
-            roi.setSize([peak.radius_width, peak.angle_width])
-        finally:
-            roi.blockSignals(False)
+        # Mirror the new geometry onto the SelectedPeak snapshot.
+        self._selected.radius = peak.radius
+        self._selected.angle = peak.angle
+        self._selected.radius_width = peak.radius_width
+        self._selected.angle_width = peak.angle_width
+        self._sync_roi_geometry()
         self._render_overlays(self.current_frame)
+        self.peakGeometryChanged.emit(self._selected)

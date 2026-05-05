@@ -30,6 +30,7 @@ from mlgidbase_gui.image_viewer import (
     ManualPeak,
     OVERLAY_KINDS,
     OVERLAY_STYLE,
+    SelectedPeak,
 )
 from mlgidbase_gui.parameter_panel import ParameterPanel
 from mlgidbase_gui.pipeline import (
@@ -78,10 +79,6 @@ class MainWindow(QMainWindow):
         self._progress: QProgressDialog | None = None
         self._pipe_thread: QThread | None = None
         self._pipe_worker: PipelineWorker | None = None
-        # Set when the running pipeline command is an "add_peak" originating
-        # from the parameter-panel button. On success we strip the manual peak
-        # from the viewer since it now lives in the detected overlay.
-        self._pending_commit: tuple[int, ManualPeak] | None = None
 
         self.setWindowTitle(APP_NAME)
         self.resize(1400, 900)
@@ -106,11 +103,27 @@ class MainWindow(QMainWindow):
         self.action_undo.triggered.connect(self._action_undo)
         edit_menu.addAction(self.action_undo)
 
+        self.action_redo = QAction("&Redo", self)
+        # Bind both Ctrl+Y (Win/Linux default) and Ctrl+Shift+Z so muscle
+        # memory from either platform works.
+        self.action_redo.setShortcuts([
+            QKeySequence(QKeySequence.StandardKey.Redo),
+            QKeySequence("Ctrl+Shift+Z"),
+        ])
+        self.action_redo.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        self.action_redo.triggered.connect(self._action_redo)
+        edit_menu.addAction(self.action_redo)
+
     def _action_undo(self) -> None:
-        # Currently scoped to manual-peak add/remove; resize / translate undo
-        # would require snapshotting on drag-start.
+        # Covers manual add/remove, manual geom edits, and detected/fitted
+        # geom edits. File-level deletes (delete_peak) are not undoable —
+        # see the confirmation dialog in _on_delete_peak_requested.
         if hasattr(self, "viewer"):
             self.viewer.undo_last_action()
+
+    def _action_redo(self) -> None:
+        if hasattr(self, "viewer"):
+            self.viewer.redo_last_action()
 
     def _build_file_menu(self, file_menu) -> None:
 
@@ -247,8 +260,10 @@ class MainWindow(QMainWindow):
 
         layout.addSpacing(6)
         hint = QLabel(
-            "<i>Polar mode: <b>Ctrl+Alt-drag</b> to label, "
-            "click to select, <b>Delete</b> to remove.</i>"
+            "<i>Polar mode: <b>Ctrl+Alt-drag</b> to label, click any peak "
+            "(detected / fitted / matched / manual) to select, drag edges "
+            "to resize detected/fitted, <b>Delete</b> to remove. "
+            "<b>Ctrl+Z</b> / <b>Ctrl+Shift+Z</b> undo / redo.</i>"
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -281,21 +296,39 @@ class MainWindow(QMainWindow):
             [profile_dock], [max(self.height() // 3, 280)], Qt.Orientation.Vertical
         )
         self.viewer.frameChanged.connect(self.profile_viewer.set_frame)
-        # Bidirectional sync between 2D ROI and profile-edge regions.
-        self.viewer.selectionChanged.connect(self.profile_viewer.set_selected_peak)
-        self.viewer.peakGeometryChanged.connect(self.profile_viewer.sync_regions_from_peak)
+        # Bidirectional sync between 2D ROI and profile-edge regions. The
+        # profile viewer only handles ManualPeak, so we filter the
+        # SelectedPeak-typed signals down to the manual case before forwarding.
+        self.viewer.selectionChanged.connect(self._forward_selection_to_profile)
+        self.viewer.peakGeometryChanged.connect(self._forward_geom_to_profile)
         self.profile_viewer.peakGeometryChanged.connect(self.viewer.update_peak_geometry_external)
+        # The faint fitted-preview box for the selected manual peak follows
+        # the profile viewer's 1D Gaussian fits. It also has to drop when
+        # the selection changes away from a manual peak.
+        self.profile_viewer.fitParamsChanged.connect(self._update_fitted_preview)
+        self.viewer.selectionChanged.connect(self._on_selection_for_preview)
+        # Live readout of the same 1D fits in the parameter panel so the
+        # user can see the fitted-peak parameters next to the detected ones.
+        self.profile_viewer.fitParamsChanged.connect(self.parameter_panel.set_fits)
 
         # Parameter readout — both selection and geometry changes feed the same slot.
         self.viewer.selectionChanged.connect(self.parameter_panel.set_peak)
         self.viewer.peakGeometryChanged.connect(self.parameter_panel.set_peak)
-        self.profile_viewer.peakGeometryChanged.connect(self.parameter_panel.set_peak)
 
-        # Three commit actions live in the parameter panel; they reuse the
-        # PipelineWorker via the same path as the Pipeline dock buttons.
+        # Commit / delete actions on the parameter panel. Add-to-detected and
+        # delete reuse the existing PipelineWorker path.
         self.parameter_panel.addToDetectedRequested.connect(self._on_add_to_detected)
+        self.parameter_panel.addToFittedRequested.connect(self._on_add_to_fitted)
         self.parameter_panel.runFittingRequested.connect(self._on_run_fitting_from_panel)
         self.parameter_panel.runMatchingRequested.connect(self._on_run_matching_from_panel)
+        self.parameter_panel.deletePeakRequested.connect(
+            lambda: self._on_delete_peak_requested(self.viewer.selected_peak)
+        )
+
+        # Direct-h5py geometry writes for detected/fitted ROI edits.
+        self.viewer.peakRowWriteRequested.connect(self._on_peak_row_write_requested)
+        # Delete keypress on file-resident peaks.
+        self.viewer.deletePeakRequested.connect(self._on_delete_peak_requested)
 
     # -- Actions --
 
@@ -478,6 +511,47 @@ class MainWindow(QMainWindow):
         self.data_viewer.setData(nodes[0])
         self.tabs.setCurrentWidget(self.data_viewer)
 
+    # -- Profile viewer adapters --
+
+    def _forward_selection_to_profile(self, sel: SelectedPeak | None) -> None:
+        # Profiles render for any kind of selection; the profile viewer
+        # internally makes regions non-movable for non-manual peaks since
+        # those are edited through the 2D ROI.
+        self.profile_viewer.set_selected_peak(sel)
+
+    def _forward_geom_to_profile(self, sel: SelectedPeak | None) -> None:
+        if sel is None:
+            return
+        self.profile_viewer.sync_regions_from_peak(sel)
+
+    def _on_selection_for_preview(self, sel: SelectedPeak | None) -> None:
+        """Drop the fitted-preview overlay when the active selection isn't
+        a manual peak (the preview only makes sense as a what-if for
+        ``Add to fitted``, which is manual-only).
+        """
+        if sel is None or sel.kind != "manual":
+            self.viewer.set_fitted_preview(None, None, None, None)
+
+    def _update_fitted_preview(self, rfit, afit) -> None:
+        """Sync the viewer's fitted-preview box to the latest 1D fits.
+
+        Only relevant for manual selections — file-resident peaks already
+        have a stored fitted box, so previewing a refit there would be
+        confusing. ``rfit`` / ``afit`` may be ``None`` (no convergence) →
+        clear the preview.
+        """
+        sel = self.viewer.selected_peak
+        if sel is None or sel.kind != "manual":
+            self.viewer.set_fitted_preview(None, None, None, None)
+            return
+        if rfit is None or afit is None:
+            self.viewer.set_fitted_preview(None, None, None, None)
+            return
+        self.viewer.set_fitted_preview(
+            float(rfit.center), float(rfit.fwhm),
+            float(afit.center), float(afit.fwhm),
+        )
+
     # -- Pipeline --
 
     def _on_pipeline_run(self, command: PipelineCommand) -> None:
@@ -486,6 +560,13 @@ class MainWindow(QMainWindow):
 
         self.pipeline_panel.set_running(True)
         self.parameter_panel.set_busy(True)
+        self.viewer.set_busy(True)
+        # Any pipeline op that reshuffles peak ids (everything except
+        # add_peak, which only appends) invalidates pending FileGeomActions.
+        # add_peak is handled by commit_manual_peak's targeted scrub.
+        if command.op_name != "add_peak":
+            self.viewer.clear_history()
+            self.viewer.clear_selection()
         self.pipeline_panel.append_log(f"--- {command.op_name} ---")
 
         # Release silx's read handle on the temp file so mlgidbase can write.
@@ -512,6 +593,7 @@ class MainWindow(QMainWindow):
 
         self.pipeline_panel.set_running(False)
         self.parameter_panel.set_busy(False)
+        self.viewer.set_busy(False)
 
         if error is not None:
             self.pipeline_panel.append_log(f"ERROR - {error}")
@@ -519,13 +601,10 @@ class MainWindow(QMainWindow):
         else:
             self.pipeline_panel.append_log("DONE")
 
-        # If this run was an Add-to-detected commit, drop the manual overlay
-        # now that the peak has been written to the file. Skip on error so the
-        # user can retry without having to redraw.
-        pending, self._pending_commit = self._pending_commit, None
-        if pending is not None and error is None:
-            frame, peak = pending
-            self.viewer.commit_manual_peak(frame, peak)
+        # The manual peak is intentionally NOT dropped after Add-to-detected
+        # so the user can also commit it to fitted_peaks (or keep tweaking
+        # the box and re-commit). The new detected/fitted overlay just
+        # appears alongside the still-selected manual box.
 
         # Reattach silx tree, refresh viewer, mark dirty.
         if self.session is not None:
@@ -540,19 +619,170 @@ class MainWindow(QMainWindow):
     def _on_add_to_detected(self) -> None:
         if self.session is None or self._pipe_thread is not None:
             return
-        peak = self.viewer.selected_peak
+        sel = self.viewer.selected_peak
         entry = self.entry_combo.currentText()
-        if peak is None or not entry:
+        if sel is None or sel.kind != "manual" or sel.manual_ref is None or not entry:
             return
+        manual_peak = sel.manual_ref
         frame = self.viewer.current_frame
         kwargs = {
             "entry": entry,
             "frame_num": frame,
-            **add_peak_kwargs_for(peak),
+            **add_peak_kwargs_for(manual_peak),
         }
-        # Stash the peak so _on_pipeline_finished can drop it on success.
-        self._pending_commit = (frame, peak)
+        # Manual peak is left in place after the run so it can also be
+        # committed to fitted_peaks or further tweaked. See the comment in
+        # _on_pipeline_finished for the rationale.
         self._on_pipeline_run(PipelineCommand("add_peak", kwargs))
+
+    def _on_add_to_fitted(self) -> None:
+        """Append a row to fitted_peaks using the profile viewer's 1D fits.
+
+        Geometry comes from the radial / angular Gaussian centers (and FWHMs);
+        amplitude from the radial fit. Fields not measurable from 1D fits
+        (theta, A, B, C, score) get zeroed — downstream code that needs them
+        should re-run the proper 2D fit.
+        """
+        if self.session is None or self._pipe_thread is not None:
+            return
+        sel = self.viewer.selected_peak
+        entry = self.entry_combo.currentText()
+        if sel is None or sel.kind != "manual" or sel.manual_ref is None or not entry:
+            return
+        manual_peak = sel.manual_ref
+        frame = self.viewer.current_frame
+
+        fits = self.profile_viewer.last_fit_params()
+        rfit = fits.get("radial")
+        afit = fits.get("angular")
+        if rfit is None or afit is None:
+            QMessageBox.warning(
+                self, "Add to fitted",
+                "No 1D Gaussian fit is available for this peak. Drag the box "
+                "until the pink fit curves appear in both profile plots, "
+                "then try again.",
+            )
+            return
+
+        model = self.tree.findHdf5TreeModel()
+        model.clear()
+        self.data_viewer.setData(None)
+        try:
+            new_id = file_model.add_fitted_peak_row(
+                self.session.temp_path, entry, frame,
+                radius=float(rfit.center),
+                radius_width=float(rfit.fwhm),
+                angle=float(afit.center),
+                # Box convention: radial border = FWHM, azimuthal border =
+                # 2 × FWHM. The wider azimuthal box gives the next refit
+                # enough context to converge on the same Gaussian; the
+                # radial box hugs the FWHM tightly because that's where
+                # peak position matters most for downstream matching.
+                angle_width=float(2.0 * afit.fwhm),
+                amplitude=float(rfit.amplitude),
+                is_ring=manual_peak.is_ring,
+            )
+        except KeyError as exc:
+            QMessageBox.warning(self, "Add to fitted", str(exc))
+            model.insertFile(str(self.session.temp_path))
+            return
+        except Exception as exc:
+            QMessageBox.critical(self, "Add to fitted", str(exc))
+            model.insertFile(str(self.session.temp_path))
+            return
+        model.insertFile(str(self.session.temp_path))
+
+        # Manual peak stays selected so the user can also commit it to
+        # detected_peaks or keep editing the box; the cyan fitted overlay
+        # simply appears alongside the yellow manual box.
+        self.session.mark_dirty()
+        self._update_title()
+        # File-level mutation invalidates pending FileGeomActions whose ids
+        # were ordered before the new row.
+        self.viewer.clear_history()
+        # Pull the fresh fitted_peaks (and matched, which references it) back
+        # into the viewer.
+        self._load_entry_into_viewer(entry)
+        self.pipeline_panel.append_log(
+            f"Added fitted peak id={new_id} on {entry}/frame{frame:05d}"
+        )
+
+    def _on_delete_peak_requested(self, sel: SelectedPeak | None) -> None:
+        """Confirm + cascade-delete a non-manual peak via mlgidbase."""
+        if (
+            sel is None or sel.kind == "manual"
+            or self.session is None or self._pipe_thread is not None
+        ):
+            return
+        if not is_mlgidbase_available():
+            QMessageBox.information(
+                self, "Delete peak",
+                "mlgidbase is not installed; cannot delete peaks.",
+            )
+            return
+        entry = self.entry_combo.currentText()
+        if not entry:
+            return
+        reply = QMessageBox.question(
+            self,
+            "Delete peak",
+            (
+                f"Delete {sel.kind} peak id={sel.peak_id} on frame {sel.frame}?\n\n"
+                "It will be removed from detected, fitted, and all matched "
+                "solutions. This cannot be undone."
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        cmd = PipelineCommand(
+            "delete_peak",
+            {
+                "entry": entry,
+                "frame_num": int(sel.frame),
+                "peak_id": int(sel.peak_id),
+            },
+        )
+        self._on_pipeline_run(cmd)
+
+    def _on_peak_row_write_requested(
+        self, frame: int, kind: str, peak_id: int, polar: dict
+    ) -> None:
+        """Persist a detected/fitted box edit straight to the NeXus file.
+
+        Drops silx's read handle for the duration of the write (matching the
+        pipeline-run dance in ``_on_pipeline_run``) so h5py can open r+, then
+        re-attaches. On KeyError (peak vanished), the undo/redo stacks are
+        cleared since they're keyed on stale ids.
+        """
+        if self.session is None:
+            return
+        entry = self.entry_combo.currentText()
+        if not entry:
+            return
+        model = self.tree.findHdf5TreeModel()
+        model.clear()
+        self.data_viewer.setData(None)
+        try:
+            file_model.update_peak_row(
+                self.session.temp_path, entry, frame, kind, peak_id, **polar
+            )
+        except KeyError:
+            QMessageBox.warning(
+                self, "Edit failed",
+                f"Peak id={peak_id} no longer exists in the file. "
+                "Undo history has been cleared.",
+            )
+            self.viewer.clear_history()
+        except Exception as exc:
+            QMessageBox.critical(self, "Edit failed", str(exc))
+            self.viewer.clear_history()
+        else:
+            self.session.mark_dirty()
+            self._update_title()
+        finally:
+            model.insertFile(str(self.session.temp_path))
 
     def _on_run_fitting_from_panel(self) -> None:
         if self.session is None or self._pipe_thread is not None:
