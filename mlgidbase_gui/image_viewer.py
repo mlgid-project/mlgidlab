@@ -83,7 +83,7 @@ MATCHED_STYLE = {"style": Qt.PenStyle.SolidLine, "width": 1.6}
 # back to matplotlib's registry, which is always available since matplotlib
 # is a transitive dep via silx.
 COLORMAPS = ("viridis", "inferno", "plasma", "magma", "cividis", "gray")
-DEFAULT_COLORMAP = "viridis"
+DEFAULT_COLORMAP = "magma"
 
 
 def _robust_levels(frame: np.ndarray) -> tuple[float, float]:

@@ -26,10 +26,16 @@ def apply_dark_theme(app: QApplication) -> None:
     app.setStyleSheet(qdarkstyle.load_stylesheet(qt_api="pyside6") + _OVERRIDES)
 
 
-# qdarkstyle reserves a left column on QComboBox dropdown items for the check
-# indicator, which leaves a visible gap before the text on uncheckable combos.
-# Pin the indicator width to zero and shrink the row padding to recover it.
+# Qt's default QComboBox reserves an icon column (PM_SmallIconSize, ~16 px)
+# on every dropdown item. Combos in this app don't use icons, so the column
+# shows up as a visible empty box before each item's text. Setting
+# qproperty-iconSize collapses that column for every QComboBox application-
+# wide. The other rules tighten item padding and zero out the (already
+# unused) check indicator that qdarkstyle reserves space for.
 _OVERRIDES = """
+QComboBox {
+    qproperty-iconSize: 0px 0px;
+}
 QComboBox QAbstractItemView {
     padding: 0px;
 }
@@ -41,5 +47,6 @@ QComboBox QAbstractItemView::item {
 QComboBox QAbstractItemView::indicator {
     width: 0px;
     height: 0px;
+    image: none;
 }
 """

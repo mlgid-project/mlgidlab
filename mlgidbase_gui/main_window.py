@@ -73,7 +73,15 @@ def _make_color_swatch(color: str, width: int = 26, height: int = 12) -> QPixmap
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.session: Session | None = None
+        # Multiple files can be open at once — each as its own Session in the
+        # file browser. The "active" one drives entry_combo, the image viewer,
+        # and per-file actions (save, save-as, close, pipeline). Switching is
+        # automatic when the user clicks a node from a different file.
+        self._sessions: list[Session] = []
+        self._active_session: Session | None = None
+        # Opens run serially through the existing single-thread CopyWorker
+        # plumbing; extra paths from a multi-select dialog wait here.
+        self._open_queue: list[Path] = []
         self._thread: QThread | None = None
         self._worker: CopyWorker | None = None
         self._progress: QProgressDialog | None = None
@@ -86,8 +94,21 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._build_central()
         self._build_docks()
+        # View menu is built last because it pulls toggleViewAction()s from
+        # the docks created in _build_docks.
+        self._build_view_menu()
         self._update_title()
         self._update_actions()
+
+    @property
+    def session(self) -> Session | None:
+        """The currently-active session — drives viewer + entry_combo + save.
+
+        Most callers were written before multi-file support and reach for
+        ``self.session``; making it a property of the active session keeps
+        those call sites working without per-call refactors.
+        """
+        return self._active_session
 
     def _build_menu(self) -> None:
         bar = self.menuBar()
@@ -113,6 +134,22 @@ class MainWindow(QMainWindow):
         self.action_redo.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
         self.action_redo.triggered.connect(self._action_redo)
         edit_menu.addAction(self.action_redo)
+
+    def _build_view_menu(self) -> None:
+        """Expose dock visibility toggles in a top-level View menu.
+
+        Each dock already has a built-in ``toggleViewAction()`` whose label
+        and check state stay in sync with the dock — reusing them keeps the
+        menu correct without manual bookkeeping.
+        """
+        view_menu = self.menuBar().addMenu("&View")
+        for dock in (
+            self._tree_dock,
+            self._display_dock,
+            self._pipeline_dock,
+            self._profile_dock,
+        ):
+            view_menu.addAction(dock.toggleViewAction())
 
     def _action_undo(self) -> None:
         # Covers manual add/remove, manual geom edits, and detected/fitted
@@ -181,10 +218,10 @@ class MainWindow(QMainWindow):
             self._on_tree_selection_changed
         )
         self.tree.activated.connect(self._on_tree_activated)
-        tree_dock = QDockWidget("File browser", self)
-        tree_dock.setWidget(self.tree)
-        tree_dock.setObjectName("FileBrowserDock")
-        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, tree_dock)
+        self._tree_dock = QDockWidget("File browser", self)
+        self._tree_dock.setWidget(self.tree)
+        self._tree_dock.setObjectName("FileBrowserDock")
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self._tree_dock)
 
         # Right: entry selector + overlay toggles
         panel = QWidget(self)
@@ -278,22 +315,22 @@ class MainWindow(QMainWindow):
         # Pipeline dock — tabified with Display on the right.
         self.pipeline_panel = PipelinePanel(self)
         self.pipeline_panel.runRequested.connect(self._on_pipeline_run)
-        pipeline_dock = QDockWidget("Pipeline", self)
-        pipeline_dock.setWidget(self.pipeline_panel)
-        pipeline_dock.setObjectName("PipelineDock")
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, pipeline_dock)
-        self.tabifyDockWidget(self._display_dock, pipeline_dock)
+        self._pipeline_dock = QDockWidget("Pipeline", self)
+        self._pipeline_dock.setWidget(self.pipeline_panel)
+        self._pipeline_dock.setObjectName("PipelineDock")
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._pipeline_dock)
+        self.tabifyDockWidget(self._display_dock, self._pipeline_dock)
         self._display_dock.raise_()
 
         # Bottom: profile viewer. Default to ~30% of window height so the
         # central image stays the main focus.
         self.profile_viewer = ProfileViewer(self)
-        profile_dock = QDockWidget("Profiles", self)
-        profile_dock.setWidget(self.profile_viewer)
-        profile_dock.setObjectName("ProfileDock")
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, profile_dock)
+        self._profile_dock = QDockWidget("Profiles", self)
+        self._profile_dock.setWidget(self.profile_viewer)
+        self._profile_dock.setObjectName("ProfileDock")
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._profile_dock)
         self.resizeDocks(
-            [profile_dock], [max(self.height() // 3, 280)], Qt.Orientation.Vertical
+            [self._profile_dock], [max(self.height() // 3, 280)], Qt.Orientation.Vertical
         )
         self.viewer.frameChanged.connect(self.profile_viewer.set_frame)
         # Bidirectional sync between 2D ROI and profile-edge regions. The
@@ -333,34 +370,43 @@ class MainWindow(QMainWindow):
     # -- Actions --
 
     def _action_open(self) -> None:
-        if not self._confirm_discard_changes():
-            return
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open NeXus file", "", NEXUS_FILTER
+        # Multi-select supported: every selected file is added to the file
+        # browser of THIS window (no new windows are spawned). Opens run
+        # serially through one CopyWorker thread — extra paths queue up.
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Open NeXus file(s)", "", NEXUS_FILTER
         )
-        if not path:
+        if not paths:
             return
-        self._open_path(Path(path))
+        self._open_queue.extend(Path(p) for p in paths)
+        self._process_open_queue()
+
+    def _process_open_queue(self) -> None:
+        """Kick off the next queued open if no copy is in flight."""
+        if self._thread is not None or not self._open_queue:
+            return
+        self._open_path(self._open_queue.pop(0))
 
     def _action_save(self) -> None:
         self._save(confirm=True)
 
-    def _save(self, confirm: bool) -> bool:
+    def _save(self, confirm: bool, session: Session | None = None) -> bool:
         """Overwrite the original from the temp. Returns True on success."""
-        if self.session is None:
+        target = session if session is not None else self._active_session
+        if target is None:
             return False
         if confirm:
             reply = QMessageBox.question(
                 self,
                 "Save",
-                f"Overwrite the original file?\n\n{self.session.original_path}",
+                f"Overwrite the original file?\n\n{target.original_path}",
                 QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Cancel,
                 QMessageBox.StandardButton.Cancel,
             )
             if reply != QMessageBox.StandardButton.Save:
                 return False
         try:
-            self.session.save()
+            target.save()
         except Exception as exc:
             QMessageBox.critical(self, "Save failed", str(exc))
             return False
@@ -383,26 +429,27 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Save As failed", str(exc))
             return
-        # The temp file may have been renamed to match the new basename;
-        # re-attach silx to the new path so the tree label updates.
-        model = self.tree.findHdf5TreeModel()
-        model.clear()
-        self.data_viewer.setData(None)
-        model.insertFile(str(self.session.temp_path))
+        # The active session's temp file may have been renamed to match the
+        # new basename; rebuild the tree from all sessions so its label
+        # updates while sibling files stay attached.
+        self._detach_silx_tree()
+        self._reattach_silx_tree()
         self._update_title()
 
     def _action_close_file(self) -> None:
-        if not self._confirm_discard_changes():
+        """Close just the currently-active file. Other files stay open."""
+        active = self._active_session
+        if active is None:
             return
-        self._teardown_session()
-        self._update_title()
-        self._update_actions()
+        if not self._confirm_discard_changes(active):
+            return
+        self._close_session(active)
 
     # -- Session lifecycle --
 
     def _open_path(self, path: Path) -> None:
-        self._teardown_session()
-
+        # Additive: never tear down existing sessions. The new file simply
+        # gets appended to the file browser when the copy completes.
         self._thread = QThread(self)
         self._worker = CopyWorker(path)
         self._worker.moveToThread(self._thread)
@@ -435,35 +482,84 @@ class MainWindow(QMainWindow):
 
         if error is not None:
             QMessageBox.critical(self, "Open failed", str(error))
-            return
-
-        self.session = session
-        if session is not None:
+        elif session is not None:
+            self._sessions.append(session)
             self.tree.findHdf5TreeModel().insertFile(str(session.temp_path))
+            # Newly-opened file becomes the active one — the user almost
+            # always wants to inspect what they just opened.
+            self._set_active_session(session)
+
+        # Keep draining the queue regardless of this open's outcome so a
+        # single bad file in a batch doesn't strand the rest.
+        self._process_open_queue()
+
+    def _close_session(self, session: Session) -> None:
+        """Remove ``session`` from the window: tear down its tree entry,
+        delete its temp dir, and pick a new active if it was the active one.
+        """
+        was_active = session is self._active_session
+        if session not in self._sessions:
+            return
+        self._sessions.remove(session)
+        # silx exposes no "remove single file" API on Hdf5TreeModel, so we
+        # rebuild the tree from the remaining sessions. Cheap — sessions
+        # are typically <5 and the model just re-opens HDF5 files.
+        self._detach_silx_tree()
+        if was_active:
+            # Active state is tied to viewer/entry_combo content — drop it
+            # before swapping so we don't leak the old session's overlays.
+            self.viewer.clear()
+            self.viewer.clear_history()
+            self.profile_viewer.clear()
+            self.entry_combo.blockSignals(True)
+            self.entry_combo.clear()
+            self.entry_combo.blockSignals(False)
+            self._active_session = None
+        session.close()
+        self._reattach_silx_tree()
+        if was_active:
+            new_active = self._sessions[-1] if self._sessions else None
+            if new_active is not None:
+                self._set_active_session(new_active)
+            else:
+                self._update_title()
+                self._update_actions()
+
+    def _set_active_session(self, session: Session | None) -> None:
+        """Make ``session`` the active one and reload viewer-side state.
+
+        No-op when ``session`` is already active. Blocked while a pipeline
+        run is in flight — the worker captured the active temp_path at run
+        time and ``_on_pipeline_finished`` reaches for ``self.session``,
+        so swapping mid-flight would corrupt that path.
+        """
+        if session is self._active_session:
+            return
+        if self._pipe_thread is not None:
+            return
+        # Tear down viewer-side state belonging to the prior active session
+        # before swapping — the new session's overlays must replace, not
+        # accumulate on top of, whatever was previously shown.
+        self.viewer.clear()
+        self.viewer.clear_history()
+        self.profile_viewer.clear()
+        self.entry_combo.blockSignals(True)
+        self.entry_combo.clear()
+        self.entry_combo.blockSignals(False)
+        self._active_session = session
+        if session is not None:
             self._populate_entries()
         self._update_title()
         self._update_actions()
 
-    def _teardown_session(self) -> None:
-        if self.session is None:
-            return
-        self.tree.findHdf5TreeModel().clear()
-        self.viewer.clear()
-        self.profile_viewer.clear()
-        self.data_viewer.setData(None)
-        self.entry_combo.blockSignals(True)
-        self.entry_combo.clear()
-        self.entry_combo.blockSignals(False)
-        self.session.close()
-        self.session = None
-
-    def _confirm_discard_changes(self) -> bool:
-        if self.session is None or not self.session.dirty:
+    def _confirm_discard_changes(self, session: Session | None = None) -> bool:
+        target = session if session is not None else self._active_session
+        if target is None or not target.dirty:
             return True
         reply = QMessageBox.question(
             self,
             "Unsaved changes",
-            f"{self.session.original_path.name} has unsaved changes. "
+            f"{target.original_path.name} has unsaved changes. "
             f"Save before continuing?",
             QMessageBox.StandardButton.Save
             | QMessageBox.StandardButton.Discard
@@ -471,10 +567,28 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Save,
         )
         if reply == QMessageBox.StandardButton.Save:
-            return self._save(confirm=False)
+            return self._save(confirm=False, session=target)
         if reply == QMessageBox.StandardButton.Discard:
             return True
         return False
+
+    # -- silx tree helpers --
+
+    def _detach_silx_tree(self) -> None:
+        """Release silx's read handles on every loaded temp file.
+
+        Required before any code path opens an HDF5 file ``r+`` (pipeline
+        runs, direct h5py edits) since silx's open handle would otherwise
+        block the writer.
+        """
+        self.tree.findHdf5TreeModel().clear()
+        self.data_viewer.setData(None)
+
+    def _reattach_silx_tree(self) -> None:
+        """Re-insert every session's temp file into the tree in order."""
+        model = self.tree.findHdf5TreeModel()
+        for s in self._sessions:
+            model.insertFile(str(s.temp_path))
 
     # -- Entry / viewer wiring --
 
@@ -502,14 +616,52 @@ class MainWindow(QMainWindow):
         nodes = list(self.tree.selectedH5Nodes())
         if not nodes:
             return
-        self.data_viewer.setData(nodes[0])
+        node = nodes[0]
+        self.data_viewer.setData(node)
+        # Multiple files may be loaded — clicking into a different file's
+        # subtree promotes that file to the active session so the entry
+        # combo, image viewer, and per-file actions follow the user's
+        # focus without an extra click.
+        self._activate_session_for_node(node)
 
     def _on_tree_activated(self, *_: object) -> None:
         nodes = list(self.tree.selectedH5Nodes())
         if not nodes:
             return
-        self.data_viewer.setData(nodes[0])
+        node = nodes[0]
+        self.data_viewer.setData(node)
         self.tabs.setCurrentWidget(self.data_viewer)
+        self._activate_session_for_node(node)
+
+    def _activate_session_for_node(self, node) -> None:
+        """If ``node`` lives in a non-active session's file, swap active."""
+        fname = self._node_filename(node)
+        if fname is None:
+            return
+        for s in self._sessions:
+            if s.temp_path == fname:
+                if s is not self._active_session:
+                    self._set_active_session(s)
+                return
+
+    @staticmethod
+    def _node_filename(node) -> Path | None:
+        """Resolve the filesystem path of the file ``node`` was loaded from.
+
+        silx exposes this differently across versions — fall through the
+        known accessors and give up silently if nothing answers.
+        """
+        for getter in (
+            lambda n: getattr(n, "local_filename", None),
+            lambda n: n.h5py_object.file.filename,
+        ):
+            try:
+                p = getter(node)
+            except Exception:
+                continue
+            if p:
+                return Path(p)
+        return None
 
     # -- Profile viewer adapters --
 
@@ -569,9 +721,9 @@ class MainWindow(QMainWindow):
             self.viewer.clear_selection()
         self.pipeline_panel.append_log(f"--- {command.op_name} ---")
 
-        # Release silx's read handle on the temp file so mlgidbase can write.
-        self.tree.findHdf5TreeModel().clear()
-        self.data_viewer.setData(None)
+        # Release silx's read handles on every loaded temp file so mlgidbase
+        # can open the active one r+. Sibling files are reattached on finish.
+        self._detach_silx_tree()
 
         self._pipe_thread = QThread(self)
         self._pipe_worker = PipelineWorker(self.session.temp_path, command)
@@ -606,9 +758,9 @@ class MainWindow(QMainWindow):
         # the box and re-commit). The new detected/fitted overlay just
         # appears alongside the still-selected manual box.
 
-        # Reattach silx tree, refresh viewer, mark dirty.
+        # Reattach silx tree (every session), refresh viewer, mark dirty.
+        self._reattach_silx_tree()
         if self.session is not None:
-            self.tree.findHdf5TreeModel().insertFile(str(self.session.temp_path))
             if error is None:
                 self.session.mark_dirty()
             entry = self.entry_combo.currentText()
@@ -664,9 +816,7 @@ class MainWindow(QMainWindow):
             )
             return
 
-        model = self.tree.findHdf5TreeModel()
-        model.clear()
-        self.data_viewer.setData(None)
+        self._detach_silx_tree()
         try:
             new_id = file_model.add_fitted_peak_row(
                 self.session.temp_path, entry, frame,
@@ -684,13 +834,13 @@ class MainWindow(QMainWindow):
             )
         except KeyError as exc:
             QMessageBox.warning(self, "Add to fitted", str(exc))
-            model.insertFile(str(self.session.temp_path))
+            self._reattach_silx_tree()
             return
         except Exception as exc:
             QMessageBox.critical(self, "Add to fitted", str(exc))
-            model.insertFile(str(self.session.temp_path))
+            self._reattach_silx_tree()
             return
-        model.insertFile(str(self.session.temp_path))
+        self._reattach_silx_tree()
 
         # Manual peak stays selected so the user can also commit it to
         # detected_peaks or keep editing the box; the cyan fitted overlay
@@ -761,9 +911,7 @@ class MainWindow(QMainWindow):
         entry = self.entry_combo.currentText()
         if not entry:
             return
-        model = self.tree.findHdf5TreeModel()
-        model.clear()
-        self.data_viewer.setData(None)
+        self._detach_silx_tree()
         try:
             file_model.update_peak_row(
                 self.session.temp_path, entry, frame, kind, peak_id, **polar
@@ -782,7 +930,7 @@ class MainWindow(QMainWindow):
             self.session.mark_dirty()
             self._update_title()
         finally:
-            model.insertFile(str(self.session.temp_path))
+            self._reattach_silx_tree()
 
     def _on_run_fitting_from_panel(self) -> None:
         if self.session is None or self._pipe_thread is not None:
@@ -908,8 +1056,20 @@ class MainWindow(QMainWindow):
         self.action_close_file.setEnabled(has_session)
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if not self._confirm_discard_changes():
-            event.ignore()
-            return
-        self._teardown_session()
+        # Each loaded file may have unsaved changes — prompt per dirty
+        # session in load order so the user gets the same per-file save
+        # dialog they would on _action_close_file.
+        for s in list(self._sessions):
+            if not self._confirm_discard_changes(s):
+                event.ignore()
+                return
+        # All clear — tear everything down. silx must release its handles
+        # before we delete the temp files.
+        self._detach_silx_tree()
+        self.viewer.clear()
+        self.profile_viewer.clear()
+        for s in list(self._sessions):
+            s.close()
+        self._sessions.clear()
+        self._active_session = None
         event.accept()
