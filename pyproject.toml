@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlgidbase-gui"
+version = "0.0.1"
+description = "Graphical interface for the mlgidBASE GIWAXS analysis pipeline"
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6>=6.6",
+    # silx[full] pulls in matplotlib, dateutil, qtawesome, PyOpenGL — all
+    # required by DataViewerFrame's auto-rendering.
+    "silx[full]>=2.1",
+    "h5py>=3.10",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "pyqtgraph>=0.13",
+    "qdarkstyle>=3.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+# Pipeline backend (heavy: pulls torch + the mlgid analysis stack).
+# Install when you actually want to run detection/fitting/matching from the GUI.
+pipeline = ["mlgidbase>=0.1"]
+
+[project.gui-scripts]
+mlgidbase-gui = "mlgidbase_gui:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mlgidbase_gui*"]
