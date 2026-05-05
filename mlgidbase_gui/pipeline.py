@@ -36,39 +36,22 @@ def is_mlgidbase_available() -> bool:
 
 
 def add_peak_kwargs_for(peak) -> dict:
-    """Build the per-mode kwargs dict for ``mlgidBASE.add_peak``.
+    """Build the kwargs dict for ``mlgidBASE.add_peak``.
 
-    Tutorial 7 takes polar args for rings (angle / angle_width / radius /
-    radius_width) and Cartesian for segments (q_xy / dq_xy / q_z / dq_z).
-    For segments we return the Cartesian bounding box of the polar
-    rectangle — accurate for narrow segments, conservative for wider ones.
+    Always pass polar (angle / angle_width / radius / radius_width) for both
+    rings and segments. mlgidBASE.add_peak (see ``peak_operations._calc_new_peak``)
+    accepts either polar or cartesian: if all four polar values are non-None
+    it uses them verbatim and recomputes ``q_xy / q_z`` from them, otherwise
+    it back-computes polar widths from cartesian widths. The cartesian
+    bounding box of a polar wedge is strictly wider than the polar widths,
+    so the back-converted polar widths come out inflated — which previously
+    made saved segments look much bigger than the user-drawn box.
     """
-    import math
-
-    if peak.is_ring:
-        return {
-            "angle": float(peak.angle),
-            "angle_width": float(peak.angle_width),
-            "radius": float(peak.radius),
-            "radius_width": float(peak.radius_width),
-        }
-
-    a = math.radians(peak.angle)
-    da = math.radians(peak.angle_width)
-    rs = (
-        max(peak.radius - peak.radius_width / 2.0, 0.0),
-        peak.radius + peak.radius_width / 2.0,
-    )
-    n_sub = 8
-    angs = [a - da / 2.0 + (a + da / 2.0 - (a - da / 2.0)) * i / (n_sub - 1)
-            for i in range(n_sub)]
-    qxys = [r * math.cos(ang) for r in rs for ang in angs]
-    qzs = [r * math.sin(ang) for r in rs for ang in angs]
     return {
-        "q_xy": float((min(qxys) + max(qxys)) / 2.0),
-        "dq_xy": float(max(qxys) - min(qxys)),
-        "q_z": float((min(qzs) + max(qzs)) / 2.0),
-        "dq_z": float(max(qzs) - min(qzs)),
+        "angle": float(peak.angle),
+        "angle_width": float(peak.angle_width),
+        "radius": float(peak.radius),
+        "radius_width": float(peak.radius_width),
     }
 
 

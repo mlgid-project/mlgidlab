@@ -268,15 +268,19 @@ class ParameterPanel(QGroupBox):
             ):
                 btn.setEnabled(False)
             return
-        # Add-to-detected and Add-to-fitted only apply to manual peaks
-        # (already-on-file peaks have nothing to commit). Delete-peak only
-        # applies to non-manual peaks (manual uses the Delete shortcut).
-        # Fitting/matching always available — the worker surfaces errors
-        # if no peaks exist.
+        # Add-to-detected only makes sense for manual peaks (committing the
+        # in-memory candidate). Add-to-fitted accepts manual *and* detected
+        # selections — a detected box is the natural input for a fit, and
+        # this lets the user promote a detected row into fitted_peaks
+        # using the live 1D Gaussian fit. Delete-peak only applies to
+        # non-manual peaks (manual uses the Delete shortcut). Fitting /
+        # matching always available — the worker surfaces errors if no
+        # peaks exist.
         is_manual = peak is not None and peak.kind == "manual"
+        is_addable_to_fitted = peak is not None and peak.kind in ("manual", "detected")
         is_file_peak = peak is not None and peak.kind != "manual"
         self.btn_add_detected.setEnabled(is_manual)
-        self.btn_add_fitted.setEnabled(is_manual)
+        self.btn_add_fitted.setEnabled(is_addable_to_fitted)
         self.btn_delete_peak.setEnabled(is_file_peak)
         self.btn_run_fitting.setEnabled(True)
         self.btn_run_matching.setEnabled(True)

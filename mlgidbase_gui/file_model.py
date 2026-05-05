@@ -286,6 +286,68 @@ def add_fitted_peak_row(
         return new_id
 
 
+def clear_peaks(file_path: Path, entry: str, kind: str) -> int:
+    """Empty every ``<kind>_peaks`` dataset under ``entry/data/analysis/``.
+
+    ``kind`` is one of:
+
+    - ``"detected"``   — empties ``detected_peaks`` per frame.
+    - ``"fitted"``     — empties ``fitted_peaks`` and ``fitted_peaks_errors``
+                         per frame (the two are paired by id).
+    - ``"matched"``    — empties every ``matched_*`` dataset per frame.
+
+    Datasets are recreated empty (shape ``(0,)``) preserving dtype + attrs,
+    because pygid creates them as fixed-shape datasets so ``.resize`` is
+    unavailable. Returns the number of rows removed across all frames.
+
+    Manual peaks live in memory only — clear them via the viewer.
+    """
+    if kind not in ("detected", "fitted", "matched"):
+        raise ValueError(
+            f"clear_peaks: kind must be detected/fitted/matched, got {kind!r}"
+        )
+    removed = 0
+    with h5py.File(file_path, "r+") as f:
+        ana_path = f"{entry}/{ANALYSIS_REL}"
+        if ana_path not in f:
+            return 0
+        ana_group = f[ana_path]
+        for frame_name in list(ana_group.keys()):
+            frame_group = ana_group[frame_name]
+            if not isinstance(frame_group, h5py.Group):
+                continue
+            if kind == "matched":
+                for ds_name in list(frame_group.keys()):
+                    if ds_name.startswith("matched_"):
+                        removed += _empty_dataset_in_place(frame_group, ds_name)
+            elif kind == "fitted":
+                for ds_name in ("fitted_peaks", "fitted_peaks_errors"):
+                    if ds_name in frame_group:
+                        removed += _empty_dataset_in_place(frame_group, ds_name)
+            else:
+                ds_name = "detected_peaks"
+                if ds_name in frame_group:
+                    removed += _empty_dataset_in_place(frame_group, ds_name)
+    return removed
+
+
+def _empty_dataset_in_place(parent: h5py.Group, name: str) -> int:
+    """Replace ``parent[name]`` with an empty array of the same dtype, keep attrs.
+
+    Returns the row count that was removed (for logging). Used only by
+    ``clear_peaks`` — internal helper, not part of the public surface.
+    """
+    ds = parent[name]
+    n = int(ds.shape[0]) if len(ds.shape) > 0 else 0
+    attrs = dict(ds.attrs)
+    empty = np.zeros(0, dtype=ds.dtype)
+    del parent[name]
+    new_ds = parent.create_dataset(name, data=empty)
+    for k, v in attrs.items():
+        new_ds.attrs[k] = v
+    return n
+
+
 def update_peak_row(
     file_path: Path,
     entry: str,

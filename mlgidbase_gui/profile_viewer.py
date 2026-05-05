@@ -292,15 +292,17 @@ class ProfileViewer(QWidget):
     def _update_fit_curves(
         self, peak: SelectedPeak, radial: np.ndarray, angular: np.ndarray
     ) -> None:
-        # Manual peaks are still being shaped — refit the data inside the
-        # box on every drag so the user can adjust the bounds against the
-        # live curve. Non-manual peaks are stored under the convention
+        # Manual + detected peaks are candidate boxes — refit the data
+        # inside the box on every drag so the user can adjust the bounds
+        # against the live curve, and so "Add to fitted" picks up an
+        # actual FWHM (detected boxes don't carry the FWHM convention).
+        # Fitted + matched peaks are stored under the convention
         #   radial border = FWHM   →   FWHM_r = radius_width
         #   azimuthal border = 2 × FWHM   →   FWHM_a = angle_width / 2
         # so we draw the Gaussian implied by that convention exactly. This
         # keeps the displayed curve in sync with the saved box parameters
         # — no refit drift on re-select.
-        is_manual = peak.kind == "manual"
+        do_real_fit = peak.kind in ("manual", "detected")
         rfit: GaussianFit | None = None
         afit: GaussianFit | None = None
         if self._radius is not None:
@@ -308,7 +310,7 @@ class ProfileViewer(QWidget):
             r_hi = peak.radius + peak.radius_width / 2.0
             r_pad = FIT_RENDER_PAD_FACTOR * peak.radius_width
             render_r = (r_lo - r_pad, r_hi + r_pad)
-            if is_manual:
+            if do_real_fit:
                 rfit = fit_gaussian_on_axis(
                     self._radius, radial, peak.radius, peak.radius_width,
                     fit_range=(r_lo, r_hi),
@@ -330,7 +332,7 @@ class ProfileViewer(QWidget):
                 a_hi = peak.angle + peak.angle_width / 2.0
                 a_pad = FIT_RENDER_PAD_FACTOR * peak.angle_width
                 render_a = (a_lo - a_pad, a_hi + a_pad)
-                if is_manual:
+                if do_real_fit:
                     afit = fit_gaussian_on_axis(
                         self._angle, angular, peak.angle, peak.angle_width,
                         fit_range=(a_lo, a_hi),

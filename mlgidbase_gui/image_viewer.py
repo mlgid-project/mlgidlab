@@ -11,7 +11,7 @@ from typing import Protocol
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QPainterPath
+from PySide6.QtGui import QAction, QColor, QPainterPath
 from PySide6.QtWidgets import (
     QButtonGroup,
     QComboBox,
@@ -608,13 +608,78 @@ class GIWAXSImageViewer(QWidget):
 
         self._view.sigTimeChanged.connect(self._on_time_changed)
 
+        # Add a "Reset zoom" action to the viewbox right-click menu so the
+        # user can undo a manual zoom without leaving the keyboard / mouse.
+        # pyqtgraph's default "View All" does the same thing under a less
+        # discoverable label; this just adds the explicitly-named entry.
+        self._install_reset_zoom_action()
+
     # -- Public API --
 
-    def show_stack(self, stack: EntryStack) -> None:
+    def show_stack(self, stack: EntryStack, *, preserve_view: bool = False) -> None:
+        """Render ``stack`` in the active mode.
+
+        ``preserve_view`` keeps the current viewbox range and time-axis
+        position across the re-render — used after pipeline ops and direct
+        h5py edits where the underlying stack is identical and only the
+        peak overlays changed. Default ``False`` (autorange) for the
+        entry-switch / file-open paths, where the new stack typically has
+        different axes.
+        """
+        # Capture before resetting cached state so the saved range is the
+        # one the user is actually looking at right now.
+        saved_xrange: tuple[float, float] | None = None
+        saved_yrange: tuple[float, float] | None = None
+        saved_frame: int | None = None
+        if preserve_view and self._stack is not None:
+            try:
+                xr, yr = self._plot.getViewBox().viewRange()
+                saved_xrange = (float(xr[0]), float(xr[1]))
+                saved_yrange = (float(yr[0]), float(yr[1]))
+            except Exception:
+                pass
+            saved_frame = self.current_frame
+
         self._stack = stack
         self._polar_cache = None
         self._frame_peaks.clear()
         self._render_active_mode()
+
+        # _apply_params calls setImage(autoRange=True), which resets the
+        # range and the time index. If the caller asked for preservation,
+        # apply the snapshot afterwards so it wins.
+        if preserve_view and saved_xrange is not None and saved_yrange is not None:
+            self._plot.getViewBox().setRange(
+                xRange=saved_xrange, yRange=saved_yrange, padding=0
+            )
+        if preserve_view and saved_frame is not None:
+            try:
+                self._view.setCurrentIndex(int(saved_frame))
+            except Exception:
+                pass
+
+    def reset_zoom(self) -> None:
+        """Auto-fit the viewbox to the current image."""
+        try:
+            self._plot.getViewBox().autoRange()
+        except Exception:
+            pass
+
+    def _install_reset_zoom_action(self) -> None:
+        vb = self._plot.getViewBox()
+        menu = getattr(vb, "menu", None)
+        if menu is None:
+            return
+        action = QAction("Reset zoom", menu)
+        action.triggered.connect(self.reset_zoom)
+        # Insert at the top so it lands above pyqtgraph's default entries.
+        first = menu.actions()[0] if menu.actions() else None
+        if first is not None:
+            menu.insertAction(first, action)
+            menu.insertSeparator(first)
+        else:
+            menu.addAction(action)
+        self._reset_zoom_action = action  # keep a reference
 
     def set_peaks(self, frame: int, peaks: dict[str, PeakTable | None]) -> None:
         self._frame_peaks[frame] = peaks
@@ -818,6 +883,29 @@ class GIWAXSImageViewer(QWidget):
         self._sync_roi()
         self._render_overlays(self.current_frame)
         self.selectionChanged.emit(None)
+
+    def clear_all_manual_peaks(self) -> None:
+        """Drop every manual peak across all frames + the undo history.
+
+        Matches Tools → Clear all manual peaks. Manual peaks are
+        in-memory only, so no file write is involved. The selection is
+        also cleared if it pointed at a manual peak.
+        """
+        if not self._manual_peaks:
+            # Still clear undo history of any orphaned ManualGeomActions
+            # and refresh in case overlays drift.
+            self._undo_stack.clear()
+            self._redo_stack.clear()
+            return
+        self._manual_peaks.clear()
+        if self._selected is not None and self._selected.kind == "manual":
+            self._selected = None
+            self._fitted_preview_geom = None
+            self._sync_roi()
+            self.selectionChanged.emit(None)
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._render_overlays(self.current_frame)
 
     def set_fitted_preview(
         self,
@@ -1134,13 +1222,16 @@ class GIWAXSImageViewer(QWidget):
                 )
             ])
 
-        # Fitted-preview overlay: only meaningful while a manual peak is
-        # the active selection. Hide whenever the selection switches away.
+        # Fitted-preview overlay: only meaningful while a candidate peak
+        # (manual or detected) is the active selection — both are subject to
+        # an Add-to-fitted commit and the cyan box previews where the saved
+        # row would land. Hide for fitted/matched selections (already on
+        # file with their own box).
         preview_table: PeakTable | None = None
         if (
             self._fitted_preview_geom is not None
             and self._selected is not None
-            and self._selected.kind == "manual"
+            and self._selected.kind in ("manual", "detected")
         ):
             cr, fr, ca, fa = self._fitted_preview_geom
             preview_table = _peaks_from_manual([

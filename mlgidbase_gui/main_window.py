@@ -115,6 +115,7 @@ class MainWindow(QMainWindow):
         file_menu = bar.addMenu("&File")
         self._build_file_menu(file_menu)
         self._build_edit_menu(bar)
+        self._build_tools_menu(bar)
 
     def _build_edit_menu(self, bar) -> None:
         edit_menu = bar.addMenu("&Edit")
@@ -134,6 +135,108 @@ class MainWindow(QMainWindow):
         self.action_redo.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
         self.action_redo.triggered.connect(self._action_redo)
         edit_menu.addAction(self.action_redo)
+
+    def _build_tools_menu(self, bar) -> None:
+        """Bulk-edit operations that don't fit the per-peak ROI workflow.
+
+        Currently scoped to "clear all of one kind for the active entry".
+        Future additions (export, copy peaks across frames, statistics,
+        symmetry ops, etc.) will land here too — see the README for the
+        full roadmap.
+        """
+        tools_menu = bar.addMenu("&Tools")
+        self.action_clear_manual = QAction("Clear all manual peaks", self)
+        self.action_clear_manual.triggered.connect(self._action_clear_manual)
+        tools_menu.addAction(self.action_clear_manual)
+
+        self.action_clear_detected = QAction("Clear all detected peaks", self)
+        self.action_clear_detected.triggered.connect(
+            lambda: self._action_clear_file_peaks("detected")
+        )
+        tools_menu.addAction(self.action_clear_detected)
+
+        self.action_clear_fitted = QAction("Clear all fitted peaks", self)
+        self.action_clear_fitted.triggered.connect(
+            lambda: self._action_clear_file_peaks("fitted")
+        )
+        tools_menu.addAction(self.action_clear_fitted)
+
+        self.action_clear_matched = QAction("Clear all matched peaks", self)
+        self.action_clear_matched.triggered.connect(
+            lambda: self._action_clear_file_peaks("matched")
+        )
+        tools_menu.addAction(self.action_clear_matched)
+
+    def _action_clear_manual(self) -> None:
+        """Drop every manual peak. In-memory only, no file write."""
+        if not self._confirm_clear("manual"):
+            return
+        self.viewer.clear_all_manual_peaks()
+        self.pipeline_panel.append_log("Cleared all manual peaks")
+
+    def _action_clear_file_peaks(self, kind: str) -> None:
+        """Empty every ``<kind>_peaks`` dataset for the active entry.
+
+        Cascade rule: clearing fitted also clears matched, because matched
+        rows reference fitted ids — leaving stale matched_* solutions
+        pointing at deleted fitted rows is worse than wiping them.
+        """
+        if self.session is None or self._pipe_thread is not None:
+            return
+        entry = self.entry_combo.currentText()
+        if not entry:
+            return
+        if not self._confirm_clear(kind):
+            return
+        kinds_to_clear = [kind]
+        if kind == "fitted":
+            kinds_to_clear.append("matched")
+
+        self._detach_silx_tree()
+        try:
+            removed_total = 0
+            for k in kinds_to_clear:
+                removed_total += file_model.clear_peaks(
+                    self.session.temp_path, entry, k
+                )
+        except Exception as exc:
+            QMessageBox.critical(self, "Clear failed", str(exc))
+            self._reattach_silx_tree()
+            return
+        self._reattach_silx_tree()
+
+        self.session.mark_dirty()
+        self._update_title()
+        # Bulk wipe invalidates every FileGeomAction and the selection.
+        self.viewer.clear_history()
+        self.viewer.clear_selection()
+        self._load_entry_into_viewer(entry, preserve_view=True)
+        self.pipeline_panel.append_log(
+            f"Cleared {kind} peaks ({removed_total} rows total) on {entry}"
+        )
+
+    def _confirm_clear(self, kind: str) -> bool:
+        descriptions = {
+            "manual":   ("manual peaks (in-memory)",
+                         "every manual peak in this session"),
+            "detected": ("detected peaks",
+                         "every row of detected_peaks for the active entry"),
+            "fitted":   ("fitted + matched peaks",
+                         "every row of fitted_peaks AND every matched_* "
+                         "solution for the active entry "
+                         "(matched references fitted, so it has to go too)"),
+            "matched":  ("matched peaks",
+                         "every matched_* solution for the active entry"),
+        }
+        title, body = descriptions.get(kind, (kind, kind))
+        reply = QMessageBox.question(
+            self,
+            f"Clear {title}",
+            f"Remove {body}?\n\nThis cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        return reply == QMessageBox.StandardButton.Yes
 
     def _build_view_menu(self) -> None:
         """Expose dock visibility toggles in a top-level View menu.
@@ -300,6 +403,8 @@ class MainWindow(QMainWindow):
             "<i>Polar mode: <b>Ctrl+Alt-drag</b> to label, click any peak "
             "(detected / fitted / matched / manual) to select, drag edges "
             "to resize detected/fitted, <b>Delete</b> to remove. "
+            "Add-to-fitted accepts manual or detected selections — the "
+            "cyan box previews the saved FWHM. "
             "<b>Ctrl+Z</b> / <b>Ctrl+Shift+Z</b> undo / redo.</i>"
         )
         hint.setWordWrap(True)
@@ -314,6 +419,15 @@ class MainWindow(QMainWindow):
 
         # Pipeline dock — tabified with Display on the right.
         self.pipeline_panel = PipelinePanel(self)
+        # Let the panel resolve "Active entry" / "Active frame" at click time
+        # without pulling MainWindow into its imports. Returning None for
+        # either falls through to mlgidBASE's all-entries / all-frames default.
+        self.pipeline_panel.set_active_entry_resolver(
+            lambda: self.entry_combo.currentText() or None
+        )
+        self.pipeline_panel.set_active_frame_resolver(
+            lambda: self.viewer.current_frame if self.session is not None else None
+        )
         self.pipeline_panel.runRequested.connect(self._on_pipeline_run)
         self._pipeline_dock = QDockWidget("Pipeline", self)
         self._pipeline_dock.setWidget(self.pipeline_panel)
@@ -678,22 +792,24 @@ class MainWindow(QMainWindow):
 
     def _on_selection_for_preview(self, sel: SelectedPeak | None) -> None:
         """Drop the fitted-preview overlay when the active selection isn't
-        a manual peak (the preview only makes sense as a what-if for
-        ``Add to fitted``, which is manual-only).
+        a candidate-for-fitted peak. Manual + detected are both candidates
+        — Add-to-fitted is enabled for either — so the preview is shown
+        for both kinds. Fitted / matched already have a stored box, so a
+        cyan refit overlay there would be visual noise.
         """
-        if sel is None or sel.kind != "manual":
+        if sel is None or sel.kind not in ("manual", "detected"):
             self.viewer.set_fitted_preview(None, None, None, None)
 
     def _update_fitted_preview(self, rfit, afit) -> None:
         """Sync the viewer's fitted-preview box to the latest 1D fits.
 
-        Only relevant for manual selections — file-resident peaks already
-        have a stored fitted box, so previewing a refit there would be
-        confusing. ``rfit`` / ``afit`` may be ``None`` (no convergence) →
-        clear the preview.
+        Relevant for manual + detected selections — both feed Add-to-fitted.
+        File-resident fitted / matched peaks already carry their stored box
+        and aren't previewed here. ``rfit`` / ``afit`` may be ``None`` (no
+        convergence) → clear the preview.
         """
         sel = self.viewer.selected_peak
-        if sel is None or sel.kind != "manual":
+        if sel is None or sel.kind not in ("manual", "detected"):
             self.viewer.set_fitted_preview(None, None, None, None)
             return
         if rfit is None or afit is None:
@@ -765,7 +881,9 @@ class MainWindow(QMainWindow):
                 self.session.mark_dirty()
             entry = self.entry_combo.currentText()
             if entry:
-                self._load_entry_into_viewer(entry)
+                # Same entry, same axes — preserve the user's zoom and
+                # frame across the overlay refresh.
+                self._load_entry_into_viewer(entry, preserve_view=True)
             self._update_title()
 
     def _on_add_to_detected(self) -> None:
@@ -790,18 +908,20 @@ class MainWindow(QMainWindow):
     def _on_add_to_fitted(self) -> None:
         """Append a row to fitted_peaks using the profile viewer's 1D fits.
 
-        Geometry comes from the radial / angular Gaussian centers (and FWHMs);
-        amplitude from the radial fit. Fields not measurable from 1D fits
-        (theta, A, B, C, score) get zeroed — downstream code that needs them
-        should re-run the proper 2D fit.
+        Accepts the active selection when ``kind`` is manual or detected —
+        both are candidate boxes whose 1D fit is the natural input for
+        fitted_peaks. Geometry comes from the radial / angular Gaussian
+        centers (and FWHMs); amplitude from the radial fit. Fields not
+        measurable from 1D fits (theta, A, B, C, score) get zeroed —
+        downstream code that needs them should re-run the proper 2D fit.
         """
         if self.session is None or self._pipe_thread is not None:
             return
         sel = self.viewer.selected_peak
         entry = self.entry_combo.currentText()
-        if sel is None or sel.kind != "manual" or sel.manual_ref is None or not entry:
+        if sel is None or sel.kind not in ("manual", "detected") or not entry:
             return
-        manual_peak = sel.manual_ref
+        is_ring = bool(sel.is_ring)
         frame = self.viewer.current_frame
 
         fits = self.profile_viewer.last_fit_params()
@@ -830,7 +950,7 @@ class MainWindow(QMainWindow):
                 # peak position matters most for downstream matching.
                 angle_width=float(2.0 * afit.fwhm),
                 amplitude=float(rfit.amplitude),
-                is_ring=manual_peak.is_ring,
+                is_ring=is_ring,
             )
         except KeyError as exc:
             QMessageBox.warning(self, "Add to fitted", str(exc))
@@ -842,19 +962,20 @@ class MainWindow(QMainWindow):
             return
         self._reattach_silx_tree()
 
-        # Manual peak stays selected so the user can also commit it to
-        # detected_peaks or keep editing the box; the cyan fitted overlay
-        # simply appears alongside the yellow manual box.
+        # Selection is left alone so the user can keep editing or commit
+        # again; the cyan fitted overlay simply appears alongside the
+        # original box.
         self.session.mark_dirty()
         self._update_title()
         # File-level mutation invalidates pending FileGeomActions whose ids
         # were ordered before the new row.
         self.viewer.clear_history()
         # Pull the fresh fitted_peaks (and matched, which references it) back
-        # into the viewer.
-        self._load_entry_into_viewer(entry)
+        # into the viewer — same entry, so preserve the user's zoom + frame.
+        self._load_entry_into_viewer(entry, preserve_view=True)
         self.pipeline_panel.append_log(
-            f"Added fitted peak id={new_id} on {entry}/frame{frame:05d}"
+            f"Added fitted peak id={new_id} (from {sel.kind}) on "
+            f"{entry}/frame{frame:05d}"
         )
 
     def _on_delete_peak_requested(self, sel: SelectedPeak | None) -> None:
@@ -953,25 +1074,37 @@ class MainWindow(QMainWindow):
                 "before running matching.",
             )
             return
-        cmd = PipelineCommand(
-            "run_matching",
-            {
-                "cif_prepr": cif.text().strip(),
-                "peaks_type": self.pipeline_panel.peaks_type.currentText(),
-                "threshold": float(self.pipeline_panel.threshold.value()),
-                "device": self.pipeline_panel.device.currentText(),
-            },
-        )
-        self._on_pipeline_run(cmd)
+        kwargs: dict = {
+            "cif_prepr": cif.text().strip(),
+            "peaks_type": self.pipeline_panel.peaks_type.currentText(),
+            "threshold": float(self.pipeline_panel.threshold.value()),
+            "device": self.pipeline_panel.device.currentText(),
+        }
+        # Mirror the Pipeline-dock default: scope to the active entry so a
+        # multi-entry file doesn't silently process siblings the user can't see.
+        active_entry = self.entry_combo.currentText() or None
+        if active_entry:
+            kwargs["entry"] = active_entry
+        self._on_pipeline_run(PipelineCommand("run_matching", kwargs))
 
-    def _load_entry_into_viewer(self, entry: str) -> None:
+    def _load_entry_into_viewer(
+        self, entry: str, *, preserve_view: bool = False
+    ) -> None:
+        """Load ``entry`` into the image viewer.
+
+        ``preserve_view``: when True, the viewer keeps its current zoom and
+        frame index across the reload. Used after pipeline ops and direct
+        h5py edits (the underlying stack is unchanged — only peak overlays
+        are different). Switching to a different entry passes False so the
+        viewer auto-ranges to the new axes.
+        """
         assert self.session is not None
         try:
             stack = file_model.load_entry(self.session.temp_path, entry)
         except Exception as exc:
             QMessageBox.warning(self, "Load failed", f"Could not load {entry}: {exc}")
             return
-        self.viewer.show_stack(stack)
+        self.viewer.show_stack(stack, preserve_view=preserve_view)
         for frame in range(stack.n_frames):
             try:
                 peaks = file_model.load_peaks(self.session.temp_path, entry, frame)

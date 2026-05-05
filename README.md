@@ -90,6 +90,10 @@ input.
 - **View menu.** Toggles for every dock (mirrors the right-click title-bar
   menu).
 - **Edit menu.** Undo / Redo entries with the standard shortcuts.
+- **Tools menu.** Bulk operations that don't fit the per-peak ROI
+  workflow. Today: clear-all of one peak kind (manual / detected /
+  fitted / matched) for the active entry. Clearing fitted also clears
+  matched, since matched_* references fitted ids.
 
 ## Repository layout
 
@@ -123,6 +127,45 @@ example/             Sample NeXus file + matching CIF pickle
 - The undo stack uses an Action protocol (`ManualAddAction`,
   `ManualRemoveAction`, `ManualGeomAction`, `FileGeomAction`). Pipeline
   ops that reshuffle ids invalidate the stack and clear it on completion.
+
+## Tools menu — future ideas
+
+The Tools menu is the home for batch / cross-cutting operations. Likely
+additions, roughly in order of effort:
+
+- **Re-fit all detected peaks.** One-click sweep that runs the radial /
+  angular Gaussian fit on every detected_peaks row and appends the
+  results to fitted_peaks.
+- **Run full pipeline.** Detection → Fitting → Matching as a single
+  chained job, scoped by the same Active-entry / All-entries dropdown.
+- **Apply intensity threshold.** Bulk-delete peaks whose amplitude is
+  below a user-set value (per kind), useful for pruning low-confidence
+  detections after a noisy run.
+- **Copy peaks across frames.** Take the current frame's peaks of one
+  kind and replicate to a frame range — useful when a series shares
+  one diffraction pattern.
+- **Symmetrize peaks.** Mirror peaks across q_z = 0 (or any user-chosen
+  axis) — shorthand for the common GIWAXS symmetry assumption.
+- **Export peaks to CSV.** Per-frame or stacked CSV of detected /
+  fitted / matched tables for downstream analysis in pandas / Excel.
+- **Export image as PNG.** Snapshot the current Cartesian or polar
+  view at full resolution with overlays included.
+- **Frame statistics.** Per-frame histogram of peak counts (detected /
+  fitted / matched), fit-quality score distributions, ring vs segment
+  ratios — useful as a glance health check for a series.
+- **Diff against baseline.** Compare two open files and highlight
+  per-frame differences in detected / fitted peaks; helpful when
+  tweaking detection configs.
+- **Reset analysis.** Single-click "Clear detected + fitted +
+  matched" — the common "I want to redo from scratch" combo.
+- **Recompute polar transform.** Force a refresh of the cached polar
+  stack (e.g. after editing pygid metadata externally).
+- **Save snapshot.** Snapshot the temp file alongside an annotation
+  message so the user can step back to known-good states without
+  Save-As-ing the original.
+
+These are deliberately quick, self-contained operations; anything that
+requires its own dock or custom widgets should live elsewhere.
 
 ## Status
 
