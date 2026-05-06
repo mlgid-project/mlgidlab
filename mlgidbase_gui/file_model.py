@@ -13,6 +13,18 @@ import numpy as np
 
 ENTRY_PREFIX = "entry_"
 FRAME_KEY_FMT = "frame{:05d}"
+
+
+def is_entry_group_name(name: str) -> bool:
+    """Whether ``name`` looks like a NeXus entry group.
+
+    pygid's default writer uses ``entry_0000``, ``entry_0001``, …, but
+    other writers expose a single ``entry`` group (no numeric suffix)
+    or use mnemonic suffixes like ``entry_horiz``. Both forms are valid
+    NeXus and we shouldn't filter out files just because their entries
+    don't follow the numeric-suffix convention.
+    """
+    return name == "entry" or name.startswith(ENTRY_PREFIX)
 ANALYSIS_REL = "data/analysis"
 IMG_REL = "data/img_gid_q"
 QXY_REL = "data/q_xy"
@@ -70,9 +82,42 @@ class EntryStack:
 
 
 def list_entries(file_path: Path) -> list[str]:
-    """Return entry group names like ['entry_0000', 'entry_0001'] in sorted order."""
+    """Return q-image entry names in sorted order.
+
+    Only ``img_gid_q`` entries are exposed: those are the ones the viewer
+    knows how to render and the only ones mlgidDETECT / mlgidFIT actually
+    process. Polar entries (``img_gid_pol``) and any non-q sibling groups
+    are filtered out so the entry dropdown can't lead the user to an
+    entry that would silently no-op a pipeline run or crash the loader.
+
+    The filter mirrors pygid's reading convention: each entry's ``data``
+    group has a ``signal`` attribute naming the active image dataset.
+    """
+    return [name for name, signal in list_entry_signals(file_path).items()
+            if signal == "img_gid_q"]
+
+
+def list_entry_signals(file_path: Path) -> dict[str, str | None]:
+    """Return ``{entry_name: signal_or_None}`` for every entry_* group.
+
+    Used by the host to diagnose files that load with no usable entries
+    (the entry combo would otherwise look mysteriously empty when the
+    file contains only 1D-cut entries or polar-only data).
+    """
+    out: dict[str, str | None] = {}
     with h5py.File(file_path, "r") as f:
-        return sorted(name for name in f if name.startswith(ENTRY_PREFIX))
+        for name in sorted(f.keys()):
+            if not is_entry_group_name(name):
+                continue
+            data = f.get(f"{name}/data")
+            if data is None:
+                out[name] = None
+                continue
+            signal = data.attrs.get("signal")
+            if isinstance(signal, bytes):
+                signal = signal.decode("utf-8", errors="replace")
+            out[name] = signal if isinstance(signal, str) else None
+    return out
 
 
 def load_entry(file_path: Path, entry: str) -> EntryStack:
@@ -284,6 +329,86 @@ def add_fitted_peak_row(
         for k, v in attrs.items():
             new_ds.attrs[k] = v
         return new_id
+
+
+def normalize_for_pygid(file_path: Path) -> dict[str, list[str]]:
+    """Patch every entry so pygid's per-frame writers / readers behave.
+
+    Two normalizations are applied to the temp copy (the original file
+    is never touched):
+
+    1. **0-D ``angle_of_incidence``** → 1-D length-``n_frames`` array.
+       ``pygid.nexus_reader.get_ai`` indexes by ``frame_num``; a 0-D
+       scalar dataset (some writers do this for single-frame data)
+       raises ``IndexError: invalid index to scalar variable`` and
+       blocks every pipeline op before it starts.
+
+    2. **Missing per-frame analysis groups** → empty groups created.
+       ``pygid.datasaver._save_img_container_detect`` (called from
+       ``mlgidbase.save_detect`` / ``save_fit`` / matched-write paths)
+       assumes ``data/analysis/frame{N:05d}`` already exists. Files
+       written for a single frame only ship with ``frame00000``; the
+       per-frame detection / fitting code then errors with
+       ``KeyError: 'frameXXXXX' doesn't exist`` when run on any
+       higher-numbered frame. We pre-create the missing groups with
+       the same NX attrs pygid uses in the bulk save path.
+
+    Returns a dict ``{"angle": [...], "frames": [...]}`` describing
+    which entries were patched in each pass (for logging). Idempotent
+    on already-normalized files.
+    """
+    patched_angle: list[str] = []
+    patched_frames: list[str] = []
+    with h5py.File(file_path, "r+") as f:
+        for entry_name in list(f.keys()):
+            if not is_entry_group_name(entry_name):
+                continue
+            entry = f[entry_name]
+            # Look up n_frames from the entry's primary signal dataset.
+            data = entry.get("data")
+            if data is None:
+                continue
+            signal = data.attrs.get("signal")
+            if isinstance(signal, bytes):
+                signal = signal.decode("utf-8", errors="replace")
+            if not signal or signal not in data:
+                continue
+            n_frames = int(data[signal].shape[0])
+
+            # --- 1. angle_of_incidence: scalar → 1-D
+            ai_path = "instrument/angle_of_incidence"
+            if ai_path in entry:
+                ai_ds = entry[ai_path]
+                # A length-mismatched 1-D field is intentionally not
+                # "fixed" because the per-frame values may legitimately
+                # differ (true per-frame metadata) and broadcasting
+                # would silently lie.
+                if ai_ds.ndim == 0:
+                    scalar_value = float(ai_ds[()])
+                    new_arr = np.full((n_frames,), scalar_value, dtype=np.float64)
+                    attrs = dict(ai_ds.attrs)
+                    del entry[ai_path]
+                    new_ds = entry.create_dataset(ai_path, data=new_arr)
+                    for k, v in attrs.items():
+                        new_ds.attrs[k] = v
+                    patched_angle.append(entry_name)
+
+            # --- 2. analysis/frameXXXXX groups: pre-create missing ones
+            analysis = entry.require_group("data/analysis")
+            created_any = False
+            for i in range(n_frames):
+                group_name = FRAME_KEY_FMT.format(i)
+                if group_name not in analysis:
+                    g = analysis.create_group(group_name)
+                    # Match the NX attrs pygid sets in its bulk save path
+                    # so downstream readers don't choke on stricter
+                    # NeXus validators.
+                    g.attrs["NX_class"] = "NXparameters"
+                    g.attrs["EX_required"] = "true"
+                    created_any = True
+            if created_any:
+                patched_frames.append(entry_name)
+    return {"angle": patched_angle, "frames": patched_frames}
 
 
 def clear_peaks(file_path: Path, entry: str, kind: str) -> int:

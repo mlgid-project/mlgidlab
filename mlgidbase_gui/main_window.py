@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressDialog,
+    QSlider,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -41,7 +42,7 @@ from mlgidbase_gui.pipeline import (
 from mlgidbase_gui.pipeline_panel import PipelinePanel
 from mlgidbase_gui.profile_viewer import ProfileViewer
 from mlgidbase_gui.session import Session
-from mlgidbase_gui.workers import CopyWorker, PipelineWorker
+from mlgidbase_gui.workers import CifParseWorker, CopyWorker, PipelineWorker
 
 APP_NAME = "mlgidBASE GUI"
 NEXUS_FILTER = "HDF5 / NeXus (*.h5 *.hdf5 *.nxs);;All files (*)"
@@ -87,6 +88,17 @@ class MainWindow(QMainWindow):
         self._progress: QProgressDialog | None = None
         self._pipe_thread: QThread | None = None
         self._pipe_worker: PipelineWorker | None = None
+        # Queue of PipelineCommands waiting to run sequentially. The
+        # "All entries" option in the pipeline panel expands to one
+        # command per entry; each finished run dequeues the next so the
+        # user gets per-entry log lines and per-entry error recovery.
+        self._pipeline_queue: list[PipelineCommand] = []
+        # CIF-parse worker thread. CifPattern construction is slow for
+        # raw CIFs so we run it off the GUI thread; only one parse runs
+        # at a time (the panel's button stays disabled while it's in
+        # flight).
+        self._cif_parse_thread: QThread | None = None
+        self._cif_parse_worker: CifParseWorker | None = None
 
         self.setWindowTitle(APP_NAME)
         self.resize(1400, 900)
@@ -145,27 +157,32 @@ class MainWindow(QMainWindow):
         full roadmap.
         """
         tools_menu = bar.addMenu("&Tools")
-        self.action_clear_manual = QAction("Clear all manual peaks", self)
-        self.action_clear_manual.triggered.connect(self._action_clear_manual)
-        tools_menu.addAction(self.action_clear_manual)
+        # The four clear-* actions all do the same kind of thing (wipe one
+        # peak family) so they live under a single hover-expanding
+        # "Clear peaks" submenu rather than cluttering the Tools root.
+        clear_menu = tools_menu.addMenu("&Clear peaks")
 
-        self.action_clear_detected = QAction("Clear all detected peaks", self)
+        self.action_clear_manual = QAction("Manual", self)
+        self.action_clear_manual.triggered.connect(self._action_clear_manual)
+        clear_menu.addAction(self.action_clear_manual)
+
+        self.action_clear_detected = QAction("Detected", self)
         self.action_clear_detected.triggered.connect(
             lambda: self._action_clear_file_peaks("detected")
         )
-        tools_menu.addAction(self.action_clear_detected)
+        clear_menu.addAction(self.action_clear_detected)
 
-        self.action_clear_fitted = QAction("Clear all fitted peaks", self)
+        self.action_clear_fitted = QAction("Fitted", self)
         self.action_clear_fitted.triggered.connect(
             lambda: self._action_clear_file_peaks("fitted")
         )
-        tools_menu.addAction(self.action_clear_fitted)
+        clear_menu.addAction(self.action_clear_fitted)
 
-        self.action_clear_matched = QAction("Clear all matched peaks", self)
+        self.action_clear_matched = QAction("Matched", self)
         self.action_clear_matched.triggered.connect(
             lambda: self._action_clear_file_peaks("matched")
         )
-        tools_menu.addAction(self.action_clear_matched)
+        clear_menu.addAction(self.action_clear_matched)
 
     def _action_clear_manual(self) -> None:
         """Drop every manual peak. In-memory only, no file write."""
@@ -335,7 +352,36 @@ class MainWindow(QMainWindow):
         self.entry_combo = QComboBox()
         self.entry_combo.currentTextChanged.connect(self._on_entry_changed)
         form.addRow("Entry:", self.entry_combo)
+
+        # Frame slider — bidirectional sync with the image viewer's
+        # built-in timeline. Hidden for single-frame stacks where it
+        # would just take vertical space without any function.
+        self.frame_slider = QSlider(Qt.Orientation.Horizontal)
+        self.frame_slider.setMinimum(0)
+        self.frame_slider.setMaximum(0)
+        self.frame_slider.setSingleStep(1)
+        self.frame_slider.setPageStep(1)
+        self.frame_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.frame_slider.setTickInterval(1)
+        self.frame_slider.valueChanged.connect(self._on_frame_slider_changed)
+        self.frame_label = QLabel("Frame —")
+        self.frame_label.setMinimumWidth(80)
+        self.frame_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        frame_row = QWidget()
+        frame_h = QHBoxLayout(frame_row)
+        frame_h.setContentsMargins(0, 0, 0, 0)
+        frame_h.setSpacing(6)
+        frame_h.addWidget(self.frame_slider, 1)
+        frame_h.addWidget(self.frame_label)
+        # Stash the row's parent label so we can hide both in unison.
+        self._frame_row_widget = frame_row
+        form.addRow("Frame:", frame_row)
         layout.addLayout(form)
+        # Both the slider and its "Frame:" label start hidden — they're
+        # only useful once a multi-frame stack is loaded.
+        self._set_frame_slider_visible(False)
 
         layout.addWidget(QLabel("Overlays"))
         self._overlay_checks: dict[str, QCheckBox] = {}
@@ -402,9 +448,10 @@ class MainWindow(QMainWindow):
         hint = QLabel(
             "<i>Polar mode: <b>Ctrl+Alt-drag</b> to label, click any peak "
             "(detected / fitted / matched / manual) to select, drag edges "
-            "to resize detected/fitted, <b>Delete</b> to remove. "
+            "to resize manual / detected, <b>Delete</b> to remove. "
             "Add-to-fitted accepts manual or detected selections — the "
             "cyan box previews the saved FWHM. "
+            "<b>LMB double-click</b> resets zoom. "
             "<b>Ctrl+Z</b> / <b>Ctrl+Shift+Z</b> undo / redo.</i>"
         )
         hint.setWordWrap(True)
@@ -428,7 +475,8 @@ class MainWindow(QMainWindow):
         self.pipeline_panel.set_active_frame_resolver(
             lambda: self.viewer.current_frame if self.session is not None else None
         )
-        self.pipeline_panel.runRequested.connect(self._on_pipeline_run)
+        self.pipeline_panel.runRequested.connect(self._on_run_requested)
+        self.pipeline_panel.parseCifsRequested.connect(self._on_parse_cifs_requested)
         self._pipeline_dock = QDockWidget("Pipeline", self)
         self._pipeline_dock.setWidget(self.pipeline_panel)
         self._pipeline_dock.setObjectName("PipelineDock")
@@ -447,6 +495,11 @@ class MainWindow(QMainWindow):
             [self._profile_dock], [max(self.height() // 3, 280)], Qt.Orientation.Vertical
         )
         self.viewer.frameChanged.connect(self.profile_viewer.set_frame)
+        # Bidirectional Display-dock slider sync: viewer pushes frame
+        # changes into the slider (e.g. user scrubs the pyqtgraph
+        # timeline below the image), and the slider's valueChanged
+        # already pushes back into the viewer via _on_frame_slider_changed.
+        self.viewer.frameChanged.connect(self._on_viewer_frame_changed)
         # Bidirectional sync between 2D ROI and profile-edge regions. The
         # profile viewer only handles ManualPeak, so we filter the
         # SelectedPeak-typed signals down to the manual case before forwarding.
@@ -470,8 +523,10 @@ class MainWindow(QMainWindow):
         # delete reuse the existing PipelineWorker path.
         self.parameter_panel.addToDetectedRequested.connect(self._on_add_to_detected)
         self.parameter_panel.addToFittedRequested.connect(self._on_add_to_fitted)
-        self.parameter_panel.runFittingRequested.connect(self._on_run_fitting_from_panel)
-        self.parameter_panel.runMatchingRequested.connect(self._on_run_matching_from_panel)
+        # Refresh the cyan preview overlay immediately when the user
+        # toggles ring/segment — otherwise the preview would lag until
+        # the next fit recompute.
+        self.parameter_panel.saveAsRingChanged.connect(self._on_save_as_ring_changed)
         self.parameter_panel.deletePeakRequested.connect(
             lambda: self._on_delete_peak_requested(self.viewer.selected_peak)
         )
@@ -496,10 +551,32 @@ class MainWindow(QMainWindow):
         self._process_open_queue()
 
     def _process_open_queue(self) -> None:
-        """Kick off the next queued open if no copy is in flight."""
-        if self._thread is not None or not self._open_queue:
+        """Kick off the next queued open if no copy is in flight.
+
+        When the queue is exhausted the shared progress dialog is finally
+        closed and destroyed — see the comment in ``_open_path`` for why
+        we keep one dialog spanning the batch instead of creating a fresh
+        one per file.
+        """
+        if self._thread is not None:
+            return
+        if not self._open_queue:
+            self._dismiss_open_progress()
             return
         self._open_path(self._open_queue.pop(0))
+
+    def _dismiss_open_progress(self) -> None:
+        """Hide + destroy the shared open-progress dialog, if any."""
+        if self._progress is None:
+            return
+        self._progress.close()
+        # ``close()`` only hides the dialog and keeps it parented to the
+        # MainWindow as a hidden child; the WindowModal overlay state on
+        # the parent isn't fully released until the dialog is destroyed.
+        # ``deleteLater`` schedules destruction on the next event-loop
+        # turn, which is what un-dims the window.
+        self._progress.deleteLater()
+        self._progress = None
 
     def _action_save(self) -> None:
         self._save(confirm=True)
@@ -570,12 +647,21 @@ class MainWindow(QMainWindow):
         self._thread.started.connect(self._worker.run)
         self._worker.finished.connect(self._on_open_finished)
 
-        self._progress = QProgressDialog("Opening file…", "", 0, 0, self)
-        self._progress.setWindowTitle(APP_NAME)
-        self._progress.setWindowModality(Qt.WindowModality.WindowModal)
-        self._progress.setCancelButton(None)
-        self._progress.setMinimumDuration(0)
-        self._progress.show()
+        # One shared progress dialog spans the whole open queue. Creating
+        # a new WindowModal QProgressDialog per file (and only ``close()``-
+        # ing the previous one) used to leave the parent visibly dimmed
+        # across the entire batch — Qt re-applied the modal overlay
+        # before the previous dialog's hide had finished painting, and
+        # the parented hidden dialogs accumulated as zombie children.
+        if self._progress is None:
+            self._progress = QProgressDialog("Opening file…", "", 0, 0, self)
+            self._progress.setWindowTitle(APP_NAME)
+            self._progress.setWindowModality(Qt.WindowModality.WindowModal)
+            self._progress.setCancelButton(None)
+            self._progress.setMinimumDuration(0)
+            self._progress.show()
+        # Per-file label so the user can see which file is being copied.
+        self._progress.setLabelText(f"Opening {path.name}…")
 
         self._thread.start()
 
@@ -590,13 +676,33 @@ class MainWindow(QMainWindow):
         if self._worker is not None:
             self._worker.deleteLater()
             self._worker = None
-        if self._progress is not None:
-            self._progress.close()
-            self._progress = None
+        # Progress dialog is *not* closed per file — it spans the whole
+        # queue and is dismissed by ``_process_open_queue`` once the
+        # queue is empty. Closing here would re-trigger the modal flicker
+        # that this consolidation was meant to avoid.
 
         if error is not None:
             QMessageBox.critical(self, "Open failed", str(error))
         elif session is not None:
+            # Patch any pygid-incompatible metadata in the temp copy
+            # (e.g. 0-D angle_of_incidence) before silx + the pipeline
+            # see it. Failure here is non-fatal — the file might still
+            # work for normal viewing even if a pipeline run later
+            # complains.
+            try:
+                patched = file_model.normalize_for_pygid(session.temp_path)
+            except Exception:
+                patched = {"angle": [], "frames": []}
+            if patched["angle"]:
+                self.pipeline_panel.append_log(
+                    "Normalized 0-D angle_of_incidence in: "
+                    + ", ".join(patched["angle"])
+                )
+            if patched["frames"]:
+                self.pipeline_panel.append_log(
+                    "Created missing per-frame analysis groups in: "
+                    + ", ".join(patched["frames"])
+                )
             self._sessions.append(session)
             self.tree.findHdf5TreeModel().insertFile(str(session.temp_path))
             # Newly-opened file becomes the active one — the user almost
@@ -661,8 +767,17 @@ class MainWindow(QMainWindow):
         self.entry_combo.clear()
         self.entry_combo.blockSignals(False)
         self._active_session = session
+        # ExpParameters are derived from the active NeXus metadata, so a
+        # CIF cache built against the prior session may be misleading
+        # for the new one. Forget it; the user can re-Parse when ready.
+        if hasattr(self, "pipeline_panel"):
+            self.pipeline_panel.clear_cif_cache()
         if session is not None:
             self._populate_entries()
+        else:
+            # No active session → wipe the per-entry options on the
+            # pipeline panel so they don't reference a closed file.
+            self.pipeline_panel.set_available_entries([])
         self._update_title()
         self._update_actions()
 
@@ -718,13 +833,132 @@ class MainWindow(QMainWindow):
         self.entry_combo.clear()
         self.entry_combo.addItems(entries)
         self.entry_combo.blockSignals(False)
+        # Push the same entry list into the pipeline panel's per-section
+        # scope dropdowns so the user can pick a specific entry instead
+        # of being limited to ACTIVE / ALL.
+        self.pipeline_panel.set_available_entries(entries)
         if entries:
             self._load_entry_into_viewer(entries[0])
+        else:
+            # Empty entry combo isn't always "empty file" — it's much more
+            # often "file has entries but none are 2D q-images". Tell the
+            # user exactly what's in the file so they don't think the GUI
+            # silently dropped a working file.
+            self._warn_no_q_entries()
+
+    def _warn_no_q_entries(self) -> None:
+        """Diagnose why the entry combo ended up empty.
+
+        The viewer + pipeline only handle ``img_gid_q`` entries. Files
+        with reduced-data entries (``horiz_cut_gid``, ``rad_cut_gid``,
+        polar-only ``img_gid_pol``, etc.) load fine but produce no
+        viewable entry, which previously looked like the GUI broke.
+        """
+        try:
+            signals = file_model.list_entry_signals(self.session.temp_path)
+        except Exception:
+            signals = {}
+        if not signals:
+            # Truly empty — file genuinely has no entry_* groups.
+            QMessageBox.information(
+                self,
+                "Nothing to show",
+                f"{self.session.original_path.name} has no entry_* groups "
+                "to display.",
+            )
+            return
+        rows = "\n".join(
+            f"  • {name} — signal = {signal!r}"
+            for name, signal in signals.items()
+        )
+        QMessageBox.information(
+            self,
+            "No 2D q-image entries",
+            f"{self.session.original_path.name} loaded successfully but "
+            "contains no entries with the 2D q-image data the viewer + "
+            "pipeline operate on (signal = 'img_gid_q').\n\n"
+            f"Entries found:\n{rows}\n\n"
+            "These are likely reduced data (1D cuts, polar grids, or "
+            "post-processed outputs). To use the GUI's detection / "
+            "fitting / matching tools, open a NeXus file produced by "
+            "the pygid → mlgidDETECT pipeline that still carries the "
+            "raw q-image stack.",
+        )
 
     def _on_entry_changed(self, entry: str) -> None:
         if not entry or self.session is None:
             return
         self._load_entry_into_viewer(entry)
+
+    def _on_frame_slider_changed(self, value: int) -> None:
+        """User dragged the Display-dock slider — push to the viewer.
+
+        ``viewer.set_frame`` is a no-op when ``value`` already matches
+        the current frame, so the bidirectional sync (slider→viewer→
+        slider via _on_viewer_frame_changed) doesn't recurse.
+        """
+        self.viewer.set_frame(value)
+
+    def _on_viewer_frame_changed(self, frame: int) -> None:
+        """Viewer changed frame (timeline scrub, programmatic seek, etc.)
+        — keep the Display-dock slider + label in sync without
+        re-emitting valueChanged back into the viewer.
+        """
+        self.frame_label.setText(self._frame_label_text(frame))
+        if self.frame_slider.value() == frame:
+            return
+        self.frame_slider.blockSignals(True)
+        try:
+            self.frame_slider.setValue(int(frame))
+        finally:
+            self.frame_slider.blockSignals(False)
+
+    def _refresh_frame_slider(self) -> None:
+        """Match the slider's range + value to the active stack's
+        frame count. Called after every show_stack — covers entry
+        switches, file opens, and pipeline-finished reloads.
+        Single-frame stacks hide the row entirely.
+        """
+        n = self.viewer.n_frames
+        cur = self.viewer.current_frame
+        self.frame_slider.blockSignals(True)
+        try:
+            if n <= 1:
+                self.frame_slider.setMinimum(0)
+                self.frame_slider.setMaximum(0)
+                self.frame_slider.setValue(0)
+            else:
+                self.frame_slider.setMinimum(0)
+                self.frame_slider.setMaximum(n - 1)
+                self.frame_slider.setValue(int(cur))
+        finally:
+            self.frame_slider.blockSignals(False)
+        self.frame_label.setText(self._frame_label_text(cur))
+        self._set_frame_slider_visible(n > 1)
+
+    def _set_frame_slider_visible(self, visible: bool) -> None:
+        """Show or hide the slider row + its left-column label.
+
+        QFormLayout doesn't have a single "hide row" call in older
+        PySide6 versions, so we pull the label widget out of the form
+        directly and toggle it alongside the slider widget.
+        """
+        self._frame_row_widget.setVisible(visible)
+        # The left-column "Frame:" label was added by addRow; reach it
+        # via labelForField so it hides in lockstep.
+        form = self._frame_row_widget.parentWidget().layout()
+        try:
+            label = form.labelForField(self._frame_row_widget)
+        except Exception:
+            label = None
+        if label is not None:
+            label.setVisible(visible)
+
+    def _frame_label_text(self, idx: int) -> str:
+        n = self.viewer.n_frames
+        if n <= 1:
+            return "Frame —"
+        return f"Frame {int(idx)} / {n - 1}"
 
     def _on_tree_selection_changed(self, *_: object) -> None:
         nodes = list(self.tree.selectedH5Nodes())
@@ -737,6 +971,10 @@ class MainWindow(QMainWindow):
         # combo, image viewer, and per-file actions follow the user's
         # focus without an extra click.
         self._activate_session_for_node(node)
+        # Click into entry_X anywhere → switch the image tab to that
+        # entry. The entry-combo signal already triggers the viewer
+        # reload, so we just push the new value here.
+        self._activate_entry_for_node(node)
 
     def _on_tree_activated(self, *_: object) -> None:
         nodes = list(self.tree.selectedH5Nodes())
@@ -746,14 +984,76 @@ class MainWindow(QMainWindow):
         self.data_viewer.setData(node)
         self.tabs.setCurrentWidget(self.data_viewer)
         self._activate_session_for_node(node)
+        self._activate_entry_for_node(node)
+
+    def _activate_entry_for_node(self, node) -> None:
+        """If the clicked node is inside an ``entry_*`` group, switch the
+        entry combo (and therefore the image viewer) to that entry.
+
+        No-ops for clicks on the file root or on nodes outside any entry
+        group (e.g. top-level metadata). Also no-ops if the entry isn't
+        in the combo — that would mean it's a non-q entry filtered out
+        by ``list_entries``, where the viewer can't render anything
+        useful anyway.
+        """
+        entry = self._node_entry_name(node)
+        if entry is None:
+            return
+        if self.entry_combo.findText(entry) < 0:
+            return
+        if self.entry_combo.currentText() == entry:
+            return
+        # Triggers _on_entry_changed → _load_entry_into_viewer.
+        self.entry_combo.setCurrentText(entry)
+
+    @staticmethod
+    def _node_entry_name(node) -> str | None:
+        """Extract the ``entry_*`` group name from a node's HDF5 path.
+
+        silx exposes the absolute path as ``local_name`` (e.g.
+        ``/entry_0000/data/img_gid_q``); we take the first component if
+        it begins with ``entry_``. Returns None for nodes outside any
+        entry group.
+        """
+        for getter in (
+            lambda n: getattr(n, "local_name", None),
+            lambda n: n.h5py_object.name,
+        ):
+            try:
+                p = getter(node)
+            except Exception:
+                continue
+            if p:
+                parts = str(p).lstrip("/").split("/")
+                if parts and file_model.is_entry_group_name(parts[0]):
+                    return parts[0]
+                return None
+        return None
 
     def _activate_session_for_node(self, node) -> None:
-        """If ``node`` lives in a non-active session's file, swap active."""
+        """If ``node`` lives in a non-active session's file, swap active.
+
+        silx normalizes paths through the OS, so a literal ``Path`` equality
+        with ``session.temp_path`` can fail when one side has a symlink,
+        dotfile component, or trailing slash that the other doesn't —
+        previously this silently left the wrong session active and the
+        pipeline ran on the most recently opened file regardless of which
+        tree the user clicked. ``Path.resolve()`` collapses both sides to
+        a canonical absolute form before the comparison.
+        """
         fname = self._node_filename(node)
         if fname is None:
             return
+        try:
+            target = fname.resolve()
+        except OSError:
+            target = fname
         for s in self._sessions:
-            if s.temp_path == fname:
+            try:
+                temp = s.temp_path.resolve()
+            except OSError:
+                temp = s.temp_path
+            if temp == target:
                 if s is not self._active_session:
                     self._set_active_session(s)
                 return
@@ -806,21 +1106,143 @@ class MainWindow(QMainWindow):
         Relevant for manual + detected selections — both feed Add-to-fitted.
         File-resident fitted / matched peaks already carry their stored box
         and aren't previewed here. ``rfit`` / ``afit`` may be ``None`` (no
-        convergence) → clear the preview.
+        convergence) → clear the preview unless we're previewing a ring,
+        in which case only ``rfit`` matters.
         """
         sel = self.viewer.selected_peak
         if sel is None or sel.kind not in ("manual", "detected"):
             self.viewer.set_fitted_preview(None, None, None, None)
             return
-        if rfit is None or afit is None:
+        save_as_ring = self.parameter_panel.save_as_ring()
+        if rfit is None:
+            self.viewer.set_fitted_preview(None, None, None, None)
+            return
+        if save_as_ring:
+            # Angular fit isn't required for rings — pass placeholders.
+            self.viewer.set_fitted_preview(
+                float(rfit.center), float(rfit.fwhm),
+                None, None,
+                is_ring=True,
+            )
+            return
+        if afit is None:
             self.viewer.set_fitted_preview(None, None, None, None)
             return
         self.viewer.set_fitted_preview(
             float(rfit.center), float(rfit.fwhm),
             float(afit.center), float(afit.fwhm),
+            is_ring=False,
         )
 
+    def _on_save_as_ring_changed(self, is_ring: bool) -> None:
+        """Toggle between segment / ring preview without waiting for the
+        next profile recompute. Also tells the profile viewer to skip the
+        angular Gaussian fit while ring is active — that fit wouldn't be
+        saved by Add-to-fitted in ring mode.
+        """
+        # Drop the angular fit *before* recomputing the preview so the
+        # cached afit is None when _update_fitted_preview reads it.
+        self.profile_viewer.set_skip_angular_fit(is_ring)
+        fits = self.profile_viewer.last_fit_params()
+        self._update_fitted_preview(fits.get("radial"), fits.get("angular"))
+
     # -- Pipeline --
+
+    def _on_parse_cifs_requested(self, cif_input: str) -> None:
+        """Run CIF parsing on a worker thread + post the result back.
+
+        CIF preprocessing simulates every CIF and can take several
+        seconds; the worker keeps the GUI responsive. Only one parse
+        runs at a time — the panel's button stays disabled until we
+        post the result back via ``set_cif_pattern``.
+        """
+        if self._cif_parse_thread is not None:
+            return
+        if self.session is None:
+            self.pipeline_panel.set_cif_pattern(
+                None, RuntimeError("Open a NeXus file first.")
+            )
+            return
+        nexus_file = self.session.temp_path
+        self._cif_parse_thread = QThread(self)
+        self._cif_parse_worker = CifParseWorker(cif_input, nexus_file)
+        self._cif_parse_worker.moveToThread(self._cif_parse_thread)
+        self._cif_parse_thread.started.connect(self._cif_parse_worker.run)
+        self._cif_parse_worker.finished.connect(self._on_parse_cifs_finished)
+        self._cif_parse_thread.start()
+
+    def _on_parse_cifs_finished(
+        self, result: object | None, error: Exception | None
+    ) -> None:
+        if self._cif_parse_thread is not None:
+            self._cif_parse_thread.quit()
+            self._cif_parse_thread.wait()
+            self._cif_parse_thread.deleteLater()
+            self._cif_parse_thread = None
+        if self._cif_parse_worker is not None:
+            self._cif_parse_worker.deleteLater()
+            self._cif_parse_worker = None
+        self.pipeline_panel.set_cif_pattern(result, error)
+        if error is not None:
+            self.pipeline_panel.append_log(f"CIF parse failed: {error}")
+        elif result is not None:
+            n = len(getattr(result, "cifs", []) or [])
+            self.pipeline_panel.append_log(
+                f"CIF cache loaded ({n} CIFs) — reused across matching runs"
+            )
+
+    def _on_run_requested(self, command: PipelineCommand) -> None:
+        """Dispatch a runRequested command from the pipeline panel.
+
+        "All entries" runs are expanded into one ``PipelineCommand`` per
+        q-entry and queued sequentially — the user gets per-entry log
+        lines and a single bad entry doesn't strand the others. A command
+        that already names an explicit ``entry`` (or runs on a file with
+        a single entry) goes straight through unchanged.
+
+        ``add_peak`` and ``delete_peak`` always carry a specific
+        ``entry`` already; only the run_* ops are subject to expansion.
+        """
+        if self.session is None:
+            return
+        if (
+            command.op_name in ("run_detection", "run_fitting", "run_matching")
+            and "entry" not in command.kwargs
+        ):
+            try:
+                entries = file_model.list_entries(self.session.temp_path)
+            except Exception as exc:
+                QMessageBox.warning(
+                    self, "Pipeline", f"Could not list entries: {exc}"
+                )
+                return
+            if not entries:
+                # No q-entries to run on — fall through and let mlgidbase
+                # raise its usual "no entries" message in the log.
+                self._enqueue_pipeline(command)
+                return
+            for entry in entries:
+                self._enqueue_pipeline(
+                    PipelineCommand(
+                        command.op_name,
+                        {**command.kwargs, "entry": entry},
+                    )
+                )
+        else:
+            self._enqueue_pipeline(command)
+
+    def _enqueue_pipeline(self, command: PipelineCommand) -> None:
+        """Queue ``command`` and start it if no run is in flight."""
+        self._pipeline_queue.append(command)
+        if self._pipe_thread is None:
+            self._run_next_pipeline_command()
+
+    def _run_next_pipeline_command(self) -> None:
+        """Pop the next queued command and start it, if any."""
+        if self._pipe_thread is not None or not self._pipeline_queue:
+            return
+        command = self._pipeline_queue.pop(0)
+        self._on_pipeline_run(command)
 
     def _on_pipeline_run(self, command: PipelineCommand) -> None:
         if self.session is None or self._pipe_thread is not None:
@@ -835,7 +1257,18 @@ class MainWindow(QMainWindow):
         if command.op_name != "add_peak":
             self.viewer.clear_history()
             self.viewer.clear_selection()
-        self.pipeline_panel.append_log(f"--- {command.op_name} ---")
+        # Per-run header: include the entry scope when present so the
+        # user can see which entry is being processed in a multi-entry
+        # batch.
+        entry_tag = command.kwargs.get("entry")
+        if entry_tag:
+            self.pipeline_panel.append_log(
+                f"--- {command.op_name} on {entry_tag} ---"
+            )
+        else:
+            self.pipeline_panel.append_log(
+                f"--- {command.op_name} (all entries) ---"
+            )
 
         # Release silx's read handles on every loaded temp file so mlgidbase
         # can open the active one r+. Sibling files are reattached on finish.
@@ -859,26 +1292,34 @@ class MainWindow(QMainWindow):
             self._pipe_worker.deleteLater()
             self._pipe_worker = None
 
-        self.pipeline_panel.set_running(False)
-        self.parameter_panel.set_busy(False)
-        self.viewer.set_busy(False)
-
         if error is not None:
             self.pipeline_panel.append_log(f"ERROR - {error}")
-            QMessageBox.critical(self, "Pipeline error", str(error))
+            # In a queued multi-entry batch, surface the error in the log
+            # but only show the modal once at the *end* (otherwise the user
+            # gets a dialog per entry and the run halts in front of every
+            # one). For single-command runs (queue empty) keep the modal.
+            if not self._pipeline_queue:
+                QMessageBox.critical(self, "Pipeline error", str(error))
         else:
             self.pipeline_panel.append_log("DONE")
 
-        # The manual peak is intentionally NOT dropped after Add-to-detected
-        # so the user can also commit it to fitted_peaks (or keep tweaking
-        # the box and re-commit). The new detected/fitted overlay just
-        # appears alongside the still-selected manual box.
+        if self.session is not None and error is None:
+            self.session.mark_dirty()
 
-        # Reattach silx tree (every session), refresh viewer, mark dirty.
+        # If more commands are queued, run the next one without
+        # tearing down the silx tree / viewer state for the user — keep
+        # the busy gating active and chain straight into the next run.
+        if self._pipeline_queue:
+            self._run_next_pipeline_command()
+            return
+
+        # Queue drained — final cleanup. Reattach silx, refresh the
+        # viewer for the active entry, lift busy gating.
+        self.pipeline_panel.set_running(False)
+        self.parameter_panel.set_busy(False)
+        self.viewer.set_busy(False)
         self._reattach_silx_tree()
         if self.session is not None:
-            if error is None:
-                self.session.mark_dirty()
             entry = self.entry_combo.currentText()
             if entry:
                 # Same entry, same axes — preserve the user's zoom and
@@ -921,20 +1362,49 @@ class MainWindow(QMainWindow):
         entry = self.entry_combo.currentText()
         if sel is None or sel.kind not in ("manual", "detected") or not entry:
             return
-        is_ring = bool(sel.is_ring)
+        # The ring/segment toggle in the parameter panel decides which
+        # storage convention to use — defaults to the source's is_ring on
+        # selection but the user can flip it before clicking. For rings,
+        # the angular fit is irrelevant (and frequently undefined) so we
+        # only require the radial fit.
+        save_as_ring = self.parameter_panel.save_as_ring()
         frame = self.viewer.current_frame
 
         fits = self.profile_viewer.last_fit_params()
         rfit = fits.get("radial")
         afit = fits.get("angular")
-        if rfit is None or afit is None:
+        if rfit is None:
             QMessageBox.warning(
                 self, "Add to fitted",
-                "No 1D Gaussian fit is available for this peak. Drag the box "
-                "until the pink fit curves appear in both profile plots, "
-                "then try again.",
+                "No radial Gaussian fit is available for this peak. Drag "
+                "the box until the pink fit curve appears in the radial "
+                "profile, then try again.",
             )
             return
+        if not save_as_ring and afit is None:
+            QMessageBox.warning(
+                self, "Add to fitted",
+                "No angular Gaussian fit is available — required for "
+                "segment peaks. Drag the box until the pink fit curve "
+                "appears in the angular profile, or check 'Save fitted "
+                "as ring' if this is a ring.",
+            )
+            return
+
+        if save_as_ring:
+            # Canonical ring convention used in already-labelled fitted_peaks
+            # rows (angle = 45°, angle_width = ∞). q_xy / q_z are recomputed
+            # from this in add_fitted_peak_row.
+            angle_to_save = 45.0
+            angle_width_to_save = float("inf")
+        else:
+            angle_to_save = float(afit.center)
+            # Box convention: radial border = FWHM, azimuthal border =
+            # 2 × FWHM. The wider azimuthal box gives the next refit
+            # enough context to converge on the same Gaussian; the radial
+            # box hugs the FWHM tightly because that's where peak position
+            # matters most for downstream matching.
+            angle_width_to_save = float(2.0 * afit.fwhm)
 
         self._detach_silx_tree()
         try:
@@ -942,15 +1412,10 @@ class MainWindow(QMainWindow):
                 self.session.temp_path, entry, frame,
                 radius=float(rfit.center),
                 radius_width=float(rfit.fwhm),
-                angle=float(afit.center),
-                # Box convention: radial border = FWHM, azimuthal border =
-                # 2 × FWHM. The wider azimuthal box gives the next refit
-                # enough context to converge on the same Gaussian; the
-                # radial box hugs the FWHM tightly because that's where
-                # peak position matters most for downstream matching.
-                angle_width=float(2.0 * afit.fwhm),
+                angle=angle_to_save,
+                angle_width=angle_width_to_save,
                 amplitude=float(rfit.amplitude),
-                is_ring=is_ring,
+                is_ring=save_as_ring,
             )
         except KeyError as exc:
             QMessageBox.warning(self, "Add to fitted", str(exc))
@@ -973,8 +1438,13 @@ class MainWindow(QMainWindow):
         # Pull the fresh fitted_peaks (and matched, which references it) back
         # into the viewer — same entry, so preserve the user's zoom + frame.
         self._load_entry_into_viewer(entry, preserve_view=True)
+        # Ring toggle is sticky across selections but reset on commit so
+        # the next Add-to-fitted defaults back to segment unless the user
+        # explicitly opts in again.
+        self.parameter_panel.reset_save_as_ring()
         self.pipeline_panel.append_log(
-            f"Added fitted peak id={new_id} (from {sel.kind}) on "
+            f"Added fitted peak id={new_id} "
+            f"({'ring' if save_as_ring else 'segment'} from {sel.kind}) on "
             f"{entry}/frame{frame:05d}"
         )
 
@@ -1053,40 +1523,6 @@ class MainWindow(QMainWindow):
         finally:
             self._reattach_silx_tree()
 
-    def _on_run_fitting_from_panel(self) -> None:
-        if self.session is None or self._pipe_thread is not None:
-            return
-        self._on_pipeline_run(PipelineCommand("run_fitting", {}))
-
-    def _on_run_matching_from_panel(self) -> None:
-        if self.session is None or self._pipe_thread is not None:
-            return
-        if not is_mlgidbase_available():
-            return
-        # Reuse whatever the Pipeline dock currently has configured. The CIF
-        # pickle is required; nudge the user to the Pipeline tab if it's missing.
-        cif = getattr(self.pipeline_panel, "cif_path", None)
-        if cif is None or not cif.text().strip():
-            QMessageBox.information(
-                self,
-                "Matching configuration",
-                "Set the CIF preprocessed pickle in the Pipeline panel "
-                "before running matching.",
-            )
-            return
-        kwargs: dict = {
-            "cif_prepr": cif.text().strip(),
-            "peaks_type": self.pipeline_panel.peaks_type.currentText(),
-            "threshold": float(self.pipeline_panel.threshold.value()),
-            "device": self.pipeline_panel.device.currentText(),
-        }
-        # Mirror the Pipeline-dock default: scope to the active entry so a
-        # multi-entry file doesn't silently process siblings the user can't see.
-        active_entry = self.entry_combo.currentText() or None
-        if active_entry:
-            kwargs["entry"] = active_entry
-        self._on_pipeline_run(PipelineCommand("run_matching", kwargs))
-
     def _load_entry_into_viewer(
         self, entry: str, *, preserve_view: bool = False
     ) -> None:
@@ -1105,6 +1541,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Load failed", f"Could not load {entry}: {exc}")
             return
         self.viewer.show_stack(stack, preserve_view=preserve_view)
+        # Match the slider to the new stack's frame range. preserve_view
+        # already restores the prior frame index inside show_stack; we
+        # only need to repopulate the slider's bounds + label here.
+        self._refresh_frame_slider()
         for frame in range(stack.n_frames):
             try:
                 peaks = file_model.load_peaks(self.session.temp_path, entry, frame)
@@ -1201,6 +1641,16 @@ class MainWindow(QMainWindow):
         self._detach_silx_tree()
         self.viewer.clear()
         self.profile_viewer.clear()
+        # Drop the shared open-progress dialog if it's still up (rare —
+        # the modal would normally have blocked the close). Otherwise its
+        # leftover modal overlay would dim the next opened window too.
+        self._dismiss_open_progress()
+        # Stop a CIF parse if one is running — closing the window while
+        # CifPattern construction is in flight otherwise drops the worker
+        # thread on the floor and Qt complains at exit.
+        if self._cif_parse_thread is not None:
+            self._cif_parse_thread.quit()
+            self._cif_parse_thread.wait()
         for s in list(self._sessions):
             s.close()
         self._sessions.clear()

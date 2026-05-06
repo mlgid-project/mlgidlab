@@ -10,7 +10,7 @@ from PySide6.QtCore import Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QHBoxLayout, QWidget
 
-from mlgidbase_gui.fit import GaussianFit, fit_gaussian_on_axis, gaussian_from_box
+from mlgidbase_gui.fit import GaussianFit, fit_gaussian_on_axis
 from mlgidbase_gui.image_viewer import OVERLAY_STYLE, ManualPeak, SelectedPeak
 
 # Multiple of box width on each side over which the rendered Gaussian curve
@@ -18,6 +18,14 @@ from mlgidbase_gui.image_viewer import OVERLAY_STYLE, ManualPeak, SelectedPeak
 # baseline; small enough that very tight peaks don't render as a spike on a
 # nearly empty axis.
 FIT_RENDER_PAD_FACTOR = 3.0
+
+# Fit interval for fitted / matched peaks, expressed as a multiple of the
+# stored FWHM around the peak center. The stored FWHM (radial: radius_width;
+# azimuthal: angle_width / 2) is generally tighter than the region we want
+# to fit over — the user expects to *see* the same FWHM on screen as is
+# saved in the file, but they want the *fit* to be computed over a wider
+# window so the Gaussian's tails get to settle into the baseline.
+FITTED_FIT_REGION_FACTOR = 3.0
 
 PROFILE_PEN_COLOR = "#e8e8e8"
 PROFILE_PEN_WIDTH = 1.2
@@ -107,6 +115,11 @@ class ProfileViewer(QWidget):
         # kind is "manual" — file-resident peaks edit through the 2D ROI.
         self._selected: SelectedPeak | None = None
         self._current_frame = 0
+        # When True, the angular Gaussian fit is skipped + cleared. Driven
+        # by the host (MainWindow) from the parameter panel's ring toggle:
+        # if Add-to-fitted will commit a ring there's no angular dimension
+        # to save, so showing the angular fit would be misleading.
+        self._skip_angular_fit: bool = False
         # Last successfully-computed fits — exposed via last_fit_params() so
         # the parameter panel's "Add to fitted" button can write them to the
         # fitted_peaks dataset. Cleared whenever the curves are cleared.
@@ -144,6 +157,19 @@ class ProfileViewer(QWidget):
         self._set_fit_cache(None, None)
         self.set_selected_peak(None)
 
+    def set_skip_angular_fit(self, skip: bool) -> None:
+        """Tell the viewer not to compute or render the angular Gaussian.
+
+        Used while the parameter panel's ring toggle is active — saving
+        as ring drops the angular dimension entirely, so showing a fit
+        the user can't actually save would be misleading.
+        """
+        if self._skip_angular_fit == skip:
+            return
+        self._skip_angular_fit = skip
+        # Re-render so the curve appears / disappears immediately.
+        self._recompute_curves()
+
     def last_fit_params(self) -> dict[str, GaussianFit | None]:
         """Most recent radial / angular Gaussian fits, or None if not fitted.
 
@@ -166,14 +192,19 @@ class ProfileViewer(QWidget):
         range). Deselecting restores full integration over the entire image.
         Also auto-zooms each profile to a window slightly wider than the box.
 
-        Region drags edit the underlying peak only for ``kind == "manual"``;
-        for other kinds the regions are visible but read-only because file
-        resident peaks edit through the 2D ROI (which has its own undo /
-        write hooks).
+        Region markers (yellow LinearRegionItems) are shown only for kinds
+        the user actively shapes — ``manual`` (draggable) and ``detected``
+        (read-only but tracks the box). For ``fitted`` / ``matched`` the
+        box is fixed by the storage convention and the region markers
+        would just clutter the view; the live Gaussian curve still renders.
         """
         self._selected = peak
         visible = peak is not None
         is_manual = peak is not None and peak.kind == "manual"
+        # Only manual + detected are user-shaped — show the region marker
+        # only for those. Fitted / matched still get the Gaussian curve
+        # (handled in _update_fit_curves) but no region overlay.
+        show_regions = peak is not None and peak.kind in ("manual", "detected")
         # For ring peaks (or any peak whose angle_width is non-finite) the
         # angular region would span the entire axis or fail to render — hide
         # it so the profile stays usable. The radial region still tracks.
@@ -182,9 +213,9 @@ class ProfileViewer(QWidget):
             and (peak.is_ring or not np.isfinite(peak.angle_width))
         )
 
-        self._radial_region.setVisible(visible)
+        self._radial_region.setVisible(show_regions)
         self._radial_region.setMovable(is_manual)
-        self._angular_region.setVisible(visible and not is_ring_box)
+        self._angular_region.setVisible(show_regions and not is_ring_box)
         self._angular_region.setMovable(is_manual)
 
         if peak is not None:
@@ -209,30 +240,28 @@ class ProfileViewer(QWidget):
                 or self._selected.manual_ref is not peak
             ):
                 return
-            r, a = peak.radius, peak.angle
-            dr, da = peak.radius_width, peak.angle_width
-            is_ring_box = peak.is_ring or not np.isfinite(da)
+            sel = self._selected  # SelectedPeak with kind == "manual"
         else:
             if peak is not self._selected:
                 return
-            r, a = peak.radius, peak.angle
-            dr, da = peak.radius_width, peak.angle_width
-            is_ring_box = peak.is_ring or not np.isfinite(da)
-        r_lo = r - dr / 2.0
-        r_hi = r + dr / 2.0
+            sel = peak
+        r_range = _radial_fit_range(sel)
+        a_range = _angular_fit_range(sel)
         self._radial_region.blockSignals(True)
         try:
-            self._radial_region.setRegion((float(r_lo), float(r_hi)))
+            self._radial_region.setRegion(
+                (float(r_range[0]), float(r_range[1]))
+            )
         finally:
             self._radial_region.blockSignals(False)
         # Skip the angular region for ring boxes — its bounds would be
         # ±inf / span the entire axis. setVisible already hid it.
-        if not is_ring_box:
-            a_lo = a - da / 2.0
-            a_hi = a + da / 2.0
+        if a_range is not None:
             self._angular_region.blockSignals(True)
             try:
-                self._angular_region.setRegion((float(a_lo), float(a_hi)))
+                self._angular_region.setRegion(
+                    (float(a_range[0]), float(a_range[1]))
+                )
             finally:
                 self._angular_region.blockSignals(False)
         # The integration window changed → recompute the slice profiles.
@@ -292,63 +321,52 @@ class ProfileViewer(QWidget):
     def _update_fit_curves(
         self, peak: SelectedPeak, radial: np.ndarray, angular: np.ndarray
     ) -> None:
-        # Manual + detected peaks are candidate boxes — refit the data
-        # inside the box on every drag so the user can adjust the bounds
-        # against the live curve, and so "Add to fitted" picks up an
-        # actual FWHM (detected boxes don't carry the FWHM convention).
-        # Fitted + matched peaks are stored under the convention
-        #   radial border = FWHM   →   FWHM_r = radius_width
-        #   azimuthal border = 2 × FWHM   →   FWHM_a = angle_width / 2
-        # so we draw the Gaussian implied by that convention exactly. This
-        # keeps the displayed curve in sync with the saved box parameters
-        # — no refit drift on re-select.
-        do_real_fit = peak.kind in ("manual", "detected")
+        # All peak kinds now drive a real Gaussian fit; only the *interval*
+        # we fit over changes:
+        #   manual / detected  → box bounds (the user-controlled region)
+        #   fitted / matched   → ``FITTED_FIT_REGION_FACTOR × FWHM`` around
+        #                        the center, where the FWHM is derived from
+        #                        the storage convention
+        #                          radial:   FWHM_r = radius_width
+        #                          azimuth:  FWHM_a = angle_width / 2
+        # The wider fitted/matched window lets the Gaussian's tails settle
+        # into the baseline so the fit isn't biased by the FWHM boundary.
+        # The image-space box continues to render the stored FWHM extents.
         rfit: GaussianFit | None = None
         afit: GaussianFit | None = None
-        if self._radius is not None:
-            r_lo = peak.radius - peak.radius_width / 2.0
-            r_hi = peak.radius + peak.radius_width / 2.0
-            r_pad = FIT_RENDER_PAD_FACTOR * peak.radius_width
+        r_range = _radial_fit_range(peak)
+        if self._radius is not None and r_range is not None:
+            r_lo, r_hi = r_range
+            r_pad = FIT_RENDER_PAD_FACTOR * (r_hi - r_lo)
             render_r = (r_lo - r_pad, r_hi + r_pad)
-            if do_real_fit:
-                rfit = fit_gaussian_on_axis(
-                    self._radius, radial, peak.radius, peak.radius_width,
-                    fit_range=(r_lo, r_hi),
-                    render_range=render_r,
-                )
-            else:
-                # Stored convention: radial box width == FWHM.
-                rfit = gaussian_from_box(
-                    self._radius, radial, peak.radius, peak.radius_width,
-                    render_range=render_r,
-                )
+            rfit = fit_gaussian_on_axis(
+                self._radius, radial, peak.radius, peak.radius_width,
+                fit_range=(r_lo, r_hi),
+                render_range=render_r,
+            )
             if rfit is not None:
                 self._radial_fit_curve.setData(rfit.x, rfit.y)
             else:
                 self._radial_fit_curve.setData([], [])
-        if self._angle is not None:
-            if np.isfinite(peak.angle_width) and peak.angle_width > 0:
-                a_lo = peak.angle - peak.angle_width / 2.0
-                a_hi = peak.angle + peak.angle_width / 2.0
-                a_pad = FIT_RENDER_PAD_FACTOR * peak.angle_width
-                render_a = (a_lo - a_pad, a_hi + a_pad)
-                if do_real_fit:
-                    afit = fit_gaussian_on_axis(
-                        self._angle, angular, peak.angle, peak.angle_width,
-                        fit_range=(a_lo, a_hi),
-                        render_range=render_a,
-                    )
-                else:
-                    # Stored convention: azimuthal box width == 2 × FWHM.
-                    afit = gaussian_from_box(
-                        self._angle, angular, peak.angle,
-                        peak.angle_width / 2.0,
-                        render_range=render_a,
-                    )
+        # Skip angular fit when the host has flagged ring-save mode — the
+        # angular dimension won't be saved, so showing a fit would lie
+        # about what Add-to-fitted will write.
+        a_range = None if self._skip_angular_fit else _angular_fit_range(peak)
+        if self._angle is not None and a_range is not None:
+            a_lo, a_hi = a_range
+            a_pad = FIT_RENDER_PAD_FACTOR * (a_hi - a_lo)
+            render_a = (a_lo - a_pad, a_hi + a_pad)
+            afit = fit_gaussian_on_axis(
+                self._angle, angular, peak.angle, peak.angle_width,
+                fit_range=(a_lo, a_hi),
+                render_range=render_a,
+            )
             if afit is not None:
                 self._angular_fit_curve.setData(afit.x, afit.y)
             else:
                 self._angular_fit_curve.setData([], [])
+        elif self._angle is not None:
+            self._angular_fit_curve.setData([], [])
         self._set_fit_cache(rfit, afit)
 
     def _set_fit_cache(
@@ -415,6 +433,47 @@ class ProfileViewer(QWidget):
         # Radial profile slices over the angular range — needs refresh.
         self._recompute_curves()
         self.peakGeometryChanged.emit(self._selected.manual_ref)
+
+
+def _radial_fit_range(peak: SelectedPeak) -> tuple[float, float] | None:
+    """Radial Gaussian fit interval for ``peak``.
+
+    For manual / detected peaks the interval is the box itself (the user
+    controls the box bounds, so we fit over what they drew). For
+    fitted / matched peaks the box bounds *are* the FWHM — the fit interval
+    expands to ``FITTED_FIT_REGION_FACTOR × FWHM`` around the center so
+    the Gaussian fit has room outside the FWHM to settle into the baseline.
+    Returns ``None`` only when widths are non-finite or zero (caller hides
+    the curve in that case).
+    """
+    r = peak.radius
+    dr = peak.radius_width
+    if not (np.isfinite(r) and np.isfinite(dr) and dr > 0):
+        return None
+    if peak.kind in ("manual", "detected"):
+        half = dr / 2.0
+    else:  # fitted / matched
+        # radial box width == FWHM_r by storage convention.
+        half = FITTED_FIT_REGION_FACTOR * dr / 2.0
+    return (r - half, r + half)
+
+
+def _angular_fit_range(peak: SelectedPeak) -> tuple[float, float] | None:
+    """Angular Gaussian fit interval for ``peak``. None for ring peaks
+    (angle_width inf or non-finite — angular slice is the whole axis).
+    """
+    a = peak.angle
+    da = peak.angle_width
+    if peak.is_ring or not (np.isfinite(a) and np.isfinite(da) and da > 0):
+        return None
+    if peak.kind in ("manual", "detected"):
+        half = da / 2.0
+    else:
+        # azimuthal box width == 2 × FWHM_a by storage convention, so
+        # FWHM_a = da / 2 — same factor expansion as radial.
+        fwhm_a = da / 2.0
+        half = FITTED_FIT_REGION_FACTOR * fwhm_a / 2.0
+    return (a - half, a + half)
 
 
 def _hex_to_rgb(hexstr: str) -> tuple[int, int, int]:

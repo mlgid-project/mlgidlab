@@ -17,9 +17,11 @@ the NeXus file.
   candidate peak. Manual peaks are kept in memory until you commit them to
   the file as detected or fitted entries.
 - **Edit and delete file-resident peaks.** Click any detected, fitted, or
-  matched peak to select it; drag the ROI edges to resize (detected and
-  fitted only); press `Delete` to cascade-remove via `mlgidBASE.delete_peak`.
-  Geometry edits are written straight to HDF5 in place.
+  matched peak to select it; drag the ROI edges to resize (detected only —
+  fitted boxes encode the FWHM convention so editing them in place would
+  misrepresent the underlying Gaussian); press `Delete` to cascade-remove
+  via `mlgidBASE.delete_peak`. Geometry edits are written straight to HDF5
+  in place.
 - **Inspect 1D radial / azimuthal profiles.** The bottom dock shows the
   radial and angular cross-sections of the selected box, with live Gaussian
   fits that follow ROI drags. Manual peaks get a real bounded refit;
@@ -30,10 +32,12 @@ the NeXus file.
   `fitted_peaks` using the 1D Gaussian fit parameters (radial border = FWHM,
   azimuthal border = 2 × FWHM).
 - **Run the pipeline stages.** The Pipeline dock exposes Detection, Fitting,
-  and Matching as buttons. Matching takes a preprocessed CIF pickle, a
-  peaks-type (segments / rings), a threshold, and a device (cpu / cuda).
-  Per-run logs stream into the dock; the GUI is gated `busy` while a run is
-  in flight.
+  and Matching as collapsible accordion sections. Matching takes a CIF
+  input (a preprocessed pickle, one-or-more raw `.cif` files, or a folder
+  containing `.cif`s — `ExpParameters` are auto-derived from the active
+  NeXus file's instrument metadata in the raw-CIF case), a peaks-type
+  (segments / rings), thresholds, and a device (cpu / cuda). Per-run logs
+  stream into the dock; the GUI is gated `busy` while a run is in flight.
 - **Undo / redo.** `Ctrl+Z` / `Ctrl+Shift+Z` (or `Ctrl+Y`) walk an
   Action-protocol history covering manual add, manual remove, manual
   geometry edits, and detected/fitted geometry edits. Pipeline operations

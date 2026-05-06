@@ -11,6 +11,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
+    QCheckBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -37,8 +38,10 @@ _SOURCE_LABEL = {
 class ParameterPanel(QGroupBox):
     addToDetectedRequested = Signal()
     addToFittedRequested = Signal()
-    runFittingRequested = Signal()
-    runMatchingRequested = Signal()
+    # Emits the new state of the "Save fitted as ring" checkbox so the host
+    # can refresh the cyan fitted-preview overlay (rings render as a full
+    # angular sweep) without waiting for the next selection change.
+    saveAsRingChanged = Signal(bool)
     deletePeakRequested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -55,6 +58,18 @@ class ParameterPanel(QGroupBox):
         outer.addWidget(form_widget)
 
         self._source_label = self._make_value_label()
+        # Color swatch shown alongside the source row only for matched
+        # selections — color matches the matched-overlay palette so the
+        # user can map the readout back to the box on screen at a glance.
+        self._source_swatch = QLabel()
+        self._source_swatch.setFixedSize(14, 14)
+        self._source_swatch.setVisible(False)
+        self._source_row = QWidget()
+        _src_h = QHBoxLayout(self._source_row)
+        _src_h.setContentsMargins(0, 0, 0, 0)
+        _src_h.setSpacing(6)
+        _src_h.addWidget(self._source_label, 1)
+        _src_h.addWidget(self._source_swatch)
         self._radius_label = self._make_value_label()
         self._radius_width_label = self._make_value_label()
         self._angle_label = self._make_value_label()
@@ -72,7 +87,7 @@ class ParameterPanel(QGroupBox):
 
         # Source / Type / ID describe the peak itself and apply to every
         # kind, so they sit above the kind-specific Detected/Fitted blocks.
-        form.addRow("Source:", self._source_label)
+        form.addRow("Source:", self._source_row)
         form.addRow("Type:", self._type_label)
         form.addRow("ID:", self._id_label)
         form.addRow(self._make_section_label("Detected peak"))
@@ -108,18 +123,24 @@ class ParameterPanel(QGroupBox):
         add_row_widget.setLayout(add_row)
         outer.addWidget(add_row_widget)
 
-        self.btn_run_fitting = QPushButton("Run fitting")
-        self.btn_run_fitting.clicked.connect(self.runFittingRequested)
-        self.btn_run_matching = QPushButton("Run matching")
-        self.btn_run_matching.clicked.connect(self.runMatchingRequested)
+        # Ring/segment toggle — applies to whichever box "Add to fitted"
+        # would commit. State is sticky: once the user (un)checks it the
+        # value persists across selection changes; only Add-to-fitted
+        # itself resets it (back to unchecked) after a successful commit.
+        # When checked, the saved row uses the canonical ring convention
+        # (angle = 45°, angle_width = ∞), the angular profile fit is
+        # skipped, and the cyan preview renders as a full-sweep ring.
+        self.chk_save_as_ring = QCheckBox("Save fitted as ring")
+        self.chk_save_as_ring.toggled.connect(self.saveAsRingChanged)
+        outer.addWidget(self.chk_save_as_ring)
+
+        # Run fitting / Run matching used to live here too, but they're
+        # already exposed in the Pipeline dock with their full kwarg
+        # surface — duplicating them in the per-peak panel just confused
+        # the user about what each call would do. Removed.
         self.btn_delete_peak = QPushButton("Delete peak")
         self.btn_delete_peak.clicked.connect(self.deletePeakRequested)
-        for btn in (
-            self.btn_run_fitting,
-            self.btn_run_matching,
-            self.btn_delete_peak,
-        ):
-            outer.addWidget(btn)
+        outer.addWidget(self.btn_delete_peak)
 
         if not self._mlgidbase_available:
             note = QLabel("<i>mlgidbase not installed — actions disabled.</i>")
@@ -175,13 +196,32 @@ class ParameterPanel(QGroupBox):
                 self._fit_amp_label,
             ):
                 lbl.setText(EMPTY)
+            self._source_swatch.setVisible(False)
             return
         source = _SOURCE_LABEL.get(peak.kind, peak.kind.capitalize())
-        if peak.kind == "matched" and peak.structure_uid:
-            source = f"{source} ({peak.structure_uid})"
+        if peak.kind == "matched":
+            # Prefer the human-readable structure label (CIF + (hkl) +
+            # probability) when the viewer attached one; fall back to the
+            # raw structure_uid only if the label wasn't populated.
+            tag = peak.structure_label or peak.structure_uid
+            if tag:
+                source = f"{source} ({tag})"
+            if peak.structure_color:
+                self._source_swatch.setStyleSheet(
+                    f"background-color: {peak.structure_color};"
+                    " border: 1px solid #444;"
+                )
+                self._source_swatch.setVisible(True)
+            else:
+                self._source_swatch.setVisible(False)
+        else:
+            self._source_swatch.setVisible(False)
         self._source_label.setText(source)
         self._type_label.setText("Ring" if peak.is_ring else "Segment")
         self._id_label.setText(str(peak.peak_id))
+
+        # Ring/segment toggle is sticky across selection changes (set by
+        # the user, reset only by Add-to-fitted) — see chk_save_as_ring.
 
         show_detected = peak.kind in ("manual", "detected")
         if show_detected:
@@ -241,6 +281,21 @@ class ParameterPanel(QGroupBox):
             self._fit_angle_label.setText(EMPTY)
             self._fit_fwhm_a_label.setText(EMPTY)
 
+    def save_as_ring(self) -> bool:
+        """Whether the next Add-to-fitted should commit a ring row."""
+        return self.chk_save_as_ring.isChecked()
+
+    def reset_save_as_ring(self) -> None:
+        """Force the ring toggle back to unchecked.
+
+        Called by MainWindow after a successful Add-to-fitted commit so
+        the user has to opt back in for each new ring row. Emits
+        saveAsRingChanged via the standard toggled connection so the
+        cyan preview / angular fit refresh follow.
+        """
+        if self.chk_save_as_ring.isChecked():
+            self.chk_save_as_ring.setChecked(False)
+
     def set_busy(self, busy: bool) -> None:
         """Disable buttons while a pipeline run is in flight."""
         if not self._mlgidbase_available:
@@ -249,11 +304,10 @@ class ParameterPanel(QGroupBox):
             for btn in (
                 self.btn_add_detected,
                 self.btn_add_fitted,
-                self.btn_run_fitting,
-                self.btn_run_matching,
                 self.btn_delete_peak,
             ):
                 btn.setEnabled(False)
+            self.chk_save_as_ring.setEnabled(False)
         else:
             self._update_actions_enabled(self._current_peak())
 
@@ -262,28 +316,24 @@ class ParameterPanel(QGroupBox):
             for btn in (
                 self.btn_add_detected,
                 self.btn_add_fitted,
-                self.btn_run_fitting,
-                self.btn_run_matching,
                 self.btn_delete_peak,
             ):
                 btn.setEnabled(False)
+            self.chk_save_as_ring.setEnabled(False)
             return
         # Add-to-detected only makes sense for manual peaks (committing the
         # in-memory candidate). Add-to-fitted accepts manual *and* detected
         # selections — a detected box is the natural input for a fit, and
         # this lets the user promote a detected row into fitted_peaks
         # using the live 1D Gaussian fit. Delete-peak only applies to
-        # non-manual peaks (manual uses the Delete shortcut). Fitting /
-        # matching always available — the worker surfaces errors if no
-        # peaks exist.
+        # non-manual peaks (manual uses the Delete shortcut).
         is_manual = peak is not None and peak.kind == "manual"
         is_addable_to_fitted = peak is not None and peak.kind in ("manual", "detected")
         is_file_peak = peak is not None and peak.kind != "manual"
         self.btn_add_detected.setEnabled(is_manual)
         self.btn_add_fitted.setEnabled(is_addable_to_fitted)
+        self.chk_save_as_ring.setEnabled(is_addable_to_fitted)
         self.btn_delete_peak.setEnabled(is_file_peak)
-        self.btn_run_fitting.setEnabled(True)
-        self.btn_run_matching.setEnabled(True)
 
     def _current_peak(self) -> SelectedPeak | None:
         # Re-derive the peak the panel is currently showing (if any) so we can

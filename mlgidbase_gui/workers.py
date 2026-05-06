@@ -5,8 +5,39 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 
-from mlgidbase_gui.pipeline import PIPELINE_LOGGERS, PipelineCommand, execute
+from mlgidbase_gui.pipeline import (
+    PIPELINE_LOGGERS,
+    PipelineCommand,
+    execute,
+    parse_cif_input,
+)
 from mlgidbase_gui.session import Session
+
+
+class CifParseWorker(QObject):
+    """Parses CIF input (raw .cif files / folder / pickle) into a CifPattern.
+
+    Runs on a worker thread because raw CIF parsing simulates a 2D
+    diffraction pattern per CIF and can take several seconds for a
+    typical batch — we don't want the GUI thread blocked while it works.
+    Emits ``finished(CifPattern | str | None, Exception | None)`` —
+    the result is the cached object (CifPattern for raw, str path for a
+    pickle, None for empty input).
+    """
+
+    finished = Signal(object, object)
+
+    def __init__(self, cif_input: str, nexus_file: Path) -> None:
+        super().__init__()
+        self._cif_input = cif_input
+        self._nexus_file = nexus_file
+
+    def run(self) -> None:
+        try:
+            result = parse_cif_input(self._cif_input, self._nexus_file)
+            self.finished.emit(result, None)
+        except Exception as exc:
+            self.finished.emit(None, exc)
 
 
 class CopyWorker(QObject):
@@ -65,6 +96,14 @@ class PipelineWorker(QObject):
             result = execute(self._file_path, self._command)
             self.finished.emit(result, None)
         except Exception as exc:
+            # Stream the traceback through the log channel so the user
+            # can see *where* mlgidBASE failed — the modal dialog only
+            # shows the bare exception message which is often opaque
+            # ("invalid index to scalar variable" doesn't tell anyone
+            # which dataset / function tripped). The traceback lands in
+            # the panel log alongside the mlgidbase log lines.
+            import traceback
+            self.log.emit(traceback.format_exc())
             self.finished.emit(None, exc)
         finally:
             for lg, prev in zip(loggers, prev_levels):

@@ -123,6 +123,10 @@ class PipelinePanel(QWidget):
     """
 
     runRequested = Signal(PipelineCommand)
+    # Emitted when the user clicks "Parse CIFs". The host runs a worker
+    # thread to do the actual parsing (slow for raw CIFs) and posts the
+    # result back via ``set_cif_pattern``.
+    parseCifsRequested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -132,6 +136,12 @@ class PipelinePanel(QWidget):
         # back to mlgidBASE's own None-default (all entries / all frames).
         self._get_active_entry: Callable[[], str | None] | None = None
         self._get_active_frame: Callable[[], int | None] | None = None
+        # CIF cache: ``_cached_cif_input`` is the raw text the user
+        # parsed against; ``_cached_cif_obj`` is the resulting CifPattern
+        # (or other pre-loaded object). Run Matching forwards the cache
+        # when present and the input hasn't changed since the parse.
+        self._cached_cif_input: str | None = None
+        self._cached_cif_obj: object | None = None
         self._build_ui()
 
     # -- Public API used by MainWindow --
@@ -364,15 +374,52 @@ class PipelinePanel(QWidget):
         form.addRow("Frames:", self.match_frame_scope)
 
         self.cif_path = QLineEdit()
-        self.cif_path.setPlaceholderText("Select preprocessed CIF pickle…")
+        self.cif_path.setPlaceholderText("Pickle, .cif file(s), or folder…")
+        self.cif_path.setToolTip(
+            "Forwarded as ``cif_prepr`` to mlgidBASE.run_matching. Accepts:\n"
+            "  • a preprocessed CIF pickle (.pickle / .pkl)\n"
+            "  • one or more raw .cif files (semicolon-separated)\n"
+            "  • a folder containing .cif files\n\n"
+            "For raw input, ExpParameters are auto-derived from the active "
+            "NeXus file's instrument metadata."
+        )
         cif_browse = QPushButton("Browse…")
         cif_browse.clicked.connect(self._browse_cif)
+        cif_browse_dir = QPushButton("Folder…")
+        cif_browse_dir.setToolTip(
+            "Pick a directory; every .cif inside is used."
+        )
+        cif_browse_dir.clicked.connect(self._browse_cif_dir)
         cif_row = QWidget()
         cif_h = QHBoxLayout(cif_row)
         cif_h.setContentsMargins(0, 0, 0, 0)
         cif_h.addWidget(self.cif_path, 1)
         cif_h.addWidget(cif_browse)
-        form.addRow("CIF pickle:", cif_row)
+        cif_h.addWidget(cif_browse_dir)
+        form.addRow("CIF input:", cif_row)
+
+        # Parse button + cache-state label. CIF preprocessing simulates
+        # every input pattern, which is slow — caching the resulting
+        # CifPattern across multiple Run-Matching clicks is a huge time
+        # saver. The cache is invalidated whenever the input text changes.
+        self.btn_parse_cifs = QPushButton("Parse CIFs")
+        self.btn_parse_cifs.setToolTip(
+            "Pre-load the CIF input into a CifPattern that subsequent "
+            "matching runs reuse. Without this, every Run Matching "
+            "re-parses the CIFs from scratch."
+        )
+        self.btn_parse_cifs.clicked.connect(self._on_parse_cifs)
+        self.btn_parse_cifs.setEnabled(False)
+        self.cif_cache_label = QLabel("Not parsed")
+        self.cif_cache_label.setStyleSheet("color: #aaa; font-style: italic;")
+        cif_parse_row = QWidget()
+        cif_parse_h = QHBoxLayout(cif_parse_row)
+        cif_parse_h.setContentsMargins(0, 0, 0, 0)
+        cif_parse_h.addWidget(self.btn_parse_cifs)
+        cif_parse_h.addWidget(self.cif_cache_label, 1)
+        form.addRow("", cif_parse_row)
+        # Any edit invalidates the cache and re-enables the button.
+        self.cif_path.textChanged.connect(self._on_cif_input_changed)
 
         self.peaks_type = QComboBox()
         self.peaks_type.addItems(["segments", "rings"])
@@ -449,8 +496,16 @@ class PipelinePanel(QWidget):
         cif = self.cif_path.text().strip()
         if not cif:
             return
+        # Forward the cached CifPattern when the user has already parsed
+        # it (and the input hasn't changed since); otherwise pass the
+        # path string and let the worker translate it. Cached or not,
+        # mlgidBASE.run_matching accepts both forms.
+        if self._cached_cif_obj is not None and self._cached_cif_input == cif:
+            cif_value: object = self._cached_cif_obj
+        else:
+            cif_value = cif
         kwargs: dict = {
-            "cif_prepr": cif,
+            "cif_prepr": cif_value,
             "peaks_type": self.peaks_type.currentText(),
             "threshold": float(self.threshold.value()),
             "intensity_threshold": float(self.intensity_threshold.value()),
@@ -460,6 +515,86 @@ class PipelinePanel(QWidget):
         self._inject_frame_scope(self.match_frame_scope, kwargs)
         self.runRequested.emit(PipelineCommand("run_matching", kwargs))
 
+    def _on_parse_cifs(self) -> None:
+        text = self.cif_path.text().strip()
+        if not text:
+            return
+        # Disable the button + show in-progress text. The host runs the
+        # parse on a worker thread and posts the result back via
+        # set_cif_pattern.
+        self.btn_parse_cifs.setEnabled(False)
+        self.btn_parse_cifs.setText("Parsing…")
+        self.cif_cache_label.setText("Parsing…")
+        self.cif_cache_label.setStyleSheet("color: #ffeb3b; font-style: italic;")
+        self.parseCifsRequested.emit(text)
+
+    def _on_cif_input_changed(self, text: str) -> None:
+        """Invalidate the cache + re-enable the parse button on edit."""
+        text = text.strip()
+        # Only invalidate if the text actually differs from the cache —
+        # programmatic Browse → setText that exactly matches the cached
+        # input shouldn't blow it away.
+        if self._cached_cif_input is not None and text != self._cached_cif_input:
+            self._cached_cif_obj = None
+            self._cached_cif_input = None
+            self.cif_cache_label.setText("Input changed; re-parse")
+            self.cif_cache_label.setStyleSheet(
+                "color: #ff6b6b; font-style: italic;"
+            )
+        elif self._cached_cif_input is None:
+            self.cif_cache_label.setText("Not parsed")
+            self.cif_cache_label.setStyleSheet(
+                "color: #aaa; font-style: italic;"
+            )
+        self.btn_parse_cifs.setText("Parse CIFs")
+        self.btn_parse_cifs.setEnabled(bool(text))
+
+    def clear_cif_cache(self) -> None:
+        """Forget any cached CifPattern.
+
+        Used by the host on session swap because ``ExpParameters`` are
+        derived from the active NeXus file's instrument metadata — a
+        cache built against file A's params can't be safely reused when
+        running matching on file B.
+        """
+        if self._cached_cif_obj is None and self._cached_cif_input is None:
+            return
+        self._cached_cif_obj = None
+        self._cached_cif_input = None
+        self.cif_cache_label.setText("Not parsed (active file changed)")
+        self.cif_cache_label.setStyleSheet("color: #aaa; font-style: italic;")
+        self.btn_parse_cifs.setText("Parse CIFs")
+        self.btn_parse_cifs.setEnabled(bool(self.cif_path.text().strip()))
+
+    def set_cif_pattern(self, obj: object | None, error: Exception | None) -> None:
+        """Host posts the parse result here. None+exception → error state.
+
+        On success, ``obj`` is cached against the current input text and
+        every subsequent Run Matching reuses it.
+        """
+        self.btn_parse_cifs.setText("Parse CIFs")
+        self.btn_parse_cifs.setEnabled(True)
+        if error is not None or obj is None:
+            self._cached_cif_obj = None
+            self._cached_cif_input = None
+            msg = str(error) if error is not None else "(empty result)"
+            # Keep the user's input alone so they can retry from the same
+            # text; just flag the cache as failed.
+            self.cif_cache_label.setText(f"Parse failed — {msg[:60]}")
+            self.cif_cache_label.setStyleSheet(
+                "color: #ff6b6b; font-style: italic;"
+            )
+            return
+        self._cached_cif_input = self.cif_path.text().strip()
+        self._cached_cif_obj = obj
+        # Surface the CIF count + the kind of input so the user can see
+        # what's been cached (CifPattern exposes ``cifs``).
+        n = len(getattr(obj, "cifs", []) or [])
+        self.cif_cache_label.setText(f"Parsed: {n} CIF(s) cached")
+        self.cif_cache_label.setStyleSheet(
+            "color: #4ade80; font-style: italic;"
+        )
+
     # -- Internals --
 
     def _inject_entry_scope(self, combo: QComboBox, kwargs: dict) -> None:
@@ -468,15 +603,51 @@ class PipelinePanel(QWidget):
         - ``ENTRY_ACTIVE``: insert ``entry=<active>`` (skip if no resolver
           or no active entry — mlgidBASE will then iterate all).
         - ``ENTRY_ALL``: leave ``entry`` out of kwargs so mlgidBASE
-          defaults to all entries.
+          defaults to all entries (the host's queue dispatcher then
+          expands this into per-entry runs).
+        - any other value: a literal entry name appended after
+          ACTIVE/ALL, used when the user explicitly picks one entry.
         """
-        if combo.currentText() != ENTRY_ACTIVE:
+        choice = combo.currentText()
+        if choice == ENTRY_ALL or not choice:
             return
-        if self._get_active_entry is None:
+        if choice == ENTRY_ACTIVE:
+            if self._get_active_entry is None:
+                return
+            active = self._get_active_entry()
+            if active:
+                kwargs["entry"] = active
             return
-        active = self._get_active_entry()
-        if active:
-            kwargs["entry"] = active
+        # Literal entry name — sent verbatim.
+        kwargs["entry"] = choice
+
+    def set_available_entries(self, entries: list[str]) -> None:
+        """Refresh the per-entry options in all three entry-scope combos.
+
+        Called by the host whenever the active session changes (or after
+        a pipeline op that might have added entries — though no current
+        op does). Rebuilds the items as
+        ``[ACTIVE, ALL, entry_0000, entry_0001, …]`` while preserving
+        the user's prior selection if it's still valid.
+        """
+        if not self._available:
+            return
+        for combo in (
+            self.det_entry_scope,
+            self.fit_entry_scope,
+            self.match_entry_scope,
+        ):
+            previous = combo.currentText()
+            combo.blockSignals(True)
+            try:
+                combo.clear()
+                combo.addItems([ENTRY_ACTIVE, ENTRY_ALL, *entries])
+                # Restore the prior selection when still in the new list,
+                # otherwise default back to "Active entry".
+                idx = combo.findText(previous)
+                combo.setCurrentIndex(idx if idx >= 0 else 0)
+            finally:
+                combo.blockSignals(False)
 
     def _inject_frame_scope(self, combo: QComboBox, kwargs: dict) -> None:
         if combo.currentText() != FRAME_ACTIVE:
@@ -498,11 +669,27 @@ class PipelinePanel(QWidget):
             self.det_config_path.setText(path)
 
     def _browse_cif(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
+        """Pick one .pickle or one-or-more .cif files.
+
+        Multi-select (.cif) joins paths with ``;``; ``pipeline.execute``
+        splits this back out and wraps the CIFs in a CifPattern at run
+        time. A single .pickle file is forwarded to mlgidBASE unchanged.
+        """
+        paths, _ = QFileDialog.getOpenFileNames(
             self,
-            "Select CIF preprocessed pickle",
+            "Select CIF input",
             "",
-            "Pickle (*.pickle *.pkl);;All files (*)",
+            "All supported (*.cif *.pickle *.pkl)"
+            ";;CIF files (*.cif);;Pickle (*.pickle *.pkl);;All files (*)",
         )
-        if path:
-            self.cif_path.setText(path)
+        if not paths:
+            return
+        self.cif_path.setText(";".join(paths))
+
+    def _browse_cif_dir(self) -> None:
+        """Pick a directory of .cif files. Forwarded as a single path."""
+        directory = QFileDialog.getExistingDirectory(
+            self, "Select folder with CIF files", ""
+        )
+        if directory:
+            self.cif_path.setText(directory)

@@ -14,6 +14,7 @@ from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QPainterPath
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
     QComboBox,
     QHBoxLayout,
     QLabel,
@@ -138,6 +139,11 @@ class SelectedPeak:
     angle_width: float
     is_ring: bool = False
     structure_uid: str | None = None
+    # Human-readable structure label + overlay color, populated only for
+    # matched selections so the parameter panel can render the source row
+    # without re-deriving these from the viewer's matched bookkeeping.
+    structure_label: str | None = None
+    structure_color: str | None = None
     manual_ref: ManualPeak | None = None
 
     @classmethod
@@ -270,6 +276,8 @@ class _LabelEventFilter(QObject):
     drawUpdated = Signal(QPointF, QPointF)
     drawFinished = Signal(QPointF, QPointF)
     selectAt = Signal(QPointF)
+    # Bare LMB double-click (no modifiers, no drag) — wired to reset zoom.
+    doubleClicked = Signal()
 
     # Pixel tolerance below which a press+release counts as a click, not a drag.
     CLICK_TOLERANCE_PX = 4
@@ -290,6 +298,17 @@ class _LabelEventFilter(QObject):
 
     def eventFilter(self, _obj: QObject, ev: QEvent) -> bool:  # type: ignore[override]
         et = ev.type()
+        if (
+            et == QEvent.Type.MouseButtonDblClick
+            and ev.button() == Qt.MouseButton.LeftButton
+            and ev.modifiers() == Qt.KeyboardModifier.NoModifier
+        ):
+            # Bare LMB double-click anywhere on the image resets the zoom.
+            # Modifier+double-click and other-button double-click fall
+            # through so pyqtgraph's default handlers (e.g. ROI editing)
+            # still see the event.
+            self.doubleClicked.emit()
+            return True
         if et == QEvent.Type.MouseButtonPress and ev.button() == Qt.MouseButton.LeftButton:
             mods = ev.modifiers()
             if _has_label_modifiers(mods):
@@ -518,6 +537,21 @@ class GIWAXSImageViewer(QWidget):
         self._cmap_combo.setCurrentText(DEFAULT_COLORMAP)
         self._cmap_combo.currentTextChanged.connect(self._on_cmap_changed)
         bar.addWidget(self._cmap_combo)
+        bar.addSpacing(16)
+        # Optional bottom timeline strip. The Display-dock slider is the
+        # primary frame control; this toggle re-exposes pyqtgraph's
+        # built-in timeline (with frame ticks + draggable line) for
+        # users who want it. Default off so the image gets the full
+        # vertical canvas — and so the x-axis label isn't shadowed by
+        # the splitter handle.
+        self._timeline_check = QCheckBox("Timeline")
+        self._timeline_check.setChecked(False)
+        self._timeline_check.setToolTip(
+            "Show/hide pyqtgraph's bottom timeline strip. The Display-"
+            "dock slider drives the same frame index either way."
+        )
+        self._timeline_check.toggled.connect(self._set_timeline_visible)
+        bar.addWidget(self._timeline_check)
         bar.addStretch(1)
         bar_widget = QWidget(self)
         bar_widget.setLayout(bar)
@@ -527,6 +561,16 @@ class GIWAXSImageViewer(QWidget):
         self._view = pg.ImageView(self, view=self._plot)
         self._view.ui.roiBtn.hide()
         self._view.ui.menuBtn.hide()
+        # Hide pyqtgraph's bottom timeline strip — redundant with the
+        # Display-dock frame slider. ``setImage`` re-shows it via
+        # ``roiClicked`` for any multi-frame stack, so we re-apply our
+        # toggle state in ``_apply_params`` after every render.
+        self._view.ui.roiPlot.hide()
+        # Set the splitter handle width to 0 so even when the strip is
+        # hidden there's no grey separator line eating into the image's
+        # x-axis label area.
+        self._view.ui.splitter.setHandleWidth(0)
+        self._view.ui.splitter.setSizes([1, 0])
         outer.addWidget(self._view)
 
         self._plot.invertY(False)
@@ -563,6 +607,7 @@ class GIWAXSImageViewer(QWidget):
         self._label_filter.drawUpdated.connect(self._on_draw_updated)
         self._label_filter.drawFinished.connect(self._on_draw_finished)
         self._label_filter.selectAt.connect(self._on_select_at)
+        self._label_filter.doubleClicked.connect(self.reset_zoom)
 
         # Apply default colormap immediately.
         self._apply_cmap(DEFAULT_COLORMAP)
@@ -601,10 +646,16 @@ class GIWAXSImageViewer(QWidget):
         # Delete keypresses while mlgidbase has the file open for writes.
         self._busy: bool = False
 
-        # Geometry of the fitted-preview box for the current manual selection
+        # Geometry of the fitted-preview box for the current selection
         # (radius_center, fwhm_radial, angle_center, fwhm_angular). Cleared
-        # whenever the selection isn't a manual peak with valid 1D fits.
+        # whenever the selection isn't a manual / detected peak with valid
+        # 1D fits.
         self._fitted_preview_geom: tuple[float, float, float, float] | None = None
+        # When True, the preview is rendered as a ring (full angular sweep
+        # at angle = 45°, angle_width = ∞) regardless of the angular fit —
+        # mirrors what Add-to-fitted will write when the "Save fitted as
+        # ring" toggle is on.
+        self._fitted_preview_is_ring: bool = False
 
         self._view.sigTimeChanged.connect(self._on_time_changed)
 
@@ -880,6 +931,7 @@ class GIWAXSImageViewer(QWidget):
             return
         self._selected = None
         self._fitted_preview_geom = None
+        self._fitted_preview_is_ring = False
         self._sync_roi()
         self._render_overlays(self.current_frame)
         self.selectionChanged.emit(None)
@@ -901,6 +953,7 @@ class GIWAXSImageViewer(QWidget):
         if self._selected is not None and self._selected.kind == "manual":
             self._selected = None
             self._fitted_preview_geom = None
+            self._fitted_preview_is_ring = False
             self._sync_roi()
             self.selectionChanged.emit(None)
         self._undo_stack.clear()
@@ -913,28 +966,48 @@ class GIWAXSImageViewer(QWidget):
         fwhm_r: float | None,
         center_a: float | None,
         fwhm_a: float | None,
+        *,
+        is_ring: bool = False,
     ) -> None:
         """Show / hide the faint preview of the would-be fitted_peaks box.
 
-        Pass any None to clear. When set, paints a dashed cyan box of size
-        ``FWHM_r × 2·FWHM_a`` centered at ``(center_r, center_a)`` — the
-        same convention ``Add to fitted`` uses to compute ``radius_width``
-        and ``angle_width``. Visible only while a manual peak is selected;
+        Pass any None to clear. When ``is_ring`` is False, paints a dashed
+        cyan box of size ``FWHM_r × 2·FWHM_a`` centered at
+        ``(center_r, center_a)`` — the same convention ``Add to fitted``
+        uses to compute ``radius_width`` and ``angle_width``. When
+        ``is_ring`` is True, ``center_a`` / ``fwhm_a`` are ignored and the
+        preview is drawn as a full-angular-sweep ring at the canonical
+        ``angle = 45°, angle_width = ∞`` (matching what Add-to-fitted will
+        write). Visible only while a manual or detected peak is selected;
         the parameter panel's selection-changed slot calls this with None
         for any other kind.
         """
         if (
             center_r is None or fwhm_r is None
-            or center_a is None or fwhm_a is None
             or not (np.isfinite(center_r) and np.isfinite(fwhm_r) and fwhm_r > 0)
+        ):
+            self._fitted_preview_geom = None
+            self._fitted_preview_is_ring = False
+        elif is_ring:
+            # Ring path: angular fit isn't required (or even meaningful)
+            # — store sentinel angular values that _render_overlays
+            # rewrites to (45°, ∞) when it builds the preview row.
+            self._fitted_preview_geom = (
+                float(center_r), float(fwhm_r), 45.0, 0.0,
+            )
+            self._fitted_preview_is_ring = True
+        elif (
+            center_a is None or fwhm_a is None
             or not (np.isfinite(center_a) and np.isfinite(fwhm_a) and fwhm_a > 0)
         ):
             self._fitted_preview_geom = None
+            self._fitted_preview_is_ring = False
         else:
             self._fitted_preview_geom = (
                 float(center_r), float(fwhm_r),
                 float(center_a), float(fwhm_a),
             )
+            self._fitted_preview_is_ring = False
         self._render_overlays(self.current_frame)
 
     def set_busy(self, busy: bool) -> None:
@@ -945,6 +1018,24 @@ class GIWAXSImageViewer(QWidget):
     @property
     def current_frame(self) -> int:
         return int(self._view.currentIndex)
+
+    @property
+    def n_frames(self) -> int:
+        """Number of frames in the active stack (0 if no stack loaded)."""
+        return 0 if self._stack is None else int(self._stack.n_frames)
+
+    def set_frame(self, frame: int) -> None:
+        """Programmatic seek. Wraps pyqtgraph's setCurrentIndex with a
+        bounds check so callers (Display-dock slider, scripts) can't
+        drive the timeline out of range.
+        """
+        n = self.n_frames
+        if n == 0:
+            return
+        idx = max(0, min(int(frame), n - 1))
+        if idx == self.current_frame:
+            return
+        self._view.setCurrentIndex(idx)
 
     @property
     def selected_peak(self) -> SelectedPeak | None:
@@ -1174,14 +1265,29 @@ class GIWAXSImageViewer(QWidget):
             pos=p.pos,
             scale=p.scale,
         )
-        # The roiPlot is pyqtgraph's frame-timeline strip; only meaningful
-        # when the stack has more than one frame.
-        multi_frame = p.image_pg.shape[0] > 1
-        self._view.ui.roiPlot.setVisible(multi_frame)
-        if multi_frame:
-            self._view.ui.splitter.setSizes([4, 1])
+        # pyqtgraph's setImage internally calls roiClicked() which
+        # force-shows the bottom timeline strip whenever the image
+        # has a time axis (line 671 in ImageView.py). Re-apply our
+        # toggle state so the user's choice persists across stack
+        # reloads.
+        self._set_timeline_visible(self._timeline_check.isChecked())
+
+    def _set_timeline_visible(self, visible: bool) -> None:
+        """Show / hide pyqtgraph's bottom timeline strip.
+
+        When hidden, the splitter is collapsed to size [1, 0] and the
+        handle is already 0-width (set in __init__) so there's no
+        residual line clipping the image's x-axis label. When shown,
+        we hand the strip ~20% of the height — enough for frame ticks
+        and the draggable timeLine without crowding the image.
+        """
+        ui = self._view.ui
+        ui.roiPlot.setVisible(visible)
+        if visible:
+            total = max(self.height(), 200)
+            ui.splitter.setSizes([int(total * 0.8), int(total * 0.2)])
         else:
-            self._view.ui.splitter.setSizes([1, 0])
+            ui.splitter.setSizes([1, 0])
 
     def _on_time_changed(self, index: int, _time: float) -> None:
         idx = int(index)
@@ -1234,14 +1340,26 @@ class GIWAXSImageViewer(QWidget):
             and self._selected.kind in ("manual", "detected")
         ):
             cr, fr, ca, fa = self._fitted_preview_geom
-            preview_table = _peaks_from_manual([
-                ManualPeak(
-                    radius=cr, angle=ca,
-                    radius_width=fr,            # FWHM_r
-                    angle_width=2.0 * fa,       # 2 × FWHM_a
-                    is_ring=False, temp_id=0,
-                )
-            ])
+            if self._fitted_preview_is_ring:
+                # Ring preview: angular dimensions ignored, full sweep at
+                # the canonical (45°, ∞) ring convention.
+                preview_table = _peaks_from_manual([
+                    ManualPeak(
+                        radius=cr, angle=45.0,
+                        radius_width=fr,        # FWHM_r
+                        angle_width=float("inf"),
+                        is_ring=True, temp_id=0,
+                    )
+                ])
+            else:
+                preview_table = _peaks_from_manual([
+                    ManualPeak(
+                        radius=cr, angle=ca,
+                        radius_width=fr,            # FWHM_r
+                        angle_width=2.0 * fa,       # 2 × FWHM_a
+                        is_ring=False, temp_id=0,
+                    )
+                ])
 
         if self._mode == MODE_POLAR:
             self._detected.set_polar(det)
@@ -1405,10 +1523,12 @@ class GIWAXSImageViewer(QWidget):
         # 4) matched — only when the master toggle is on. The hit's peak_id
         # is the underlying fitted id (which is what delete_peak consumes).
         if self._matched_master_visible:
-            for s in reversed(self._matched_per_frame.get(frame, [])):
+            structures = self._matched_per_frame.get(frame, [])
+            for s_idx, s in reversed(list(enumerate(structures))):
                 if not self._is_matched_item_visible(s.unique_id):
                     continue
                 tbl = s.peaks
+                color = MATCHED_PALETTE[s_idx % len(MATCHED_PALETTE)]
                 for i in reversed(range(len(tbl))):
                     if _polar_table_row_contains(tbl, i, x, y):
                         self._set_selected(SelectedPeak(
@@ -1421,6 +1541,8 @@ class GIWAXSImageViewer(QWidget):
                             angle_width=float(tbl.angle_width[i]),
                             is_ring=bool(tbl.is_ring[i]),
                             structure_uid=s.unique_id,
+                            structure_label=s.label,
+                            structure_color=color,
                         ))
                         return
 
@@ -1468,9 +1590,11 @@ class GIWAXSImageViewer(QWidget):
     def _sync_roi(self) -> None:
         """Create / update / destroy the resize ROI to match the selection.
 
-        Polar mode only, and only for editable kinds (manual / detected /
-        fitted). Matched selections show the box but no ROI — editing the
-        underlying fitted peak is the way to change geometry.
+        Polar mode only, and only for editable kinds (manual / detected).
+        Fitted and matched selections show the box but no ROI — fitted
+        boxes encode the FWHM convention so dragging their bounds would
+        misrepresent the underlying Gaussian; matched is a derived view
+        of fitted_peaks. Both edit through Add-to-fitted / delete instead.
 
         Handles ring peaks (``is_ring`` true or non-finite ``angle_width``)
         and peaks whose box edges fall outside the visible polar range:
@@ -1484,7 +1608,7 @@ class GIWAXSImageViewer(QWidget):
             self._selected is None
             or self._mode != MODE_POLAR
             or self._busy
-            or self._selected.kind == "matched"
+            or self._selected.kind in ("fitted", "matched")
         ):
             return
 
