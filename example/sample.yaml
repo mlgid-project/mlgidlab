@@ -1,0 +1,75 @@
+data:
+  name: (BA)2PbI4
+  state: thin film
+  size: 0.01 x 0.01 x 0.0011
+  structure:
+    stack: nitrogen | (BA)2PbI4 | MAPbBr3 | ITO | glass
+    materials:
+      (BA)2PbI4:
+        name: Butylammonium lead iodide n = 1
+        cas_number_1: 36945-08-1
+        cas_number_2: 10101-63-0
+        cif: (BA)2PbI4.cif
+        precursor:
+          solvents: DMF:DMSO
+          solvents_ratio: '4:1'
+          concentration_mM: 0.4
+          volume_uL: 10
+          additive: null
+        preparation:
+          deposition_method:
+            spin_coating_type: one-step
+            antisolvent: null
+            gas: null
+            spinning_speed_1: 1000
+            spinning_time_1: 10
+            spinning_speed_2: 4000
+            spinning_time_2: 300
+          annealing_procedure:
+            annealing_type: halogen lamp
+            lamp_to_sample_distance: 0.04
+            annealing_temperature: 100
+            annealing_time: 240
+        type: 2D perovskite film
+      MAPbBr3:
+        name: MAPbBr3
+        cas_number_1: 1605-39-6
+        cas_number_2: 10031-22-8
+        cif: MAPbBr3.cif
+        precursor:
+          solvents: DMF:DMSO
+          solvents_ratio: '4:1'
+          concentration_mM: 1.4
+          volume_uL: 60
+          additive: null
+        preparation:
+          deposition_method:
+            spin_coating_type: one-step
+            antisolvent: null
+            gas: null
+            spinning_speed_1: 1000
+            spinning_time_1: 10
+            spinning_speed_2: 4000
+            spinning_time_2: 30
+          annealing_procedure:
+            annealing_type: halogen lamp
+            lamp_to_sample_distance: 0.04
+            annealing_power_1: 150
+            annealing_time_1: 240
+            annealing_power_2: 85
+            annealing_time_2: 126
+        type: 3D perovskite film
+      ITO:
+        name: indium tin oxide
+        cas_number: 50926-11-9
+        thickness: 1.8e-07
+        preparation:
+          ultrasonic_bath: isopropanol 300 s, acetone 300 s
+          plasma_cleaning: 60 s in Ar plasma
+        specification: CEC010S, <= 10 Ohm/sq
+        type: substrate
+      glass:
+        name: glass
+        type: substrate
+  preparation: 2D on 3D perovskite thin film deposited by one-step spin-coating
+  experimental_conditions: nitrogen atmosphere

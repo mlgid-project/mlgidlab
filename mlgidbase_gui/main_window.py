@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread
-from PySide6.QtGui import QAction, QCloseEvent, QColor, QKeySequence, QPainter, QPen, QPixmap
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QFont, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QProgressDialog,
     QSlider,
     QTabWidget,
@@ -41,11 +42,18 @@ from mlgidbase_gui.pipeline import (
 )
 from mlgidbase_gui.pipeline_panel import PipelinePanel
 from mlgidbase_gui.profile_viewer import ProfileViewer
-from mlgidbase_gui.session import Session
-from mlgidbase_gui.workers import CifParseWorker, CopyWorker, PipelineWorker
+from mlgidbase_gui.conversion_panel import ConversionPanel
+from mlgidbase_gui.session import BaseSession, NexusSession, RawSession, Session
+from mlgidbase_gui.workers import (
+    CifParseWorker,
+    ConversionWorker,
+    CopyWorker,
+    PipelineWorker,
+)
 
 APP_NAME = "mlgidBASE GUI"
 NEXUS_FILTER = "HDF5 / NeXus (*.h5 *.hdf5 *.nxs);;All files (*)"
+RAW_FILTER = "HDF5 raw data (*.h5 *.hdf5 *.nxs);;All files (*)"
 
 
 def _make_pen_swatch(style: dict, width: int = 26, height: int = 12) -> QPixmap:
@@ -78,8 +86,8 @@ class MainWindow(QMainWindow):
         # file browser. The "active" one drives entry_combo, the image viewer,
         # and per-file actions (save, save-as, close, pipeline). Switching is
         # automatic when the user clicks a node from a different file.
-        self._sessions: list[Session] = []
-        self._active_session: Session | None = None
+        self._sessions: list[BaseSession] = []
+        self._active_session: BaseSession | None = None
         # Opens run serially through the existing single-thread CopyWorker
         # plumbing; extra paths from a multi-select dialog wait here.
         self._open_queue: list[Path] = []
@@ -99,6 +107,13 @@ class MainWindow(QMainWindow):
         # flight).
         self._cif_parse_thread: QThread | None = None
         self._cif_parse_worker: CifParseWorker | None = None
+        # Conversion worker thread (raw → NeXus). Kept separate from
+        # the pipeline worker because conversion runs on raw inputs,
+        # while pipeline runs on converted NeXus files; the two never
+        # need to share a worker.
+        self._conv_thread: QThread | None = None
+        self._conv_worker: ConversionWorker | None = None
+        self._conv_progress: QProgressDialog | None = None
 
         self.setWindowTitle(APP_NAME)
         self.resize(1400, 900)
@@ -184,6 +199,14 @@ class MainWindow(QMainWindow):
         )
         clear_menu.addAction(self.action_clear_matched)
 
+        # Export the current frame to PNG. Works for either NeXus or
+        # raw mode — pyqtgraph's ImageExporter operates on the active
+        # plot item regardless of which stack supplied the data.
+        tools_menu.addSeparator()
+        self.action_export_png = QAction("Export current frame as PNG…", self)
+        self.action_export_png.triggered.connect(self._action_export_png)
+        tools_menu.addAction(self.action_export_png)
+
     def _action_clear_manual(self) -> None:
         """Drop every manual peak. In-memory only, no file write."""
         if not self._confirm_clear("manual"):
@@ -232,6 +255,39 @@ class MainWindow(QMainWindow):
             f"Cleared {kind} peaks ({removed_total} rows total) on {entry}"
         )
 
+    def _action_export_png(self) -> None:
+        """Export the currently-displayed image (with overlays) to PNG.
+
+        Uses pyqtgraph's ImageExporter on the viewer's PlotItem so the
+        output mirrors what the user sees — colormap, levels, axes,
+        and any visible peak overlays. Available in both NeXus and
+        raw modes.
+        """
+        if self.viewer.n_frames == 0:
+            QMessageBox.information(
+                self, "Nothing to export",
+                "Open a file and load an entry before exporting.",
+            )
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export current frame as PNG", "frame.png",
+            "PNG image (*.png);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            from pyqtgraph.exporters import ImageExporter
+            exporter = ImageExporter(self.viewer._plot)
+            exporter.export(path)
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Export failed",
+                f"Could not write PNG: {exc}",
+            )
+            return
+        # Confirm visually so the user knows where the file landed.
+        self.statusBar().showMessage(f"Wrote {path}", 5000)
+
     def _confirm_clear(self, kind: str) -> bool:
         descriptions = {
             "manual":   ("manual peaks (in-memory)",
@@ -267,6 +323,8 @@ class MainWindow(QMainWindow):
             self._tree_dock,
             self._display_dock,
             self._pipeline_dock,
+            self._conversion_dock,
+            self._logs_dock,
             self._profile_dock,
         ):
             view_menu.addAction(dock.toggleViewAction())
@@ -284,10 +342,19 @@ class MainWindow(QMainWindow):
 
     def _build_file_menu(self, file_menu) -> None:
 
-        self.action_open = QAction("&Open…", self)
+        self.action_open = QAction("Open &NeXus…", self)
         self.action_open.setShortcut(QKeySequence.StandardKey.Open)
         self.action_open.triggered.connect(self._action_open)
         file_menu.addAction(self.action_open)
+
+        # Distinct entry point for raw detector data: routes through pygid
+        # conversion before the rest of the pipeline becomes usable. The
+        # two flows are kept separate by design — auto-detecting raw vs
+        # converted from file content is brittle.
+        self.action_open_raw = QAction("Open &raw data…", self)
+        self.action_open_raw.setShortcut(QKeySequence("Ctrl+Shift+O"))
+        self.action_open_raw.triggered.connect(self._action_open_raw)
+        file_menu.addAction(self.action_open_raw)
 
         self.action_save = QAction("&Save", self)
         self.action_save.setShortcut(QKeySequence.StandardKey.Save)
@@ -482,6 +549,53 @@ class MainWindow(QMainWindow):
         self._pipeline_dock.setObjectName("PipelineDock")
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._pipeline_dock)
         self.tabifyDockWidget(self._display_dock, self._pipeline_dock)
+
+        # Conversion dock — mode-exclusive sibling of the Pipeline dock.
+        # Visible only when the active session is a RawSession; switching
+        # between Nexus and Raw sessions hides one and shows the other.
+        # Both share the same dock slot (tabified with Display) so the
+        # right side never grows beyond two visible tabs.
+        self.conversion_panel = ConversionPanel(self)
+        self.conversion_panel.conversionRunRequested.connect(
+            self._on_conversion_run
+        )
+        self._conversion_dock = QDockWidget("Conversion", self)
+        self._conversion_dock.setWidget(self.conversion_panel)
+        self._conversion_dock.setObjectName("ConversionDock")
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._conversion_dock)
+        self.tabifyDockWidget(self._display_dock, self._conversion_dock)
+        # Default state matches the default session (none): pipeline dock
+        # shown so the user can see what would be available once they
+        # open a converted file. ``_apply_session_mode`` handles toggles
+        # from then on.
+        self._conversion_dock.setVisible(False)
+
+        # Shared Logs dock — tabified next to Display / Pipeline / Conversion.
+        # Both panels emit ``logMessage`` / ``logCleared``; we route them
+        # through this single widget so the log history is visible in
+        # either mode (and a switch from Conversion to NeXus doesn't hide
+        # the running log).
+        self._log_view = QPlainTextEdit()
+        self._log_view.setReadOnly(True)
+        self._log_view.setFont(QFont("monospace"))
+        self._log_view.setMaximumBlockCount(4000)
+        self._log_view.setPlaceholderText(
+            "Pipeline and conversion logs land here."
+        )
+        self._logs_dock = QDockWidget("Logs", self)
+        self._logs_dock.setWidget(self._log_view)
+        self._logs_dock.setObjectName("LogsDock")
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._logs_dock)
+        self.tabifyDockWidget(self._display_dock, self._logs_dock)
+
+        # Route both panels' log messages into the shared widget. Both
+        # panels' ``append_log`` / ``clear_log`` already emit these
+        # signals — every existing call site keeps working.
+        self.pipeline_panel.logMessage.connect(self._log_view.appendPlainText)
+        self.pipeline_panel.logCleared.connect(self._log_view.clear)
+        self.conversion_panel.logMessage.connect(self._log_view.appendPlainText)
+        self.conversion_panel.logCleared.connect(self._log_view.clear)
+
         self._display_dock.raise_()
 
         # Bottom: profile viewer. Default to ~30% of window height so the
@@ -550,6 +664,34 @@ class MainWindow(QMainWindow):
         self._open_queue.extend(Path(p) for p in paths)
         self._process_open_queue()
 
+    def _action_open_raw(self) -> None:
+        """Open one or more raw HDF5 detector files for conversion.
+
+        All selected files are bundled into a single ``RawSession`` so the
+        Conversion panel can apply one shared config to the whole batch.
+        Inputs are read-only — pygid only reads them — so no temp copy is
+        made and the open is synchronous (no CopyWorker needed).
+        """
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Open raw HDF5 file(s)", "", RAW_FILTER
+        )
+        if not paths:
+            return
+        try:
+            session = RawSession.open([Path(p) for p in paths])
+        except Exception as exc:
+            QMessageBox.critical(self, "Open failed", str(exc))
+            return
+        # Insert each raw file into the silx tree as a read-only entry so
+        # the user can browse the HDF5 structure before configuring the
+        # conversion. The tree model accepts the same insertFile() call
+        # that ``_on_open_finished`` uses for converted files.
+        model = self.tree.findHdf5TreeModel()
+        for raw_path in session.raw_paths:
+            model.insertFile(str(raw_path))
+        self._sessions.append(session)
+        self._set_active_session(session)
+
     def _process_open_queue(self) -> None:
         """Kick off the next queued open if no copy is in flight.
 
@@ -581,11 +723,17 @@ class MainWindow(QMainWindow):
     def _action_save(self) -> None:
         self._save(confirm=True)
 
-    def _save(self, confirm: bool, session: Session | None = None) -> bool:
-        """Overwrite the original from the temp. Returns True on success."""
+    def _save(self, confirm: bool, session: BaseSession | None = None) -> bool:
+        """Overwrite the original from the temp. Returns True on success.
+
+        Raw sessions have no writable temp copy — Save and Save As are
+        no-ops for them. The action is also disabled in the menu, but
+        guard here too in case a shortcut fires.
+        """
         target = session if session is not None else self._active_session
-        if target is None:
+        if target is None or target.kind != "nexus":
             return False
+        assert isinstance(target, NexusSession)
         if confirm:
             reply = QMessageBox.question(
                 self,
@@ -605,8 +753,9 @@ class MainWindow(QMainWindow):
         return True
 
     def _action_save_as(self) -> None:
-        if self.session is None:
+        if self.session is None or self.session.kind != "nexus":
             return
+        assert isinstance(self.session, NexusSession)
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Save As",
@@ -713,7 +862,7 @@ class MainWindow(QMainWindow):
         # single bad file in a batch doesn't strand the rest.
         self._process_open_queue()
 
-    def _close_session(self, session: Session) -> None:
+    def _close_session(self, session: BaseSession) -> None:
         """Remove ``session`` from the window: tear down its tree entry,
         delete its temp dir, and pick a new active if it was the active one.
         """
@@ -745,7 +894,7 @@ class MainWindow(QMainWindow):
                 self._update_title()
                 self._update_actions()
 
-    def _set_active_session(self, session: Session | None) -> None:
+    def _set_active_session(self, session: BaseSession | None) -> None:
         """Make ``session`` the active one and reload viewer-side state.
 
         No-op when ``session`` is already active. Blocked while a pipeline
@@ -778,10 +927,50 @@ class MainWindow(QMainWindow):
             # No active session → wipe the per-entry options on the
             # pipeline panel so they don't reference a closed file.
             self.pipeline_panel.set_available_entries([])
+        self._apply_session_mode(session)
         self._update_title()
         self._update_actions()
 
-    def _confirm_discard_changes(self, session: Session | None = None) -> bool:
+    def _apply_session_mode(self, session: BaseSession | None) -> None:
+        """Toggle dock visibility + viewer affordances for the session kind.
+
+        Pipeline and Conversion docks are mode-exclusive: only one is ever
+        visible at a time. Switching between a NeXus and a Raw session
+        flips them in lockstep. With no active session, default to the
+        Pipeline dock visible — that matches the cold-start UI.
+
+        Raw mode also hides everything that doesn't apply to a raw
+        detector frame: peak overlays / matched structures / profile
+        viewer / parameter panel / Cartesian-Polar radios / Tools >
+        Clear-peaks submenu. The user gets a clean canvas focused on
+        the conversion workflow.
+        """
+        is_raw = session is not None and session.kind == "raw"
+        self._pipeline_dock.setVisible(not is_raw)
+        self._conversion_dock.setVisible(is_raw)
+        if is_raw:
+            self._conversion_dock.raise_()
+        else:
+            # Keep Display in front by default for NeXus sessions; users
+            # who prefer Pipeline up-front can click its tab.
+            self._display_dock.raise_()
+        # Hide NeXus-mode-only widgets in raw mode.
+        self._profile_dock.setVisible(not is_raw)
+        if hasattr(self, "parameter_panel"):
+            self.parameter_panel.setVisible(not is_raw)
+        # Cartesian / Polar radios — meaningless before conversion.
+        self.viewer.set_mode_radios_visible(not is_raw)
+        # Tools > Clear peaks submenu has nothing to clear in raw mode.
+        for action in (
+            getattr(self, "action_clear_manual", None),
+            getattr(self, "action_clear_detected", None),
+            getattr(self, "action_clear_fitted", None),
+            getattr(self, "action_clear_matched", None),
+        ):
+            if action is not None:
+                action.setEnabled(not is_raw)
+
+    def _confirm_discard_changes(self, session: BaseSession | None = None) -> bool:
         target = session if session is not None else self._active_session
         if target is None or not target.dirty:
             return True
@@ -814,15 +1003,27 @@ class MainWindow(QMainWindow):
         self.data_viewer.setData(None)
 
     def _reattach_silx_tree(self) -> None:
-        """Re-insert every session's temp file into the tree in order."""
+        """Re-insert every session's files into the tree in order.
+
+        NeXus sessions contribute one file (the temp working copy); raw
+        sessions contribute every selected raw input so the user can keep
+        browsing all of them while configuring conversion.
+        """
         model = self.tree.findHdf5TreeModel()
         for s in self._sessions:
-            model.insertFile(str(s.temp_path))
+            if isinstance(s, RawSession):
+                for raw_path in s.raw_paths:
+                    model.insertFile(str(raw_path))
+            else:
+                model.insertFile(str(s.temp_path))
 
     # -- Entry / viewer wiring --
 
     def _populate_entries(self) -> None:
         if self.session is None:
+            return
+        if self.session.kind == "raw":
+            self._populate_raw_entries()
             return
         try:
             entries = file_model.list_entries(self.session.temp_path)
@@ -845,6 +1046,78 @@ class MainWindow(QMainWindow):
             # user exactly what's in the file so they don't think the GUI
             # silently dropped a working file.
             self._warn_no_q_entries()
+
+    def _populate_raw_entries(self) -> None:
+        """Walk every raw file in the active session and populate the
+        entry combo with its 3D detector-image candidates.
+
+        Combo items are labeled ``filename::dataset/path`` so the user
+        can disambiguate when the batch contains multiple files. Pipeline
+        panel's per-entry scope dropdown is cleared — pipeline ops aren't
+        meaningful in raw mode. The Conversion panel also receives the
+        same set of (file, entries) tuples for its selection tree.
+        """
+        assert isinstance(self.session, RawSession)
+        # Maintain a mapping from combo label → RawEntry so the change
+        # handler can resolve a click without re-walking the HDF5 file.
+        self._raw_entries: dict[str, file_model.RawEntry] = {}
+        labels: list[str] = []
+        panel_inputs: list[tuple[Path, list[file_model.RawEntry]]] = []
+        for raw_path in self.session.raw_paths:
+            try:
+                entries = file_model.list_raw_entries(raw_path)
+            except Exception as exc:
+                self.conversion_panel.append_log(
+                    f"Could not read {raw_path.name}: {exc}"
+                )
+                panel_inputs.append((raw_path, []))
+                continue
+            panel_inputs.append((raw_path, entries))
+            for re in entries:
+                self._raw_entries[re.label] = re
+                labels.append(re.label)
+        # Push the same data into the Conversion panel for its selection
+        # tree. Done before populating the combo so the panel paint
+        # happens once on activation.
+        self.conversion_panel.set_raw_inputs(panel_inputs)
+        self.entry_combo.blockSignals(True)
+        self.entry_combo.clear()
+        self.entry_combo.addItems(labels)
+        self.entry_combo.blockSignals(False)
+        self.pipeline_panel.set_available_entries([])
+        if labels:
+            # Auto-load the first candidate so the user sees something
+            # immediately. The change handler handles further picks.
+            self._load_raw_entry_into_viewer(labels[0])
+        else:
+            QMessageBox.information(
+                self,
+                "No raw datasets found",
+                "None of the selected raw files contain a 3D detector "
+                "dataset (shape (N, H, W) with H, W ≥ 32). Check the "
+                "files in the tree on the left to see their structure.",
+            )
+
+    def _load_raw_entry_into_viewer(self, label: str) -> None:
+        """Load the picked raw entry into the viewer in pixel coords.
+
+        ``label`` is the combo's display string (file::dataset/path).
+        Resolved through ``self._raw_entries`` to a ``RawEntry`` so
+        the loader can pull the right dataset.
+        """
+        raw_entry = getattr(self, "_raw_entries", {}).get(label)
+        if raw_entry is None:
+            return
+        try:
+            arr = file_model.load_raw_dataset(raw_entry)
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Load failed",
+                f"Could not load {raw_entry.label}: {exc}",
+            )
+            return
+        self.viewer.show_raw_stack(arr)
+        self._refresh_frame_slider()
 
     def _warn_no_q_entries(self) -> None:
         """Diagnose why the entry combo ended up empty.
@@ -888,7 +1161,10 @@ class MainWindow(QMainWindow):
     def _on_entry_changed(self, entry: str) -> None:
         if not entry or self.session is None:
             return
-        self._load_entry_into_viewer(entry)
+        if self.session.kind == "raw":
+            self._load_raw_entry_into_viewer(entry)
+        else:
+            self._load_entry_into_viewer(entry)
 
     def _on_frame_slider_changed(self, value: int) -> None:
         """User dragged the Display-dock slider — push to the viewer.
@@ -1049,14 +1325,22 @@ class MainWindow(QMainWindow):
         except OSError:
             target = fname
         for s in self._sessions:
-            try:
-                temp = s.temp_path.resolve()
-            except OSError:
-                temp = s.temp_path
-            if temp == target:
-                if s is not self._active_session:
-                    self._set_active_session(s)
-                return
+            # Raw sessions own multiple files in the tree; any of them
+            # should activate the same RawSession. NeXus sessions own
+            # exactly one file (the temp working copy).
+            if isinstance(s, RawSession):
+                candidate_paths = list(s.raw_paths)
+            else:
+                candidate_paths = [s.temp_path]
+            for candidate in candidate_paths:
+                try:
+                    candidate_resolved = candidate.resolve()
+                except OSError:
+                    candidate_resolved = candidate
+                if candidate_resolved == target:
+                    if s is not self._active_session:
+                        self._set_active_session(s)
+                    return
 
     @staticmethod
     def _node_filename(node) -> Path | None:
@@ -1281,6 +1565,101 @@ class MainWindow(QMainWindow):
         self._pipe_worker.finished.connect(self._on_pipeline_finished)
         self._pipe_thread.started.connect(self._pipe_worker.run)
         self._pipe_thread.start()
+
+    # -- Conversion (raw → NeXus) --
+
+    def _on_conversion_run(self, cfg, scans: list) -> None:
+        """Spawn the ConversionWorker for a fresh run.
+
+        ``cfg`` is a ``ConversionConfig``; ``scans`` is a list of
+        ``RawScan``. We don't refuse on overlapping output paths here
+        — pygid handles overwrite-or-append per scan via ``cfg``'s
+        flags.
+        """
+        if self._conv_thread is not None:
+            QMessageBox.information(
+                self, "Conversion in progress",
+                "A conversion run is already in flight; please wait for it "
+                "to finish before starting another.",
+            )
+            return
+        # Modal progress dialog — a long batch can run for minutes; the
+        # user needs a way to see it's progressing without watching the
+        # log pane scroll.
+        self._conv_progress = QProgressDialog(
+            "Converting…", "", 0, max(len(scans), 1), self
+        )
+        self._conv_progress.setWindowTitle(APP_NAME)
+        self._conv_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self._conv_progress.setCancelButton(None)
+        self._conv_progress.setMinimumDuration(0)
+        self._conv_progress.setLabelText(
+            f"Running {len(scans)} scan(s)…"
+        )
+        self._conv_progress.show()
+
+        self.conversion_panel.set_running(True)
+        self.conversion_panel.clear_log()
+        self.conversion_panel.append_log(
+            f"Starting conversion: {len(scans)} scan(s) → {cfg.output_dir}"
+        )
+
+        self._conv_thread = QThread(self)
+        self._conv_worker = ConversionWorker(scans, cfg)
+        self._conv_worker.moveToThread(self._conv_thread)
+        self._conv_thread.started.connect(self._conv_worker.run)
+        self._conv_worker.log.connect(self.conversion_panel.append_log)
+        self._conv_worker.progress.connect(self._on_conversion_progress)
+        self._conv_worker.finished.connect(self._on_conversion_finished)
+        self._conv_thread.start()
+
+    def _on_conversion_progress(self, done: int, total: int) -> None:
+        if self._conv_progress is None:
+            return
+        self._conv_progress.setMaximum(max(total, 1))
+        self._conv_progress.setValue(done)
+
+    def _on_conversion_finished(
+        self, output_paths: list | None, error: Exception | None
+    ) -> None:
+        if self._conv_thread is not None:
+            self._conv_thread.quit()
+            self._conv_thread.wait()
+            self._conv_thread.deleteLater()
+            self._conv_thread = None
+        if self._conv_worker is not None:
+            self._conv_worker.deleteLater()
+            self._conv_worker = None
+        if self._conv_progress is not None:
+            self._conv_progress.close()
+            self._conv_progress.deleteLater()
+            self._conv_progress = None
+
+        self.conversion_panel.set_running(False)
+
+        if error is not None:
+            self.conversion_panel.append_log(f"ERROR - {error}")
+            QMessageBox.critical(self, "Conversion failed", str(error))
+            return
+
+        outputs = list(output_paths or [])
+        if not outputs:
+            self.conversion_panel.append_log(
+                "Conversion completed but produced no output paths."
+            )
+            return
+
+        self.conversion_panel.append_log(
+            "Conversion DONE. Output files:\n  " + "\n  ".join(str(p) for p in outputs)
+        )
+
+        # Auto-open: queue every produced file as a NeXus session. The
+        # existing CopyWorker path normalizes pygid metadata and handles
+        # silx-tree insertion; ``_set_active_session`` swaps focus once
+        # the first file lands.
+        for out_path in outputs:
+            self._open_queue.append(Path(out_path))
+        self._process_open_queue()
 
     def _on_pipeline_finished(self, _result: object, error: Exception | None) -> None:
         if self._pipe_thread is not None:
@@ -1624,8 +2003,11 @@ class MainWindow(QMainWindow):
 
     def _update_actions(self) -> None:
         has_session = self.session is not None
-        self.action_save.setEnabled(has_session)
-        self.action_save_as.setEnabled(has_session)
+        # Save/Save As only apply to NeXus sessions — raw sessions have no
+        # writable temp copy. Close still works either way.
+        is_nexus = has_session and self.session.kind == "nexus"
+        self.action_save.setEnabled(is_nexus)
+        self.action_save_as.setEnabled(is_nexus)
         self.action_close_file.setEnabled(has_session)
 
     def closeEvent(self, event: QCloseEvent) -> None:
@@ -1651,6 +2033,11 @@ class MainWindow(QMainWindow):
         if self._cif_parse_thread is not None:
             self._cif_parse_thread.quit()
             self._cif_parse_thread.wait()
+        # Stop a conversion run if one is in flight — pygid + h5py do
+        # their own cleanup on a clean thread exit.
+        if self._conv_thread is not None:
+            self._conv_thread.quit()
+            self._conv_thread.wait()
         for s in list(self._sessions):
             s.close()
         self._sessions.clear()

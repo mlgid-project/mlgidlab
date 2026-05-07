@@ -161,24 +161,17 @@ def fit_gaussian_on_axis(
 
     sigma_init = max(width_init / 2.355, (x[-1] - x[0]) / 50.0)
 
-    # Wide-window fits (no fit_range) include flat baseline on either side of
-    # the peak, so a linear-bg term is well-determined. Box-bounded fits
-    # (fit_range given) typically have most points sitting on the peak with
-    # no flat tail — the slope can't be disambiguated from sigma there, so
-    # drop it and fit a constant offset instead.
-    use_linear_bg = fit_range is None
-
+    # Linear background term (slope*x + intercept) is fitted in both the
+    # wide-window and box-bounded paths. Wide-window fits use it freely;
+    # box-bounded fits constrain amp/sigma so the slope can't be absorbed
+    # into a "very wide gaussian + parabola" local minimum.
     n_edge = max(len(x) // 8, 2)
     bg_x = np.concatenate([x[:n_edge], x[-n_edge:]])
     bg_y = np.concatenate([y[:n_edge], y[-n_edge:]])
-    if use_linear_bg:
-        try:
-            slope_init, intercept_init = np.polyfit(bg_x, bg_y, 1)
-        except Exception:
-            slope_init, intercept_init = 0.0, float(np.nanmean(y))
-    else:
-        slope_init = 0.0
-        intercept_init = float(np.nanmin(y))  # baseline = the box's lowest point
+    try:
+        slope_init, intercept_init = np.polyfit(bg_x, bg_y, 1)
+    except Exception:
+        slope_init, intercept_init = 0.0, float(np.nanmean(y))
 
     bg_at_center = float(slope_init) * center_init + float(intercept_init)
     amp_init = float(np.nanmax(y) - bg_at_center)
@@ -188,36 +181,35 @@ def fit_gaussian_on_axis(
         amp_init = 1.0
 
     try:
-        if use_linear_bg:
+        if fit_range is None:
             popt, _ = curve_fit(
                 gaussian_with_linear_bg,
                 x, y,
                 p0=[amp_init, center_init, sigma_init, slope_init, intercept_init],
                 maxfev=2000,
             )
-            amplitude, center, sigma, slope, intercept = (float(v) for v in popt)
         else:
             # Box-bounded fits can fall into a "very wide Gaussian + large
             # negative offset ≈ parabola" local minimum because there's no
             # flat baseline to anchor amp/sigma. Bound sigma to the window
             # width and keep amp ≥ 0 so the optimizer must converge on an
-            # actual peak shape inside the box.
+            # actual peak shape inside the box. Slope/intercept are left
+            # unbounded so the linear-bg term can absorb sloped baselines.
             window_w = float(x[-1] - x[0])
             sample_step = window_w / max(len(x) - 1, 1)
             sigma_lo = max(sample_step * 0.5, 1e-6)
             sigma_hi = max(window_w, sigma_lo * 2.0)
             popt, _ = curve_fit(
-                gaussian_with_constant_bg,
+                gaussian_with_linear_bg,
                 x, y,
-                p0=[amp_init, center_init, sigma_init, intercept_init],
+                p0=[amp_init, center_init, sigma_init, slope_init, intercept_init],
                 bounds=(
-                    [0.0,    float(x[0]),  sigma_lo, -np.inf],
-                    [np.inf, float(x[-1]), sigma_hi,  np.inf],
+                    [0.0,    float(x[0]),  sigma_lo, -np.inf, -np.inf],
+                    [np.inf, float(x[-1]), sigma_hi,  np.inf,  np.inf],
                 ),
                 maxfev=5000,
             )
-            amplitude, center, sigma, intercept = (float(v) for v in popt)
-            slope = 0.0
+        amplitude, center, sigma, slope, intercept = (float(v) for v in popt)
     except Exception:
         return None
 
@@ -237,14 +229,9 @@ def fit_gaussian_on_axis(
     else:
         rlo, rhi = float(x[0]), float(x[-1])
     x_fine = np.linspace(rlo, rhi, FIT_RENDER_SAMPLES)
-    if use_linear_bg:
-        y_fine = gaussian_with_linear_bg(
-            x_fine, amplitude, center, sigma, slope, intercept,
-        )
-    else:
-        y_fine = gaussian_with_constant_bg(
-            x_fine, amplitude, center, sigma, intercept,
-        )
+    y_fine = gaussian_with_linear_bg(
+        x_fine, amplitude, center, sigma, slope, intercept,
+    )
     return GaussianFit(
         x=x_fine, y=y_fine,
         amplitude=amplitude, center=center, sigma=abs(sigma),

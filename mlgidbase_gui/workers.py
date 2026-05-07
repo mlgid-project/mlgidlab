@@ -5,6 +5,9 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 
+from mlgidbase_gui.conversion import CONVERSION_LOGGERS
+from mlgidbase_gui.conversion import execute as conversion_execute
+from mlgidbase_gui.conversion_panel import ConversionConfig, RawScan
 from mlgidbase_gui.pipeline import (
     PIPELINE_LOGGERS,
     PipelineCommand,
@@ -69,6 +72,60 @@ class _SignalLogHandler(logging.Handler):
             self._sink.emit(self.format(record))
         except Exception:
             pass
+
+
+class ConversionWorker(QObject):
+    """Runs ``pygid`` raw → NeXus conversion off the GUI thread.
+
+    Mirrors ``PipelineWorker``: streams every ``pygid`` log record through
+    ``log`` and emits ``finished(list[Path] | None, Exception | None)``
+    with the produced output files (or the failure exception). One
+    progress-style ``progress`` signal fires per scan boundary so the
+    host's QProgressDialog can show batch progress.
+    """
+
+    finished = Signal(object, object)  # (list[Path] | None, Exception | None)
+    log = Signal(str)
+    progress = Signal(int, int)        # (done, total)
+
+    def __init__(
+        self,
+        scans: list[RawScan],
+        cfg: ConversionConfig,
+    ) -> None:
+        super().__init__()
+        self._scans = list(scans)
+        self._cfg = cfg
+
+    def run(self) -> None:
+        handler = _SignalLogHandler(self.log)
+        handler.setFormatter(logging.Formatter("%(levelname)s - %(message)s"))
+        loggers = [logging.getLogger(name) for name in CONVERSION_LOGGERS]
+        prev_levels = [lg.level for lg in loggers]
+        for lg in loggers:
+            lg.addHandler(handler)
+            if lg.level == logging.NOTSET or lg.level > logging.INFO:
+                lg.setLevel(logging.INFO)
+
+        total = len(self._scans)
+        try:
+            self.progress.emit(0, total)
+            # ``conversion.execute`` runs all scans internally; per-scan
+            # progress would require slicing it open, which we don't do
+            # in v1. Fire the start + end progress events so the dialog
+            # shows the work range; v2 can break this into per-scan
+            # callbacks.
+            outputs = conversion_execute(self._scans, self._cfg)
+            self.progress.emit(total, total)
+            self.finished.emit(outputs, None)
+        except Exception as exc:
+            import traceback
+            self.log.emit(traceback.format_exc())
+            self.finished.emit(None, exc)
+        finally:
+            for lg, prev in zip(loggers, prev_levels):
+                lg.removeHandler(handler)
+                lg.setLevel(prev)
 
 
 class PipelineWorker(QObject):

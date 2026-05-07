@@ -23,7 +23,14 @@ dependencies = [
 dev = ["pytest>=8.0"]
 # Pipeline backend (heavy: pulls torch + the mlgid analysis stack).
 # Install when you actually want to run detection/fitting/matching from the GUI.
-pipeline = ["mlgidbase>=0.1"]
+# pygid is required for the raw → NeXus conversion path; it's transitively
+# pulled by mlgidbase but listing it explicitly makes the dependency
+# obvious to anyone reading the project metadata.
+pipeline = [
+    "mlgidbase>=0.1",
+    "pygid>=0.2",
+    "PyYAML",
+]
 
 [project.gui-scripts]
 mlgidbase-gui = "mlgidbase_gui:main"

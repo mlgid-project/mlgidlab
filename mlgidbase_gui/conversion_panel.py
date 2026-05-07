@@ -1,0 +1,1259 @@
+"""Conversion dock — UI for running pygid raw → NeXus conversion.
+
+Mirrors ``pipeline_panel`` in style: collapsible sections, log pane, single
+Run button. Visible only when the active session is a ``RawSession``.
+
+Section state is collected into a ``ConversionConfig`` + list of
+``RawScan`` and emitted on ``conversionRunRequested`` for MainWindow to
+hand off to the worker. Wiring of the emit path lives in Step 5.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QFont
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QFrame,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QPlainTextEdit,
+    QPushButton,
+    QScrollArea,
+    QStackedWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QToolButton,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+from mlgidbase_gui.file_model import RawEntry
+
+
+# Conversion-type identifiers — kept as plain strings so ``ConversionConfig``
+# stays pickleable and can pass through Qt signals without custom marshalling.
+CONV_DET2Q_GID = "det2q_gid"
+CONV_DET2Q = "det2q"
+CONV_DET2POL_GID = "det2pol_gid"
+CONV_DET2POL = "det2pol"
+
+GEOM_GID = "GID"
+GEOM_TRANSMISSION = "Transmission"
+
+# Frame-selection modes for the Selection section.
+FRAME_ALL = "All"
+FRAME_SINGLE = "Single"
+FRAME_LIST = "List"
+
+OUTPUT_SEPARATE_FILES = "Separate files"
+OUTPUT_SEPARATE_DATASETS = "Separate datasets in single file"
+
+
+def _make_form(parent: QWidget | None = None) -> QFormLayout:
+    """Build a QFormLayout configured to wrap long rows.
+
+    ``WrapLongRows`` keeps labels next to their fields when there's
+    horizontal space and stacks the label above the field when the
+    panel is narrow. This stops form rows from forcing the panel
+    wider than the dock and is what makes the parent QScrollArea's
+    ``ScrollBarAlwaysOff`` horizontal policy work in practice.
+    """
+    form = QFormLayout(parent) if parent is not None else QFormLayout()
+    form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+    return form
+
+
+@dataclass
+class RawScan:
+    """One (file, entry, frames) triple selected for conversion.
+
+    ``frame_num`` follows the pygid convention:
+    - ``None`` → all frames in the dataset
+    - ``int`` → a single frame index
+    - ``list[int]`` → an explicit subset
+    """
+
+    file_path: Path
+    entry: str
+    frame_num: int | list[int] | None = None
+
+
+@dataclass
+class ConversionConfig:
+    """Everything the conversion engine needs except the scan list."""
+
+    geometry: str = GEOM_GID
+    conv_type: str = CONV_DET2Q_GID
+    # Orientation flags — passed to pygid.CoordMaps. Default True to
+    # match the pygid example notebook's recommended workflow: with
+    # both off (pygid's library default), the converted q ranges can
+    # extend into negative quadrants depending on detector flips +
+    # beam center, which is rarely what the user wants when reviewing
+    # a single GIWAXS frame. Users who want the full quadrant range
+    # can uncheck either box in the Conversion panel.
+    vert_positive: bool = True
+    hor_positive: bool = True
+    # Reciprocal-space ranges. Empty (None) means "auto" (pygid's default).
+    dq: float | None = None
+    dang: float | None = None
+    q_xy_range: tuple[float, float] | None = None
+    q_z_range: tuple[float, float] | None = None
+    q_x_range: tuple[float, float] | None = None
+    q_y_range: tuple[float, float] | None = None
+    radial_range: tuple[float, float] | None = None
+    angular_range: tuple[float, float] | None = None
+    # Experimental params.
+    poni_path: Path | None = None
+    mask_path: Path | None = None
+    ai: float | None = None
+    # Per-field manual overrides (centerX, centerY, SDD, wavelength,
+    # fliplr, flipud, transp). Filled by the panel when the user changes
+    # the corresponding field; otherwise pygid reads the value from the
+    # PONI file.
+    expmeta_overrides: dict = field(default_factory=dict)
+    # Sample metadata YAML text (parsed by the engine via yaml.safe_load).
+    smplmeta_yaml: str = ""
+    # Experimental metadata key/value pairs from the metadata table.
+    expmeta_kv: dict[str, str] = field(default_factory=dict)
+    # Output config.
+    output_mode: str = OUTPUT_SEPARATE_FILES
+    output_dir: Path | None = None
+    # Optional custom output filename. Behaviour depends on output_mode:
+    #   - separate-datasets: this becomes the single output filename
+    #     (defaults to "converted.h5").
+    #   - separate-files: with one raw file, used verbatim; with multiple,
+    #     used as a prefix (the raw stem is appended).
+    # Empty string falls through to the per-mode defaults.
+    output_filename: str = ""
+    overwrite_file: bool = True
+    overwrite_dataset: bool = False
+
+
+class _CollapsibleSection(QWidget):
+    """Section header (clickable) + body widget that hides on collapse.
+
+    Same pattern as ``pipeline_panel._CollapsibleSection``. Duplicated
+    here rather than imported because pipeline_panel pulls in mlgidbase
+    at module level (lazy but still imports the panel UI), which we
+    don't want for raw-only sessions.
+    """
+
+    expandedChanged = Signal(bool)
+
+    def __init__(
+        self, title: str, *, expanded: bool = True, parent: QWidget | None = None
+    ) -> None:
+        super().__init__(parent)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._toggle = QToolButton(self)
+        self._toggle.setText(title)
+        self._toggle.setCheckable(True)
+        self._toggle.setChecked(expanded)
+        self._toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._toggle.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+        self._toggle.setStyleSheet(
+            "QToolButton { border: none; padding: 4px 0px; font-weight: bold; }"
+        )
+        self._toggle.toggled.connect(self._on_toggled)
+        outer.addWidget(self._toggle)
+
+        self._body = QFrame(self)
+        self._body.setFrameShape(QFrame.Shape.NoFrame)
+        self.body_layout = QVBoxLayout(self._body)
+        self.body_layout.setContentsMargins(16, 0, 4, 6)
+        self.body_layout.setSpacing(4)
+        self._body.setVisible(expanded)
+        outer.addWidget(self._body)
+
+    def is_expanded(self) -> bool:
+        return self._toggle.isChecked()
+
+    def set_expanded(self, expanded: bool) -> None:
+        if self._toggle.isChecked() == expanded:
+            return
+        self._toggle.blockSignals(True)
+        try:
+            self._toggle.setChecked(expanded)
+        finally:
+            self._toggle.blockSignals(False)
+        self._apply_state(expanded)
+
+    def _on_toggled(self, checked: bool) -> None:
+        self._apply_state(checked)
+        self.expandedChanged.emit(checked)
+
+    def _apply_state(self, expanded: bool) -> None:
+        self._body.setVisible(expanded)
+        self._toggle.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+
+
+class ConversionPanel(QWidget):
+    """Top-level widget for the Conversion dock.
+
+    Public surface mirrors the ``PipelinePanel`` slots that MainWindow
+    uses (``append_log``, ``clear_log``, ``set_running``) so the host
+    can wire either panel uniformly. Run wiring (``conversionRunRequested``
+    emit) lands in Step 5.
+    """
+
+    # Emitted when the user clicks Convert. Args: (ConversionConfig,
+    # list[RawScan]). MainWindow runs the worker and handles results.
+    conversionRunRequested = Signal(object, list)
+    # Log routing: the panel emits messages and the host forwards them to
+    # the shared Logs dock. Public ``append_log`` / ``clear_log`` API is
+    # preserved so existing call sites keep working.
+    logMessage = Signal(str)
+    logCleared = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        # File/entry inputs are populated by ``set_raw_inputs`` from
+        # MainWindow when a raw session is activated. Empty until then.
+        self._raw_inputs: list[tuple[Path, list[RawEntry]]] = []
+        self._build_ui()
+
+    # ---------------- Public surface ----------------
+
+    def append_log(self, msg: str) -> None:
+        """Forward ``msg`` to the shared Logs dock via ``logMessage``."""
+        self.logMessage.emit(msg)
+
+    def clear_log(self) -> None:
+        """Ask the shared Logs dock to wipe its contents."""
+        self.logCleared.emit()
+
+    def set_running(self, running: bool) -> None:
+        """Disable / re-enable interactive widgets while a run is in flight."""
+        # Just gate the Convert button — every parameter widget remains
+        # readable so the user can review what's running.
+        if hasattr(self, "btn_convert"):
+            self.btn_convert.setEnabled(not running and self._is_runnable())
+
+    def set_raw_inputs(
+        self, inputs: list[tuple[Path, list[RawEntry]]]
+    ) -> None:
+        """Populate the file/entry tree from the active raw session.
+
+        ``inputs`` is a list of ``(file_path, entries)`` tuples — one
+        entry per (file, dataset) pair found by ``list_raw_entries``.
+        Existing user check-state is dropped on each call; the typical
+        caller activates one raw session per call.
+        """
+        self._raw_inputs = list(inputs)
+        self._refresh_selection_tree()
+        self._refresh_runnable()
+
+    # ---------------- UI construction ----------------
+
+    def _build_ui(self) -> None:
+        # Outer layout owns only the scroll area + the always-visible
+        # Convert button; the inner content widget owns section margins.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        # Vertical scroll fires only when content overflows; horizontal
+        # is hard-locked off so a narrow dock collapses form rows
+        # (labels wrap above fields, see ``_make_form``) instead of
+        # introducing an x-axis scrollbar.
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        outer.addWidget(scroll)
+
+        content = QWidget()
+        inner = QVBoxLayout(content)
+        inner.setContentsMargins(8, 8, 8, 8)
+        inner.setSpacing(4)
+
+        # Sections are independent — any combination can be open at once.
+        # Selection starts open because that's what the user configures
+        # first; the rest stay collapsed to keep the initial UI compact.
+        self._sections: list[_CollapsibleSection] = [
+            self._build_selection_section(),
+            self._build_exp_params_section(),
+            self._build_metadata_section(),
+            self._build_conversion_config_section(),
+            self._build_output_section(),
+        ]
+        for s in self._sections:
+            inner.addWidget(s)
+
+        # Trailing stretch keeps the sections top-anchored when they
+        # don't fill the visible scroll height.
+        inner.addStretch(1)
+        scroll.setWidget(content)
+
+        # Convert button lives *outside* the scroll area so it's always
+        # reachable without scrolling, regardless of how many sections
+        # the user has expanded.
+        button_row = QWidget()
+        button_layout = QVBoxLayout(button_row)
+        button_layout.setContentsMargins(8, 4, 8, 8)
+        button_layout.setSpacing(0)
+        self.btn_convert = QPushButton("Convert")
+        self.btn_convert.setEnabled(False)
+        self.btn_convert.clicked.connect(self._on_convert_clicked)
+        button_layout.addWidget(self.btn_convert)
+        outer.addWidget(button_row)
+
+    # ---------------- Section: Selection ----------------
+
+    def _build_selection_section(self) -> _CollapsibleSection:
+        section = _CollapsibleSection("Selection", expanded=True)
+
+        hint = QLabel(
+            "<i>Tick the entries to convert. Frame mode applies to every "
+            "selected entry.</i>"
+        )
+        hint.setWordWrap(True)
+        section.body_layout.addWidget(hint)
+
+        self.selection_tree = QTreeWidget()
+        self.selection_tree.setColumnCount(3)
+        self.selection_tree.setHeaderLabels(["Source", "Shape", "Dtype"])
+        self.selection_tree.setRootIsDecorated(True)
+        self.selection_tree.setUniformRowHeights(True)
+        # Two-stage column widths: the entry column gets the bulk of
+        # available space so nested dataset paths stay readable.
+        header = self.selection_tree.header()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.selection_tree.itemChanged.connect(self._on_selection_changed)
+        section.body_layout.addWidget(self.selection_tree, 1)
+
+        # Frame mode picker — one config applies to every checked entry.
+        frame_form = _make_form()
+        frame_form.setContentsMargins(0, 0, 0, 0)
+        self.frame_mode = QComboBox()
+        self.frame_mode.addItems([FRAME_ALL, FRAME_SINGLE, FRAME_LIST])
+        self.frame_mode.currentTextChanged.connect(self._on_frame_mode_changed)
+        frame_form.addRow("Frame mode:", self.frame_mode)
+        # Stack swaps the input widget by mode: Single → spinbox-style int;
+        # List → comma-separated text. ``_on_frame_mode_changed`` toggles
+        # visibility.
+        self.frame_single = QLineEdit()
+        self.frame_single.setPlaceholderText("frame index (e.g. 0)")
+        self.frame_single.setVisible(False)
+        frame_form.addRow("", self.frame_single)
+        self.frame_list = QLineEdit()
+        self.frame_list.setPlaceholderText("comma-separated indices, e.g. 0,3,7")
+        self.frame_list.setVisible(False)
+        frame_form.addRow("", self.frame_list)
+        section.body_layout.addLayout(frame_form)
+
+        return section
+
+    def _on_frame_mode_changed(self, mode: str) -> None:
+        self.frame_single.setVisible(mode == FRAME_SINGLE)
+        self.frame_list.setVisible(mode == FRAME_LIST)
+
+    def _on_selection_changed(self, item: QTreeWidgetItem, col: int) -> None:
+        # Only react to checkbox changes; column edits are not editable
+        # in the selection tree.
+        if col != 0:
+            return
+        # Cascading top-level → children selection: when the user toggles
+        # a file's box, cascade to all its entries unless they were
+        # already individually toggled.
+        if item.parent() is None:
+            state = item.checkState(0)
+            if state == Qt.CheckState.PartiallyChecked:
+                return
+            for i in range(item.childCount()):
+                item.child(i).setCheckState(0, state)
+        else:
+            self._refresh_parent_check_state(item.parent())
+        self._refresh_runnable()
+
+    def _refresh_parent_check_state(self, parent: QTreeWidgetItem) -> None:
+        """Set parent to checked / unchecked / partial based on children."""
+        n = parent.childCount()
+        if n == 0:
+            return
+        checked = sum(
+            1
+            for i in range(n)
+            if parent.child(i).checkState(0) == Qt.CheckState.Checked
+        )
+        parent.treeWidget().blockSignals(True)
+        try:
+            if checked == 0:
+                parent.setCheckState(0, Qt.CheckState.Unchecked)
+            elif checked == n:
+                parent.setCheckState(0, Qt.CheckState.Checked)
+            else:
+                parent.setCheckState(0, Qt.CheckState.PartiallyChecked)
+        finally:
+            parent.treeWidget().blockSignals(False)
+
+    def _refresh_selection_tree(self) -> None:
+        self.selection_tree.clear()
+        for file_path, entries in self._raw_inputs:
+            file_item = QTreeWidgetItem([file_path.name, "", ""])
+            file_item.setFlags(
+                file_item.flags()
+                | Qt.ItemFlag.ItemIsUserCheckable
+                | Qt.ItemFlag.ItemIsAutoTristate
+            )
+            file_item.setCheckState(0, Qt.CheckState.Unchecked)
+            file_item.setToolTip(0, str(file_path))
+            for re in entries:
+                shape = "×".join(str(s) for s in re.shape)
+                child = QTreeWidgetItem([
+                    re.dataset_path, shape, re.dtype,
+                ])
+                child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                child.setCheckState(0, Qt.CheckState.Unchecked)
+                # Stash the RawEntry on the item so collection back into a
+                # ConversionConfig is a single ``data()`` lookup.
+                child.setData(0, Qt.ItemDataRole.UserRole, re)
+                file_item.addChild(child)
+            self.selection_tree.addTopLevelItem(file_item)
+            file_item.setExpanded(True)
+
+    # ---------------- Section: Experimental parameters ----------------
+
+    def _build_exp_params_section(self) -> _CollapsibleSection:
+        section = _CollapsibleSection("Experimental parameters", expanded=False)
+        form = _make_form()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(4)
+
+        self.poni_path = QLineEdit()
+        self.poni_path.setPlaceholderText("Path to pyFAI PONI file (required)")
+        poni_browse = QPushButton("Browse…")
+        poni_browse.clicked.connect(self._browse_poni)
+        poni_clear = QPushButton("Clear")
+        poni_clear.clicked.connect(lambda: self.poni_path.setText(""))
+        form.addRow("PONI:", _row(self.poni_path, poni_browse, poni_clear))
+        self.poni_path.textChanged.connect(self._refresh_runnable)
+
+        self.mask_path = QLineEdit()
+        self.mask_path.setPlaceholderText("Optional .npy / .tif / .edf mask")
+        mask_browse = QPushButton("Browse…")
+        mask_browse.clicked.connect(self._browse_mask)
+        mask_clear = QPushButton("Clear")
+        mask_clear.clicked.connect(lambda: self.mask_path.setText(""))
+        form.addRow("Mask:", _row(self.mask_path, mask_browse, mask_clear))
+
+        # Angle of incidence — single global value; per-frame ai is
+        # deferred per the plan's Outlook section.
+        self.ai_input = QDoubleSpinBox()
+        self.ai_input.setRange(0.0, 90.0)
+        self.ai_input.setDecimals(4)
+        self.ai_input.setSingleStep(0.01)
+        self.ai_input.setSpecialValueText("(none)")
+        self.ai_input.setValue(0.0)
+        self.ai_input.setSuffix(" °")
+        form.addRow("Angle of incidence:", self.ai_input)
+
+        section.body_layout.addLayout(form)
+
+        # Manual override fields. Hidden behind a small toggle to keep the
+        # default form compact; pygid reads everything from the PONI file
+        # if these stay blank.
+        self._override_box = QGroupBox("Manual overrides")
+        self._override_box.setCheckable(True)
+        self._override_box.setChecked(False)
+        ovl = _make_form(self._override_box)
+        ovl.setContentsMargins(8, 8, 8, 8)
+        self.over_centerX = _opt_spin(decimals=2, max_v=1e9)
+        self.over_centerY = _opt_spin(decimals=2, max_v=1e9)
+        self.over_SDD = _opt_spin(decimals=4, max_v=1e6, suffix=" m")
+        self.over_wavelength = _opt_spin(decimals=6, max_v=1e3, suffix=" Å")
+        self.over_fliplr = QCheckBox("Flip horizontally (fliplr)")
+        self.over_flipud = QCheckBox("Flip vertically (flipud)")
+        self.over_transp = QCheckBox("Transpose")
+        ovl.addRow("centerX (px):", self.over_centerX)
+        ovl.addRow("centerY (px):", self.over_centerY)
+        ovl.addRow("SDD:", self.over_SDD)
+        ovl.addRow("Wavelength:", self.over_wavelength)
+        ovl.addRow("", self.over_fliplr)
+        ovl.addRow("", self.over_flipud)
+        ovl.addRow("", self.over_transp)
+        section.body_layout.addWidget(self._override_box)
+
+        return section
+
+    def _browse_poni(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select PONI file", "",
+            "PONI calibration (*.poni);;All files (*)",
+        )
+        if path:
+            self.poni_path.setText(path)
+
+    def _browse_mask(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select mask file", "",
+            "Mask images (*.npy *.tif *.tiff *.edf);;All files (*)",
+        )
+        if path:
+            self.mask_path.setText(path)
+
+    # ---------------- Section: Metadata ----------------
+
+    def _build_metadata_section(self) -> _CollapsibleSection:
+        section = _CollapsibleSection("Metadata", expanded=False)
+
+        smpl_label = QLabel("<b>Sample metadata</b> (YAML)")
+        section.body_layout.addWidget(smpl_label)
+
+        smpl_buttons = QHBoxLayout()
+        smpl_buttons.setContentsMargins(0, 0, 0, 0)
+        load_btn = QPushButton("Load YAML…")
+        load_btn.clicked.connect(self._load_smpl_yaml)
+        save_btn = QPushButton("Save copy…")
+        save_btn.clicked.connect(self._save_smpl_yaml)
+        clear_btn = QPushButton("Clear")
+        clear_btn.clicked.connect(lambda: self.smpl_yaml.setPlainText(""))
+        smpl_buttons.addWidget(load_btn)
+        smpl_buttons.addWidget(save_btn)
+        smpl_buttons.addWidget(clear_btn)
+        smpl_buttons.addStretch(1)
+        smpl_btn_widget = QWidget()
+        smpl_btn_widget.setLayout(smpl_buttons)
+        section.body_layout.addWidget(smpl_btn_widget)
+
+        self.smpl_yaml = QPlainTextEdit()
+        self.smpl_yaml.setFont(QFont("monospace"))
+        self.smpl_yaml.setPlaceholderText(
+            "data:\n  name: my_sample\n  ..."
+        )
+        self.smpl_yaml.setMaximumHeight(120)
+        section.body_layout.addWidget(self.smpl_yaml)
+
+        section.body_layout.addSpacing(8)
+        exp_label = QLabel("<b>Experimental metadata</b>")
+        section.body_layout.addWidget(exp_label)
+
+        self.exp_meta_table = QTableWidget(0, 3)
+        self.exp_meta_table.setHorizontalHeaderLabels(["Key", "Value", "Source"])
+        self.exp_meta_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        self.exp_meta_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+        self.exp_meta_table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.exp_meta_table.setMaximumHeight(140)
+        section.body_layout.addWidget(self.exp_meta_table)
+
+        meta_buttons = QHBoxLayout()
+        meta_buttons.setContentsMargins(0, 0, 0, 0)
+        add_btn = QPushButton("Add manual")
+        add_btn.clicked.connect(self._add_manual_meta_row)
+        from_hdf5_btn = QPushButton("Add from HDF5…")
+        # Wired in Step 6 — opens a dataset picker rooted at the active
+        # raw file's tree.
+        from_hdf5_btn.clicked.connect(self._add_meta_from_hdf5)
+        del_btn = QPushButton("Remove")
+        del_btn.clicked.connect(self._remove_meta_row)
+        meta_buttons.addWidget(add_btn)
+        meta_buttons.addWidget(from_hdf5_btn)
+        meta_buttons.addWidget(del_btn)
+        meta_buttons.addStretch(1)
+        meta_btn_widget = QWidget()
+        meta_btn_widget.setLayout(meta_buttons)
+        section.body_layout.addWidget(meta_btn_widget)
+
+        return section
+
+    def _load_smpl_yaml(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load sample metadata", "",
+            "YAML (*.yaml *.yml);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            text = Path(path).read_text()
+        except OSError as exc:
+            self.append_log(f"Failed to read {path}: {exc}")
+            return
+        self.smpl_yaml.setPlainText(text)
+
+    def _save_smpl_yaml(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save sample metadata", "",
+            "YAML (*.yaml *.yml);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_text(self.smpl_yaml.toPlainText())
+        except OSError as exc:
+            self.append_log(f"Failed to write {path}: {exc}")
+
+    def _add_manual_meta_row(self) -> None:
+        row = self.exp_meta_table.rowCount()
+        self.exp_meta_table.insertRow(row)
+        self.exp_meta_table.setItem(row, 0, QTableWidgetItem(""))
+        self.exp_meta_table.setItem(row, 1, QTableWidgetItem(""))
+        src = QTableWidgetItem("manual")
+        src.setFlags(src.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        self.exp_meta_table.setItem(row, 2, src)
+
+    def _remove_meta_row(self) -> None:
+        rows = sorted({i.row() for i in self.exp_meta_table.selectedItems()},
+                      reverse=True)
+        for r in rows:
+            self.exp_meta_table.removeRow(r)
+
+    def _add_meta_from_hdf5(self) -> None:
+        """Open a dataset picker rooted at one of the loaded raw files.
+
+        The picker exposes the HDF5 tree of every raw input. Selecting a
+        dataset reads its first scalar/string value (or first element
+        for arrays, since the user is typically pointing at a metadata
+        scalar) and adds a row to the experimental metadata table with
+        the dataset path as the source.
+        """
+        if not self._raw_inputs:
+            self.append_log(
+                "Add from HDF5: no raw files loaded. Open a raw session first."
+            )
+            return
+        files = [fp for fp, _entries in self._raw_inputs]
+        result = _Hdf5MetaPicker.pick(self, files)
+        if result is None:
+            return
+        key_default, value, source = result
+        row = self.exp_meta_table.rowCount()
+        self.exp_meta_table.insertRow(row)
+        self.exp_meta_table.setItem(row, 0, QTableWidgetItem(key_default))
+        self.exp_meta_table.setItem(row, 1, QTableWidgetItem(value))
+        src_item = QTableWidgetItem(source)
+        src_item.setFlags(src_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        self.exp_meta_table.setItem(row, 2, src_item)
+
+    # ---------------- Section: Conversion config ----------------
+
+    def _build_conversion_config_section(self) -> _CollapsibleSection:
+        section = _CollapsibleSection("Conversion config", expanded=False)
+
+        form = _make_form()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(4)
+
+        self.geometry_combo = QComboBox()
+        self.geometry_combo.addItems([GEOM_GID, GEOM_TRANSMISSION])
+        self.geometry_combo.currentTextChanged.connect(self._on_geometry_changed)
+        form.addRow("Geometry:", self.geometry_combo)
+
+        self.conv_type_combo = QComboBox()
+        # Initially populated for GID; ``_on_geometry_changed`` rebuilds
+        # the list when transmission is chosen.
+        self.conv_type_combo.addItems([CONV_DET2Q_GID, CONV_DET2POL_GID])
+        self.conv_type_combo.currentTextChanged.connect(self._on_conv_type_changed)
+        form.addRow("Conversion:", self.conv_type_combo)
+
+        # Defaults match the pygid example notebook
+        # (``CoordMaps(..., vert_positive=True, hor_positive=True)``) — the
+        # author labels these "(optional, recommended)" because pygid's
+        # bare-default (both False) often lands the converted image in
+        # the negative quadrant depending on detector flips, which is
+        # rarely what the user wants when reviewing a single frame.
+        self.vert_positive_chk = QCheckBox("vert_positive")
+        self.vert_positive_chk.setChecked(True)
+        self.vert_positive_chk.setToolTip(
+            "Constrain the q_z range to non-negative values during conversion. "
+            "Recommended (matches the pygid example notebook). Uncheck to keep "
+            "any natural negative q_z extent in the converted output."
+        )
+        self.hor_positive_chk = QCheckBox("hor_positive")
+        self.hor_positive_chk.setChecked(True)
+        self.hor_positive_chk.setToolTip(
+            "Constrain the q_xy range to non-negative values during conversion. "
+            "Recommended (matches the pygid example notebook). Uncheck to keep "
+            "any natural negative q_xy extent in the converted output."
+        )
+        orient_row = QHBoxLayout()
+        orient_row.setContentsMargins(0, 0, 0, 0)
+        orient_row.addWidget(self.vert_positive_chk)
+        orient_row.addWidget(self.hor_positive_chk)
+        orient_row.addStretch(1)
+        orient_widget = QWidget()
+        orient_widget.setLayout(orient_row)
+        form.addRow("Orientation:", orient_widget)
+
+        section.body_layout.addLayout(form)
+
+        # Stack of parameter sub-forms. The visible page swaps based on
+        # conv_type so the user only sees parameters that apply.
+        self._param_stack = QStackedWidget()
+        # Page 0: det2q_gid (q_xy_range / q_z_range / dq)
+        self._param_pages: dict[str, QWidget] = {}
+        self._param_pages[CONV_DET2Q_GID] = _build_q_gid_params(self)
+        self._param_pages[CONV_DET2Q] = _build_q_trans_params(self)
+        self._param_pages[CONV_DET2POL_GID] = _build_pol_params(self, gid=True)
+        self._param_pages[CONV_DET2POL] = _build_pol_params(self, gid=False)
+        for page in self._param_pages.values():
+            self._param_stack.addWidget(page)
+        section.body_layout.addWidget(self._param_stack)
+
+        # Initial page matches the default conv_type.
+        self._show_param_page(self.conv_type_combo.currentText())
+
+        return section
+
+    def _on_geometry_changed(self, geom: str) -> None:
+        # Re-populate conv_type combo to only show variants compatible
+        # with the chosen geometry. The user picks det2q vs det2pol
+        # within the right family.
+        self.conv_type_combo.blockSignals(True)
+        try:
+            self.conv_type_combo.clear()
+            if geom == GEOM_GID:
+                self.conv_type_combo.addItems([CONV_DET2Q_GID, CONV_DET2POL_GID])
+            else:
+                self.conv_type_combo.addItems([CONV_DET2Q, CONV_DET2POL])
+        finally:
+            self.conv_type_combo.blockSignals(False)
+        self._show_param_page(self.conv_type_combo.currentText())
+
+    def _on_conv_type_changed(self, conv: str) -> None:
+        self._show_param_page(conv)
+
+    def _show_param_page(self, conv: str) -> None:
+        page = self._param_pages.get(conv)
+        if page is not None:
+            self._param_stack.setCurrentWidget(page)
+
+    # ---------------- Section: Output ----------------
+
+    def _build_output_section(self) -> _CollapsibleSection:
+        section = _CollapsibleSection("Output", expanded=False)
+
+        form = _make_form()
+        form.setContentsMargins(0, 0, 0, 0)
+
+        self.output_dir = QLineEdit()
+        self.output_dir.setPlaceholderText("Output directory (required)")
+        out_browse = QPushButton("Browse…")
+        out_browse.clicked.connect(self._browse_output_dir)
+        form.addRow("Directory:", _row(self.output_dir, out_browse))
+        self.output_dir.textChanged.connect(self._refresh_runnable)
+
+        self.output_mode_combo = QComboBox()
+        self.output_mode_combo.addItems(
+            [OUTPUT_SEPARATE_FILES, OUTPUT_SEPARATE_DATASETS]
+        )
+        self.output_mode_combo.currentTextChanged.connect(
+            self._update_output_filename_placeholder
+        )
+        form.addRow("Save as:", self.output_mode_combo)
+
+        # Optional output filename. Behaviour depends on the mode above
+        # (the placeholder text reflects the active rule):
+        #   separate-files (default): blank → "{stem}_converted.h5"
+        #   separate-files w/ prefix:  prefix appended with raw stem
+        #   separate-datasets:         blank → "converted.h5"
+        self.output_filename = QLineEdit()
+        self._update_output_filename_placeholder(
+            self.output_mode_combo.currentText()
+        )
+        form.addRow("Filename:", self.output_filename)
+
+        self.overwrite_file_chk = QCheckBox("Overwrite existing file")
+        self.overwrite_file_chk.setChecked(True)
+        self.overwrite_dataset_chk = QCheckBox("Overwrite existing dataset")
+        flags_row = QHBoxLayout()
+        flags_row.setContentsMargins(0, 0, 0, 0)
+        flags_row.addWidget(self.overwrite_file_chk)
+        flags_row.addWidget(self.overwrite_dataset_chk)
+        flags_row.addStretch(1)
+        flags_widget = QWidget()
+        flags_widget.setLayout(flags_row)
+        form.addRow("Overwrite:", flags_widget)
+
+        section.body_layout.addLayout(form)
+        return section
+
+    def _browse_output_dir(self) -> None:
+        path = QFileDialog.getExistingDirectory(
+            self, "Select output directory", str(Path.home())
+        )
+        if path:
+            self.output_dir.setText(path)
+
+    def _update_output_filename_placeholder(self, mode: str) -> None:
+        """Adjust the filename placeholder so the user knows what blank means."""
+        if mode == OUTPUT_SEPARATE_DATASETS:
+            self.output_filename.setPlaceholderText(
+                "Optional. Default: converted.h5"
+            )
+        else:
+            self.output_filename.setPlaceholderText(
+                "Optional. Default: {raw_stem}_converted.h5  (or prefix for batches)"
+            )
+
+    # ---------------- Run wiring ----------------
+
+    def _is_runnable(self) -> bool:
+        """Whether the Convert button should be enabled.
+
+        Requires: at least one entry checked, a non-empty PONI path, and
+        a non-empty output directory. ``set_running`` overrides this when
+        a run is in flight.
+        """
+        if not self.poni_path.text().strip():
+            return False
+        if not self.output_dir.text().strip():
+            return False
+        return self._has_checked_entries()
+
+    def _has_checked_entries(self) -> bool:
+        for i in range(self.selection_tree.topLevelItemCount()):
+            file_item = self.selection_tree.topLevelItem(i)
+            for j in range(file_item.childCount()):
+                if file_item.child(j).checkState(0) == Qt.CheckState.Checked:
+                    return True
+        return False
+
+    def _refresh_runnable(self) -> None:
+        self.btn_convert.setEnabled(self._is_runnable())
+
+    def _on_convert_clicked(self) -> None:
+        """Collect every section's state into a config + scan list and
+        emit ``conversionRunRequested``. MainWindow spawns the worker.
+        """
+        try:
+            scans, cfg = self._collect_run_inputs()
+        except ValueError as exc:
+            self.append_log(f"Cannot start conversion: {exc}")
+            return
+        self.conversionRunRequested.emit(cfg, scans)
+
+    # ---------------- Run-input collection ----------------
+
+    def _collect_run_inputs(self) -> tuple[list[RawScan], ConversionConfig]:
+        """Gather every panel field into ``(scans, ConversionConfig)``.
+
+        Raises ``ValueError`` for inputs that are too malformed to send
+        to the engine (e.g. an unparseable frame list). The Convert
+        button is already gated on the obvious required fields, so
+        these errors are typically just frame-mode parse failures or
+        invalid override values.
+        """
+        scans = self._collect_scans()
+        if not scans:
+            raise ValueError("No entries selected — tick at least one in the Selection tree.")
+        cfg = self._collect_config()
+        return scans, cfg
+
+    def _collect_scans(self) -> list[RawScan]:
+        frame_num = self._resolve_frame_num()
+        scans: list[RawScan] = []
+        for i in range(self.selection_tree.topLevelItemCount()):
+            file_item = self.selection_tree.topLevelItem(i)
+            for j in range(file_item.childCount()):
+                child = file_item.child(j)
+                if child.checkState(0) != Qt.CheckState.Checked:
+                    continue
+                re: RawEntry | None = child.data(0, Qt.ItemDataRole.UserRole)
+                if re is None:
+                    continue
+                scans.append(
+                    RawScan(
+                        file_path=re.file_path,
+                        entry=re.dataset_path,
+                        frame_num=frame_num,
+                    )
+                )
+        return scans
+
+    def _resolve_frame_num(self) -> int | list[int] | None:
+        mode = self.frame_mode.currentText()
+        if mode == FRAME_ALL:
+            return None
+        if mode == FRAME_SINGLE:
+            text = self.frame_single.text().strip()
+            if not text:
+                raise ValueError("Frame mode is 'Single' but no frame index was given.")
+            try:
+                return int(text)
+            except ValueError as exc:
+                raise ValueError(f"Frame index is not an integer: {text!r}") from exc
+        if mode == FRAME_LIST:
+            text = self.frame_list.text().strip()
+            if not text:
+                raise ValueError("Frame mode is 'List' but no indices were given.")
+            try:
+                return [int(p.strip()) for p in text.split(",") if p.strip()]
+            except ValueError as exc:
+                raise ValueError(f"Frame list contains a non-integer entry: {text!r}") from exc
+        return None
+
+    def _collect_config(self) -> ConversionConfig:
+        cfg = ConversionConfig()
+        cfg.geometry = self.geometry_combo.currentText()
+        cfg.conv_type = self.conv_type_combo.currentText()
+        cfg.vert_positive = self.vert_positive_chk.isChecked()
+        cfg.hor_positive = self.hor_positive_chk.isChecked()
+
+        # Range / step parameters per conversion type.
+        if cfg.conv_type == CONV_DET2Q_GID:
+            cfg.dq = _spin_or_none(self.dq_q_gid)
+            cfg.q_xy_range = _range_or_none(self.q_xy_min, self.q_xy_max)
+            cfg.q_z_range = _range_or_none(self.q_z_min, self.q_z_max)
+        elif cfg.conv_type == CONV_DET2Q:
+            cfg.dq = _spin_or_none(self.dq_q_trans)
+            cfg.q_x_range = _range_or_none(self.q_x_min, self.q_x_max)
+            cfg.q_y_range = _range_or_none(self.q_y_min, self.q_y_max)
+        elif cfg.conv_type == CONV_DET2POL_GID:
+            cfg.dq = _spin_or_none(self.dq_pol_gid)
+            cfg.dang = _spin_or_none(self.dang_pol_gid)
+            cfg.radial_range = _range_or_none(
+                self.radial_min_gid, self.radial_max_gid
+            )
+            cfg.angular_range = _range_or_none(
+                self.angular_min_gid, self.angular_max_gid
+            )
+        elif cfg.conv_type == CONV_DET2POL:
+            cfg.dq = _spin_or_none(self.dq_pol)
+            cfg.dang = _spin_or_none(self.dang_pol)
+            cfg.radial_range = _range_or_none(self.radial_min, self.radial_max)
+            cfg.angular_range = _range_or_none(self.angular_min, self.angular_max)
+
+        # Experimental parameters.
+        poni_text = self.poni_path.text().strip()
+        cfg.poni_path = Path(poni_text) if poni_text else None
+        mask_text = self.mask_path.text().strip()
+        cfg.mask_path = Path(mask_text) if mask_text else None
+        ai_value = self.ai_input.value()
+        cfg.ai = float(ai_value) if ai_value > 0 else None
+
+        # Manual overrides — only forwarded when the box is checked.
+        if self._override_box.isChecked():
+            overrides: dict = {}
+            for attr, key in (
+                ("over_centerX", "centerX"),
+                ("over_centerY", "centerY"),
+                ("over_SDD", "SDD"),
+                ("over_wavelength", "wavelength"),
+            ):
+                v = _spin_or_none(getattr(self, attr))
+                if v is not None:
+                    overrides[key] = v
+            if self.over_fliplr.isChecked():
+                overrides["fliplr"] = True
+            if self.over_flipud.isChecked():
+                overrides["flipud"] = True
+            if self.over_transp.isChecked():
+                overrides["transp"] = True
+            cfg.expmeta_overrides = overrides
+
+        # Metadata.
+        cfg.smplmeta_yaml = self.smpl_yaml.toPlainText()
+        kv: dict[str, str] = {}
+        for r in range(self.exp_meta_table.rowCount()):
+            key_item = self.exp_meta_table.item(r, 0)
+            val_item = self.exp_meta_table.item(r, 1)
+            key = key_item.text().strip() if key_item is not None else ""
+            value = val_item.text().strip() if val_item is not None else ""
+            if key:
+                kv[key] = value
+        cfg.expmeta_kv = kv
+
+        # Output.
+        out_text = self.output_dir.text().strip()
+        cfg.output_dir = Path(out_text) if out_text else None
+        cfg.output_mode = self.output_mode_combo.currentText()
+        cfg.output_filename = self.output_filename.text().strip()
+        cfg.overwrite_file = self.overwrite_file_chk.isChecked()
+        cfg.overwrite_dataset = self.overwrite_dataset_chk.isChecked()
+
+        return cfg
+
+
+# -------------- module-level helpers --------------
+
+
+def _row(*widgets: QWidget) -> QWidget:
+    """Pack widgets in a horizontal row with no margins. Convenience for
+    QFormLayout entries that combine a line edit + side buttons.
+    """
+    w = QWidget()
+    h = QHBoxLayout(w)
+    h.setContentsMargins(0, 0, 0, 0)
+    h.setSpacing(4)
+    for i, child in enumerate(widgets):
+        # Stretch the first widget (typically the line edit) so the
+        # buttons stay at their natural width.
+        h.addWidget(child, 1 if i == 0 else 0)
+    return w
+
+
+def _spin_or_none(spin: QDoubleSpinBox) -> float | None:
+    """Read a value from an ``_opt_spin`` box, returning None for "(unset)".
+
+    Mirrors the special-value sentinel used in ``_opt_spin``: a value at
+    or below the minimum (-1.0 by construction) means the user left the
+    field unset, so we return None and let pygid pick its default.
+    """
+    v = spin.value()
+    if v <= spin.minimum() + 1e-12:
+        return None
+    return float(v)
+
+
+def _range_or_none(
+    lo: QDoubleSpinBox, hi: QDoubleSpinBox
+) -> tuple[float, float] | None:
+    """Read a (min, max) pair from two ``_opt_spin`` boxes.
+
+    Returns None when either bound is "(unset)" — both ends of a range
+    have to be specified for pygid to honour it; partial ranges revert
+    to the default (auto).
+    """
+    lo_v = _spin_or_none(lo)
+    hi_v = _spin_or_none(hi)
+    if lo_v is None or hi_v is None:
+        return None
+    return (lo_v, hi_v)
+
+
+def _opt_spin(
+    *,
+    decimals: int = 2,
+    max_v: float = 1e6,
+    suffix: str = "",
+) -> QDoubleSpinBox:
+    """A QDoubleSpinBox configured for "leave blank → use PONI default".
+
+    The minimum is set to a sentinel just below 0 and the special value
+    text is shown there so the user can dial down to "(unset)" without
+    typing 0.
+    """
+    box = QDoubleSpinBox()
+    # Sentinel below 0 acts as "unset"; pygid never sees a negative SDD
+    # / wavelength in practice so this is safe.
+    box.setMinimum(-1.0)
+    box.setMaximum(max_v)
+    box.setDecimals(decimals)
+    box.setSingleStep(10 ** (-decimals))
+    box.setSpecialValueText("(unset)")
+    box.setSuffix(suffix)
+    box.setValue(-1.0)
+    return box
+
+
+def _build_q_gid_params(panel: ConversionPanel) -> QWidget:
+    """Sub-form for ``det2q_gid``: dq, q_xy_range, q_z_range."""
+    w = QWidget()
+    form = _make_form(w)
+    form.setContentsMargins(0, 0, 0, 0)
+    panel.dq_q_gid = _opt_spin(decimals=4, max_v=10.0, suffix=" Å⁻¹")
+    panel.q_xy_min = _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹")
+    panel.q_xy_max = _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹")
+    panel.q_z_min = _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹")
+    panel.q_z_max = _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹")
+    form.addRow("dq:", panel.dq_q_gid)
+    form.addRow("q_xy min:", panel.q_xy_min)
+    form.addRow("q_xy max:", panel.q_xy_max)
+    form.addRow("q_z min:", panel.q_z_min)
+    form.addRow("q_z max:", panel.q_z_max)
+    return w
+
+
+def _build_q_trans_params(panel: ConversionPanel) -> QWidget:
+    """Sub-form for transmission ``det2q``: dq, q_x_range, q_y_range."""
+    w = QWidget()
+    form = _make_form(w)
+    form.setContentsMargins(0, 0, 0, 0)
+    panel.dq_q_trans = _opt_spin(decimals=4, max_v=10.0, suffix=" Å⁻¹")
+    panel.q_x_min = _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹")
+    panel.q_x_max = _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹")
+    panel.q_y_min = _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹")
+    panel.q_y_max = _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹")
+    form.addRow("dq:", panel.dq_q_trans)
+    form.addRow("q_x min:", panel.q_x_min)
+    form.addRow("q_x max:", panel.q_x_max)
+    form.addRow("q_y min:", panel.q_y_min)
+    form.addRow("q_y max:", panel.q_y_max)
+    return w
+
+
+class _Hdf5MetaPicker(QDialog):
+    """Modal silx tree picker for adding HDF5 datasets as metadata.
+
+    Used by the Conversion panel's "Add from HDF5…" button. Returns a
+    tuple ``(suggested_key, value, source_path)`` on accept, where:
+
+    - ``suggested_key`` is the basename of the dataset (e.g. ``temperature``
+      for ``measurement/temperature``) — the user can edit it after the
+      row is added.
+    - ``value`` is the first element of the dataset coerced to a string.
+    - ``source_path`` is ``filename:/path/inside/file`` so the metadata
+      row carries provenance for the value.
+    """
+
+    def __init__(
+        self, parent: QWidget | None, files: list[Path]
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Pick HDF5 dataset")
+        self.setMinimumSize(640, 480)
+        self._files = list(files)
+        self._result: tuple[str, str, str] | None = None
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        hint = QLabel(
+            "<i>Select an HDF5 dataset to add as a metadata key. The "
+            "value is read once at this moment and stored verbatim.</i>"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        # silx tree — same widget the main browser uses, just in a
+        # modal dialog scope. Importing inside the constructor keeps
+        # silx out of the import path when this dialog isn't reached.
+        from silx.gui.hdf5 import Hdf5TreeView
+
+        self._tree = Hdf5TreeView(self)
+        self._tree.setSortingEnabled(True)
+        for fp in self._files:
+            self._tree.findHdf5TreeModel().insertFile(str(fp))
+        self._tree.activated.connect(self._on_activated)
+        self._tree.selectionModel().selectionChanged.connect(self._on_selection)
+        layout.addWidget(self._tree, 1)
+
+        self._buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        self._buttons.button(
+            QDialogButtonBox.StandardButton.Ok
+        ).setEnabled(False)
+        self._buttons.accepted.connect(self._on_accept)
+        self._buttons.rejected.connect(self.reject)
+        layout.addWidget(self._buttons)
+
+    def _on_selection(self, *_: object) -> None:
+        nodes = list(self._tree.selectedH5Nodes())
+        ok = bool(nodes) and self._is_dataset(nodes[0])
+        self._buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(ok)
+
+    def _on_activated(self, *_: object) -> None:
+        # Double-click on a dataset accepts the dialog directly.
+        nodes = list(self._tree.selectedH5Nodes())
+        if nodes and self._is_dataset(nodes[0]):
+            self._on_accept()
+
+    @staticmethod
+    def _is_dataset(node) -> bool:
+        try:
+            import h5py
+            return isinstance(node.h5py_object, h5py.Dataset)
+        except Exception:
+            return False
+
+    def _on_accept(self) -> None:
+        nodes = list(self._tree.selectedH5Nodes())
+        if not nodes or not self._is_dataset(nodes[0]):
+            return
+        node = nodes[0]
+        try:
+            ds_path = node.h5py_object.name
+            file_name = Path(node.h5py_object.file.filename).name
+            data = node.h5py_object[()]
+        except Exception as exc:
+            self._result = (str(node.local_name or "value"),
+                            f"<read error: {exc}>", "")
+            self.accept()
+            return
+        # Coerce to a single string value. Prefer the scalar form if the
+        # dataset is 0D; otherwise show the first element with a hint.
+        value = self._coerce_scalar(data)
+        suggested_key = ds_path.rsplit("/", 1)[-1] or "value"
+        source = f"{file_name}:{ds_path}"
+        self._result = (suggested_key, value, source)
+        self.accept()
+
+    @staticmethod
+    def _coerce_scalar(data) -> str:
+        try:
+            import numpy as np
+        except ImportError:
+            return repr(data)
+        arr = np.asarray(data)
+        if arr.ndim == 0:
+            v = arr[()]
+        elif arr.size == 1:
+            v = arr.flat[0]
+        else:
+            v = arr.flat[0]
+        if isinstance(v, bytes):
+            v = v.decode("utf-8", errors="replace")
+        if arr.size > 1:
+            return f"{v} (first of {arr.size}; full array not stored)"
+        return str(v)
+
+    @classmethod
+    def pick(
+        cls, parent: QWidget | None, files: list[Path]
+    ) -> tuple[str, str, str] | None:
+        dlg = cls(parent, files)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            return dlg._result
+        return None
+
+
+def _build_pol_params(panel: ConversionPanel, *, gid: bool) -> QWidget:
+    """Sub-form shared by ``det2pol`` and ``det2pol_gid``: dang, dq,
+    radial_range, angular_range. The two variants share the same
+    parameter set; ``gid`` only affects the suffix label.
+    """
+    w = QWidget()
+    form = _make_form(w)
+    form.setContentsMargins(0, 0, 0, 0)
+    suffix = "_gid" if gid else ""
+    dang_attr = f"dang_pol{suffix}"
+    dq_attr = f"dq_pol{suffix}"
+    rad_min_attr = f"radial_min{suffix}"
+    rad_max_attr = f"radial_max{suffix}"
+    ang_min_attr = f"angular_min{suffix}"
+    ang_max_attr = f"angular_max{suffix}"
+    setattr(panel, dang_attr, _opt_spin(decimals=3, max_v=180.0, suffix=" °"))
+    setattr(panel, dq_attr, _opt_spin(decimals=4, max_v=10.0, suffix=" Å⁻¹"))
+    setattr(panel, rad_min_attr, _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹"))
+    setattr(panel, rad_max_attr, _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹"))
+    setattr(panel, ang_min_attr, _opt_spin(decimals=2, max_v=360.0, suffix=" °"))
+    setattr(panel, ang_max_attr, _opt_spin(decimals=2, max_v=360.0, suffix=" °"))
+    form.addRow("dang:", getattr(panel, dang_attr))
+    form.addRow("dq:", getattr(panel, dq_attr))
+    form.addRow("radial min:", getattr(panel, rad_min_attr))
+    form.addRow("radial max:", getattr(panel, rad_max_attr))
+    form.addRow("angular min:", getattr(panel, ang_min_attr))
+    form.addRow("angular max:", getattr(panel, ang_max_attr))
+    return w

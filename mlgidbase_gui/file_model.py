@@ -129,6 +129,87 @@ def load_entry(file_path: Path, entry: str) -> EntryStack:
     return EntryStack(image_stack=img, q_xy=q_xy, q_z=q_z)
 
 
+# Raw-detector dataset enumeration & loading. These are used only by the
+# Conversion (raw-mode) workflow — no overlap with the converted-NeXus
+# readers above.
+
+# Minimum H/W in pixels for a dataset to count as a detector image.
+# Filters out coordinate axes (1D), small lookup tables, and per-frame
+# scalar arrays that h5py would otherwise misclassify as 3D.
+RAW_MIN_DETECTOR_HW = 32
+
+
+@dataclass
+class RawEntry:
+    """One candidate raw-detector dataset within an HDF5 file.
+
+    ``dataset_path`` is the absolute path inside the HDF5 file (without
+    the leading slash) — pygid's ``DataLoader`` accepts this form
+    directly as its ``dataset`` kwarg.
+    """
+
+    file_path: Path
+    dataset_path: str
+    shape: tuple[int, int, int]
+    dtype: str
+
+    @property
+    def label(self) -> str:
+        """Human-readable identifier for the entry combo / log lines."""
+        return f"{self.file_path.name}::{self.dataset_path}"
+
+
+def list_raw_entries(file_path: Path) -> list[RawEntry]:
+    """Walk a raw HDF5 file and return every 3D detector-image candidate.
+
+    A dataset qualifies when it is 3D ``(N, H, W)`` with both spatial
+    dimensions ≥ ``RAW_MIN_DETECTOR_HW`` and a numeric dtype. The walker
+    recurses through every group so unusual beamline layouts work too.
+    Datasets are sorted by path for stable UI ordering.
+
+    Reads only metadata (shape + dtype) — pixel data is not loaded
+    until ``load_raw_dataset`` is called for a specific entry.
+    """
+    out: list[RawEntry] = []
+    with h5py.File(file_path, "r") as f:
+        def visit(_name, obj):
+            if not isinstance(obj, h5py.Dataset):
+                return
+            if obj.ndim != 3:
+                return
+            n, h, w = obj.shape
+            if h < RAW_MIN_DETECTOR_HW or w < RAW_MIN_DETECTOR_HW:
+                return
+            if obj.dtype.kind not in ("i", "u", "f"):
+                return
+            out.append(
+                RawEntry(
+                    file_path=file_path,
+                    dataset_path=obj.name.lstrip("/"),
+                    shape=(int(n), int(h), int(w)),
+                    dtype=str(obj.dtype),
+                )
+            )
+        f.visititems(visit)
+    out.sort(key=lambda e: e.dataset_path)
+    return out
+
+
+def load_raw_dataset(entry: RawEntry) -> np.ndarray:
+    """Read the full 3D pixel data for one ``RawEntry``.
+
+    Returns a contiguous float32 array; integer detector data is
+    upcast so pyqtgraph's intensity scaling and the same percentile-
+    based level helpers used for converted data work uniformly.
+    """
+    with h5py.File(entry.file_path, "r") as f:
+        ds = f[entry.dataset_path]
+        arr = np.asarray(ds[()])
+    if arr.dtype.kind in ("i", "u"):
+        arr = arr.astype(np.float32, copy=False)
+    return np.ascontiguousarray(arr)
+
+
 def load_peaks(
     file_path: Path, entry: str, frame: int
 ) -> dict[PeakKind, PeakTable | None]:

@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -25,12 +24,11 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QToolButton,
     QVBoxLayout,
@@ -48,6 +46,20 @@ ENTRY_ALL = "All entries"
 
 FRAME_ACTIVE = "Active frame"
 FRAME_ALL = "All frames"
+
+
+def _make_form(parent: QWidget | None = None) -> QFormLayout:
+    """Build a QFormLayout configured to wrap long rows.
+
+    ``WrapLongRows`` keeps labels next to their fields when there's
+    horizontal space and stacks the label above the field when the
+    panel is narrow. This stops form rows from forcing the panel
+    wider than the dock and is what makes the parent QScrollArea's
+    ``ScrollBarAlwaysOff`` horizontal policy work in practice.
+    """
+    form = QFormLayout(parent) if parent is not None else QFormLayout()
+    form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+    return form
 
 
 class _CollapsibleSection(QWidget):
@@ -127,6 +139,11 @@ class PipelinePanel(QWidget):
     # thread to do the actual parsing (slow for raw CIFs) and posts the
     # result back via ``set_cif_pattern``.
     parseCifsRequested = Signal(str)
+    # Log routing: panels emit messages and the host forwards them to a
+    # shared Logs dock. Keeping ``append_log`` / ``clear_log`` as the
+    # public surface so existing call sites don't change.
+    logMessage = Signal(str)
+    logCleared = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -157,30 +174,49 @@ class PipelinePanel(QWidget):
         self._get_active_frame = fn
 
     def append_log(self, msg: str) -> None:
-        if hasattr(self, "log_view"):
-            self.log_view.appendPlainText(msg)
+        """Forward ``msg`` to the shared Logs dock via ``logMessage``."""
+        self.logMessage.emit(msg)
 
     def clear_log(self) -> None:
-        if hasattr(self, "log_view"):
-            self.log_view.clear()
+        """Ask the shared Logs dock to wipe its contents."""
+        self.logCleared.emit()
 
     def set_running(self, running: bool) -> None:
         if not self._available:
             return
         self.btn_detect.setEnabled(not running)
         self.btn_fit.setEnabled(not running)
-        # Match button additionally requires a CIF path:
+        # Match button additionally requires either a CIF or pickle path:
         if running:
             self.btn_match.setEnabled(False)
         else:
-            self.btn_match.setEnabled(bool(self.cif_path.text().strip()))
+            self._update_match_enabled()
 
     # -- UI construction --
 
     def _build_ui(self) -> None:
+        # Outer layout hosts only the scroll area — content widget owns
+        # all the actual section margins so scrollbars sit flush against
+        # the dock edge.
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(8, 8, 8, 8)
-        outer.setSpacing(4)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        # Vertical scroll fires only when content overflows; horizontal
+        # is hard-locked off so a narrow dock collapses form rows
+        # (labels wrap above fields, see ``_make_form``) instead of
+        # introducing an x-axis scrollbar.
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        outer.addWidget(scroll)
+
+        content = QWidget()
+        inner = QVBoxLayout(content)
+        inner.setContentsMargins(8, 8, 8, 8)
+        inner.setSpacing(4)
 
         if not self._available:
             hint = QLabel(
@@ -189,49 +225,31 @@ class PipelinePanel(QWidget):
                 "<pre>  pip install mlgidbase</pre>"
             )
             hint.setWordWrap(True)
-            outer.addWidget(hint)
-            outer.addStretch(1)
+            inner.addWidget(hint)
+            inner.addStretch(1)
+            scroll.setWidget(content)
             return
 
-        # Accordion: only one section open at a time. Detection starts open.
+        # Sections are independent now: any combination of them can be
+        # open at once. Detection starts open so the user has something
+        # actionable on first sight.
         self._sections: list[_CollapsibleSection] = [
             self._build_detection_section(),
             self._build_fitting_section(),
             self._build_matching_section(),
         ]
         for s in self._sections:
-            outer.addWidget(s)
-            s.expandedChanged.connect(
-                lambda opened, src=s: self._on_section_toggled(src, opened)
-            )
+            inner.addWidget(s)
 
-        # Logs — kept as a regular GroupBox so the textarea always shows.
-        log_box = QGroupBox("Logs")
-        log_layout = QVBoxLayout(log_box)
-        self.log_view = QPlainTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setFont(QFont("monospace"))
-        self.log_view.setMaximumBlockCount(2000)
-        log_layout.addWidget(self.log_view)
-        outer.addWidget(log_box, 1)
-
-    def _on_section_toggled(
-        self, source: "_CollapsibleSection", opened: bool
-    ) -> None:
-        """Accordion: opening a section collapses every other one.
-
-        Closing a section is left alone — the user can have all three closed
-        at once if they want the panel out of the way entirely.
-        """
-        if not opened:
-            return
-        for s in self._sections:
-            if s is not source and s.is_expanded():
-                s.set_expanded(False)
+        # Logs live in their own dock now (see MainWindow._logs_dock); the
+        # trailing stretch keeps the sections at the top of the scroll
+        # area when they don't fill the visible height.
+        inner.addStretch(1)
+        scroll.setWidget(content)
 
     def _build_detection_section(self) -> QWidget:
         section = _CollapsibleSection("Detection", expanded=True)
-        form = QFormLayout()
+        form = _make_form()
         form.setContentsMargins(0, 0, 0, 0)
         form.setSpacing(4)
 
@@ -283,7 +301,7 @@ class PipelinePanel(QWidget):
 
     def _build_fitting_section(self) -> QWidget:
         section = _CollapsibleSection("Fitting", expanded=False)
-        form = QFormLayout()
+        form = _make_form()
         form.setContentsMargins(0, 0, 0, 0)
         form.setSpacing(4)
 
@@ -361,7 +379,7 @@ class PipelinePanel(QWidget):
 
     def _build_matching_section(self) -> QWidget:
         section = _CollapsibleSection("Matching", expanded=False)
-        form = QFormLayout()
+        form = _make_form()
         form.setContentsMargins(0, 0, 0, 0)
         form.setSpacing(4)
 
@@ -374,14 +392,15 @@ class PipelinePanel(QWidget):
         form.addRow("Frames:", self.match_frame_scope)
 
         self.cif_path = QLineEdit()
-        self.cif_path.setPlaceholderText("Pickle, .cif file(s), or folder…")
+        self.cif_path.setPlaceholderText("Raw .cif file(s) or folder…")
         self.cif_path.setToolTip(
-            "Forwarded as ``cif_prepr`` to mlgidBASE.run_matching. Accepts:\n"
-            "  • a preprocessed CIF pickle (.pickle / .pkl)\n"
+            "Raw CIF input forwarded as ``cif_prepr`` to "
+            "mlgidBASE.run_matching. Accepts:\n"
             "  • one or more raw .cif files (semicolon-separated)\n"
             "  • a folder containing .cif files\n\n"
-            "For raw input, ExpParameters are auto-derived from the active "
-            "NeXus file's instrument metadata."
+            "ExpParameters are auto-derived from the active NeXus file's "
+            "instrument metadata.\n"
+            "For preprocessed pickle input, use the Pickle input below."
         )
         cif_browse = QPushButton("Browse…")
         cif_browse.clicked.connect(self._browse_cif)
@@ -406,7 +425,9 @@ class PipelinePanel(QWidget):
         self.btn_parse_cifs.setToolTip(
             "Pre-load the CIF input into a CifPattern that subsequent "
             "matching runs reuse. Without this, every Run Matching "
-            "re-parses the CIFs from scratch."
+            "re-parses the CIFs from scratch.\n\n"
+            "Applies only to the CIF input above; pickles are forwarded "
+            "directly without preprocessing."
         )
         self.btn_parse_cifs.clicked.connect(self._on_parse_cifs)
         self.btn_parse_cifs.setEnabled(False)
@@ -420,6 +441,31 @@ class PipelinePanel(QWidget):
         form.addRow("", cif_parse_row)
         # Any edit invalidates the cache and re-enables the button.
         self.cif_path.textChanged.connect(self._on_cif_input_changed)
+
+        # Separate pickle input — preprocessed CifPattern files skip the
+        # raw-CIF preprocessing step entirely; mlgidBASE.run_matching
+        # accepts a path-to-pickle string verbatim. Pickle path takes
+        # priority over the CIF input above when both are set.
+        self.pickle_path = QLineEdit()
+        self.pickle_path.setPlaceholderText(
+            "Preprocessed CIF pickle (.pickle / .pkl)…"
+        )
+        self.pickle_path.setToolTip(
+            "Path to a preprocessed CifPattern pickle. Forwarded as "
+            "``cif_prepr`` to mlgidBASE.run_matching when set; takes "
+            "priority over the CIF input above."
+        )
+        pickle_browse = QPushButton("Browse…")
+        pickle_browse.clicked.connect(self._browse_pickle)
+        pickle_clear = QPushButton("Clear")
+        pickle_clear.clicked.connect(lambda: self.pickle_path.setText(""))
+        pickle_row = QWidget()
+        pickle_h = QHBoxLayout(pickle_row)
+        pickle_h.setContentsMargins(0, 0, 0, 0)
+        pickle_h.addWidget(self.pickle_path, 1)
+        pickle_h.addWidget(pickle_browse)
+        pickle_h.addWidget(pickle_clear)
+        form.addRow("Pickle input:", pickle_row)
 
         self.peaks_type = QComboBox()
         self.peaks_type.addItems(["segments", "rings"])
@@ -457,13 +503,19 @@ class PipelinePanel(QWidget):
         self.btn_match = QPushButton("Run matching")
         self.btn_match.setEnabled(False)
         self.btn_match.clicked.connect(self._on_run_matching)
-        # Gate run button on a CIF path being set — matching can't proceed
-        # without it.
-        self.cif_path.textChanged.connect(
-            lambda t: self.btn_match.setEnabled(bool(t.strip()))
-        )
+        # Gate run button on either input being set — matching can't
+        # proceed without a CIF or pickle source.
+        self.cif_path.textChanged.connect(self._update_match_enabled)
+        self.pickle_path.textChanged.connect(self._update_match_enabled)
         section.body_layout.addWidget(self.btn_match)
         return section
+
+    def _update_match_enabled(self) -> None:
+        has_input = (
+            bool(self.cif_path.text().strip())
+            or bool(self.pickle_path.text().strip())
+        )
+        self.btn_match.setEnabled(has_input)
 
     # -- Click handlers --
 
@@ -493,15 +545,19 @@ class PipelinePanel(QWidget):
         self.runRequested.emit(PipelineCommand("run_fitting", kwargs))
 
     def _on_run_matching(self) -> None:
+        pkl = self.pickle_path.text().strip()
         cif = self.cif_path.text().strip()
-        if not cif:
+        if not pkl and not cif:
             return
-        # Forward the cached CifPattern when the user has already parsed
-        # it (and the input hasn't changed since); otherwise pass the
-        # path string and let the worker translate it. Cached or not,
-        # mlgidBASE.run_matching accepts both forms.
-        if self._cached_cif_obj is not None and self._cached_cif_input == cif:
-            cif_value: object = self._cached_cif_obj
+        # Pickle path takes priority. mlgidBASE.run_matching's
+        # ``load_cif_prepr`` accepts a path-to-pickle string verbatim, so
+        # we forward it untouched. Otherwise reuse the cached CifPattern
+        # when the user pre-parsed the input, else pass the string and
+        # let the worker translate raw .cif paths.
+        if pkl:
+            cif_value: object = pkl
+        elif self._cached_cif_obj is not None and self._cached_cif_input == cif:
+            cif_value = self._cached_cif_obj
         else:
             cif_value = cif
         kwargs: dict = {
@@ -669,18 +725,17 @@ class PipelinePanel(QWidget):
             self.det_config_path.setText(path)
 
     def _browse_cif(self) -> None:
-        """Pick one .pickle or one-or-more .cif files.
+        """Pick one-or-more raw .cif files.
 
-        Multi-select (.cif) joins paths with ``;``; ``pipeline.execute``
-        splits this back out and wraps the CIFs in a CifPattern at run
-        time. A single .pickle file is forwarded to mlgidBASE unchanged.
+        Multi-select joins paths with ``;``; ``pipeline.execute`` splits
+        this back out and wraps the CIFs in a CifPattern at run time.
+        Pickle input has its own dedicated picker — see ``_browse_pickle``.
         """
         paths, _ = QFileDialog.getOpenFileNames(
             self,
-            "Select CIF input",
+            "Select CIF file(s)",
             "",
-            "All supported (*.cif *.pickle *.pkl)"
-            ";;CIF files (*.cif);;Pickle (*.pickle *.pkl);;All files (*)",
+            "CIF files (*.cif);;All files (*)",
         )
         if not paths:
             return
@@ -693,3 +748,14 @@ class PipelinePanel(QWidget):
         )
         if directory:
             self.cif_path.setText(directory)
+
+    def _browse_pickle(self) -> None:
+        """Pick a single preprocessed CifPattern pickle file."""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select preprocessed CIF pickle",
+            "",
+            "Pickle (*.pickle *.pkl);;All files (*)",
+        )
+        if path:
+            self.pickle_path.setText(path)

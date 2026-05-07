@@ -29,6 +29,10 @@ from mlgidbase_gui.polar import stack_to_polar
 OVERLAY_KINDS = ("detected", "fitted", "manual")
 MODE_CARTESIAN = "cartesian"
 MODE_POLAR = "polar"
+# Raw detector data preview — pixel coordinates, no overlays. Reached only
+# when a RawSession is active; converted-NeXus sessions never visit this
+# mode and their existing Cartesian / Polar paths are unchanged.
+MODE_RAW = "raw"
 
 LABEL_MODIFIERS = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier
 
@@ -37,10 +41,14 @@ LABEL_MODIFIERS = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltM
 ANGULAR_SUBDIV_FULL = 90
 ANGULAR_SUBDIV_MIN = 4
 
-# The polar grid used by the viewer spans this angle range. A peak whose
-# angle_width is infinite, NaN, or exceeds the range is clipped to it.
-ANGLE_MIN_DEG = 0.0
-ANGLE_MAX_DEG = 90.0
+# Outer bounds for clipping a peak's angular extent before drawing it as
+# a polygon. Set to atan2's full range so peaks produced by converted
+# images that span multiple quadrants (e.g. ``vert_positive=False`` →
+# angles in [0°, 180°]) still draw correctly. Peaks whose angle / width
+# are non-finite are treated as "ring" — their polygon spans the full
+# range below.
+ANGLE_MIN_DEG = -180.0
+ANGLE_MAX_DEG = 180.0
 
 # Visual style for each overlay kind. Dashed for "raw" detection output,
 # solid for the refined fit, dotted yellow for user-drawn manual labels.
@@ -538,6 +546,21 @@ class GIWAXSImageViewer(QWidget):
         self._cmap_combo.currentTextChanged.connect(self._on_cmap_changed)
         bar.addWidget(self._cmap_combo)
         bar.addSpacing(16)
+        # Log/linear contrast toggle. When checked, the displayed image
+        # is log10(clip(data, floor, inf)) and the histogram levels are
+        # recomputed on the transformed array so the LUT stays sensible.
+        # Coordinates and overlays are unaffected — only the intensity
+        # mapping changes.
+        self._log_check = QCheckBox("Log scale")
+        self._log_check.setChecked(False)
+        self._log_check.setToolTip(
+            "Display log10(intensity) instead of linear intensity. "
+            "Useful for GIWAXS data with wide dynamic range; coordinate "
+            "axes and overlays are unchanged."
+        )
+        self._log_check.toggled.connect(self._on_log_toggled)
+        bar.addWidget(self._log_check)
+        bar.addSpacing(16)
         # Optional bottom timeline strip. The Display-dock slider is the
         # primary frame control; this toggle re-exposes pyqtgraph's
         # built-in timeline (with frame ticks + draggable line) for
@@ -631,7 +654,12 @@ class GIWAXSImageViewer(QWidget):
         self._matched_items: list[tuple[str, _PeakShapeItem]] = []
 
         self._mode = MODE_POLAR
+        self._log_scale: bool = False
         self._stack: EntryStack | None = None
+        # Raw-mode preview state. Held separately from ``_stack`` because raw
+        # detector frames have no q-axes — they're rendered in pixel
+        # coordinates and carry no overlays.
+        self._raw_image_stack: np.ndarray | None = None
         self._polar_cache: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
         self._next_manual_id = -1  # negative IDs distinguish manual from detected
         self._selected: SelectedPeak | None = None
@@ -692,6 +720,19 @@ class GIWAXSImageViewer(QWidget):
             saved_frame = self.current_frame
 
         self._stack = stack
+        # ``_raw_image_stack`` belongs to a prior RawSession; clearing it
+        # here ensures _render_active_mode never tries to re-render raw
+        # pixel data over a NeXus stack.
+        self._raw_image_stack = None
+        # If the previous session was raw, the mode flag is still
+        # ``MODE_RAW`` even though raw rendering ignored the radios.
+        # Snap back to whichever Cartesian / Polar radio is checked
+        # (Polar is the default at startup) so ``_render_active_mode``
+        # takes the converted-data branch.
+        if self._mode == MODE_RAW:
+            self._mode = (
+                MODE_CARTESIAN if self._radio_cart.isChecked() else MODE_POLAR
+            )
         self._polar_cache = None
         self._frame_peaks.clear()
         self._render_active_mode()
@@ -708,6 +749,46 @@ class GIWAXSImageViewer(QWidget):
                 self._view.setCurrentIndex(int(saved_frame))
             except Exception:
                 pass
+
+    def set_mode_radios_visible(self, visible: bool) -> None:
+        """Show / hide the Cartesian / Polar radios in the top toolbar.
+
+        Used by the host to remove mode controls when a raw session is
+        active — raw frames don't carry q-axes, so the toggles would be
+        nonsensical. The toolbar's "Colormap" + "Timeline" widgets stay
+        visible because they apply equally to raw and converted data.
+        """
+        # Find the leading "View:" label by walking up from the radio's
+        # parent layout — the label was added directly before the radios.
+        for w in (self._radio_cart, self._radio_polar):
+            w.setVisible(visible)
+        # Hide the "View:" prefix label too. It lives in the same toolbar
+        # row built by __init__; locate it by text rather than caching a
+        # reference at construction time so existing layout code stays put.
+        for label in self.findChildren(QLabel):
+            if label.text() == "View:":
+                label.setVisible(visible)
+                break
+
+    def show_raw_stack(self, arr_3d: np.ndarray) -> None:
+        """Render a raw detector stack in pixel coordinates.
+
+        Used only for raw-mode (pre-conversion) preview. Wipes any prior
+        NeXus-mode state — overlays, peaks, undo history — because none
+        of it applies to a raw detector frame. The viewer's frame slider
+        and timeline still drive frame navigation across the stack.
+        """
+        if arr_3d.ndim != 3:
+            raise ValueError(
+                f"show_raw_stack expects a 3D (N, H, W) array, got shape {arr_3d.shape}"
+            )
+        # Drop NeXus-mode state (peaks / matched / undo / cached polar).
+        # ``clear()`` already covers everything except the raw-stack field
+        # itself.
+        self.clear()
+        self._mode = MODE_RAW
+        self._raw_image_stack = np.ascontiguousarray(arr_3d)
+        self._render_active_mode()
 
     def reset_zoom(self) -> None:
         """Auto-fit the viewbox to the current image."""
@@ -857,6 +938,7 @@ class GIWAXSImageViewer(QWidget):
         self._roi_drag_before = None
         self._sync_roi()
         self._stack = None
+        self._raw_image_stack = None
         self._polar_cache = None
         if had_selection:
             self.selectionChanged.emit(None)
@@ -1022,6 +1104,8 @@ class GIWAXSImageViewer(QWidget):
     @property
     def n_frames(self) -> int:
         """Number of frames in the active stack (0 if no stack loaded)."""
+        if self._mode == MODE_RAW and self._raw_image_stack is not None:
+            return int(self._raw_image_stack.shape[0])
         return 0 if self._stack is None else int(self._stack.n_frames)
 
     def set_frame(self, frame: int) -> None:
@@ -1197,6 +1281,12 @@ class GIWAXSImageViewer(QWidget):
     # -- Rendering --
 
     def _render_active_mode(self) -> None:
+        if self._mode == MODE_RAW:
+            if self._raw_image_stack is None:
+                return
+            self._apply_params(self._build_raw_params())
+            # No overlays in raw mode — nothing to render past _apply_params.
+            return
         if self._stack is None:
             return
         if self._mode == MODE_POLAR:
@@ -1205,6 +1295,25 @@ class GIWAXSImageViewer(QWidget):
             params = self._build_cartesian_params()
         self._apply_params(params)
         self._render_overlays(self.current_frame)
+
+    def _build_raw_params(self) -> _DisplayParams:
+        """Pixel-coordinate display params for a raw detector stack.
+
+        File order is (frames, H, W); pyqtgraph wants (t, x, y) so we
+        transpose to (frames, W, H). Axes are labeled in pixels — q
+        coordinates aren't meaningful before conversion.
+        """
+        assert self._raw_image_stack is not None
+        img_pg = np.transpose(self._raw_image_stack, (0, 2, 1))
+        levels = _robust_levels(self._raw_image_stack[0])
+        return _DisplayParams(
+            image_pg=img_pg,
+            pos=(0.0, 0.0),
+            scale=(1.0, 1.0),
+            levels=levels,
+            x_label=("x", "px"),
+            y_label=("y", "px"),
+        )
 
     def _build_cartesian_params(self) -> _DisplayParams:
         assert self._stack is not None
@@ -1257,11 +1366,12 @@ class GIWAXSImageViewer(QWidget):
     def _apply_params(self, p: _DisplayParams) -> None:
         self._plot.setLabel("bottom", p.x_label[0], units=p.x_label[1])
         self._plot.setLabel("left", p.y_label[0], units=p.y_label[1])
+        image, levels = self._maybe_apply_log(p.image_pg, p.levels)
         self._view.setImage(
-            p.image_pg,
+            image,
             autoRange=True,
             autoLevels=False,
-            levels=p.levels,
+            levels=levels,
             pos=p.pos,
             scale=p.scale,
         )
@@ -1271,6 +1381,55 @@ class GIWAXSImageViewer(QWidget):
         # toggle state so the user's choice persists across stack
         # reloads.
         self._set_timeline_visible(self._timeline_check.isChecked())
+
+    def _maybe_apply_log(
+        self, image: np.ndarray, levels: tuple[float, float]
+    ) -> tuple[np.ndarray, tuple[float, float]]:
+        """If log-scale is on, return (log10(clip(image, floor)), levels')
+        with levels recomputed on the transformed first frame.
+
+        Floor is the 1st percentile of strictly-positive finite values
+        (or 1e-6 fallback) so the log transform is well-defined for
+        zero / negative pixels (background, masked regions). The
+        original ``image`` array is not modified.
+        """
+        if not self._log_scale:
+            return image, levels
+        finite = image[np.isfinite(image)]
+        pos = finite[finite > 0]
+        if pos.size > 0:
+            floor = float(np.percentile(pos, 1.0))
+        else:
+            floor = 1e-6
+        if floor <= 0:
+            floor = 1e-6
+        transformed = np.log10(np.clip(image, floor, None))
+        ref = transformed[0] if transformed.ndim == 3 else transformed
+        return transformed, _robust_levels(ref)
+
+    def _on_log_toggled(self, checked: bool) -> None:
+        """Re-render in the active mode with log/linear contrast.
+
+        Saves and restores the viewbox range so toggling contrast
+        doesn't reset the user's zoom or pan. Frame index is preserved
+        too — pyqtgraph's setImage keeps the time-axis position when
+        the stack shape is unchanged.
+        """
+        self._log_scale = bool(checked)
+        saved: tuple[tuple[float, float], tuple[float, float]] | None = None
+        try:
+            xr, yr = self._plot.getViewBox().viewRange()
+            saved = ((float(xr[0]), float(xr[1])), (float(yr[0]), float(yr[1])))
+        except Exception:
+            saved = None
+        self._render_active_mode()
+        if saved is not None:
+            try:
+                self._plot.getViewBox().setRange(
+                    xRange=saved[0], yRange=saved[1], padding=0
+                )
+            except Exception:
+                pass
 
     def _set_timeline_visible(self, visible: bool) -> None:
         """Show / hide pyqtgraph's bottom timeline strip.
@@ -1298,6 +1457,11 @@ class GIWAXSImageViewer(QWidget):
         self.matchedStructuresChanged.emit(idx, self.matched_structures(idx))
 
     def _render_overlays(self, frame: int) -> None:
+        # Raw mode has no peak data to draw — return before touching any
+        # overlay path. The four _PeakShapeItems were already cleared by
+        # show_raw_stack via clear(), so they have no leftover geometry.
+        if self._mode == MODE_RAW:
+            return
         peaks = self._frame_peaks.get(frame, {})
         det = peaks.get("detected")
         fit = peaks.get("fitted")
@@ -1425,6 +1589,12 @@ class GIWAXSImageViewer(QWidget):
     # -- Internals --
 
     def _on_radio_toggled(self) -> None:
+        # The Cartesian / Polar radios are meaningless in RAW mode (raw
+        # frames carry no q-axes), so swallow the toggle. Step 7 hides
+        # the radios entirely in raw sessions; this guard is the
+        # belt-and-braces backup if the radios are still reachable.
+        if self._mode == MODE_RAW:
+            return
         new = MODE_CARTESIAN if self._radio_cart.isChecked() else MODE_POLAR
         if new != self._mode:
             self.set_mode(new)
