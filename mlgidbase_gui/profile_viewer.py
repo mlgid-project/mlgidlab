@@ -414,6 +414,9 @@ class ProfileViewer(QWidget):
         self._selected.manual_ref.radius = new_r
         # Angular profile slices over the radial range — needs refresh.
         self._recompute_curves()
+        # Keep the dragged region inside the visible plot area so the
+        # user can always see what they're editing.
+        self._ensure_region_in_view(self._radial_plot, self._radial_region)
         self.peakGeometryChanged.emit(self._selected.manual_ref)
 
     def _on_angular_changed(self) -> None:
@@ -432,7 +435,34 @@ class ProfileViewer(QWidget):
         self._selected.manual_ref.angle = new_a
         # Radial profile slices over the angular range — needs refresh.
         self._recompute_curves()
+        self._ensure_region_in_view(self._angular_plot, self._angular_region)
         self.peakGeometryChanged.emit(self._selected.manual_ref)
+
+    def _ensure_region_in_view(
+        self, plot: pg.PlotWidget, region_item: pg.LinearRegionItem,
+    ) -> None:
+        """Expand the plot's X range so the selection region is fully
+        visible with a small padding. Never shrinks the existing view —
+        if the user has zoomed out, that stays. Only widens when the
+        region's edges have moved outside the current viewport (e.g.
+        the user dragged an edge past the plot boundary while editing
+        a manual peak).
+        """
+        lo, hi = region_item.getRegion()
+        lo, hi = float(lo), float(hi)
+        if not (np.isfinite(lo) and np.isfinite(hi)):
+            return
+        span = max(abs(hi - lo), 1e-9)
+        # Pad keeps the region edges off the plot boundary so the
+        # user can still grab them.
+        pad = 0.5 * span
+        target_lo, target_hi = lo - pad, hi + pad
+        vb = plot.getViewBox()
+        cur_lo, cur_hi = vb.viewRange()[0]
+        new_lo = min(float(cur_lo), target_lo)
+        new_hi = max(float(cur_hi), target_hi)
+        if new_lo < cur_lo or new_hi > cur_hi:
+            plot.setXRange(new_lo, new_hi, padding=0)
 
 
 def _radial_fit_range(peak: SelectedPeak) -> tuple[float, float] | None:

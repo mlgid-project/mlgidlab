@@ -5,16 +5,51 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 
-from mlgidbase_gui.conversion import CONVERSION_LOGGERS
 from mlgidbase_gui.conversion import execute as conversion_execute
 from mlgidbase_gui.conversion_panel import ConversionConfig, RawScan
 from mlgidbase_gui.pipeline import (
-    PIPELINE_LOGGERS,
     PipelineCommand,
     execute,
     parse_cif_input,
 )
 from mlgidbase_gui.session import Session
+
+
+def _trigger_pipeline_imports() -> None:
+    """Force ``mlgidbase`` (and its transitive ``pygid`` import) to load.
+
+    Several ``pygid`` submodules (``coordmaps``, ``datasaver``,
+    ``conversion``, ``dataloader``) call ``logging.basicConfig`` at
+    module top — which first **removes every handler already attached
+    to the root logger** before installing their own ``StreamHandler``.
+    If we attached our ``_SignalLogHandler`` and *then* triggered the
+    lazy import, our handler would be ripped out before the first log
+    line ever reaches it. Calling this helper before installing our
+    handler means pygid's destructive `removeHandler` sequence has
+    already run; module bodies don't re-execute on subsequent imports
+    so our handler stays attached for the rest of the worker's run.
+
+    Failures are swallowed: a missing ``mlgidbase`` install just means
+    the worker will surface the actual ``ImportError`` from
+    ``execute`` later, with the proper exception channel.
+    """
+    try:
+        import mlgidbase  # noqa: F401
+    except Exception:
+        pass
+
+
+def _trigger_conversion_imports() -> None:
+    """Same idea as ``_trigger_pipeline_imports`` for raw conversion.
+
+    ``conversion.execute`` lazily imports ``pygid``; make that happen
+    before the worker attaches its log handler so pygid's basicConfig
+    side effect doesn't strip our sink.
+    """
+    try:
+        import pygid  # noqa: F401
+    except Exception:
+        pass
 
 
 class CifParseWorker(QObject):
@@ -30,14 +65,22 @@ class CifParseWorker(QObject):
 
     finished = Signal(object, object)
 
-    def __init__(self, cif_input: str, nexus_file: Path) -> None:
+    def __init__(
+        self,
+        cif_input: str,
+        nexus_file: Path,
+        entry: str | None = None,
+    ) -> None:
         super().__init__()
         self._cif_input = cif_input
         self._nexus_file = nexus_file
+        self._entry = entry
 
     def run(self) -> None:
         try:
-            result = parse_cif_input(self._cif_input, self._nexus_file)
+            result = parse_cif_input(
+                self._cif_input, self._nexus_file, self._entry
+            )
             self.finished.emit(result, None)
         except Exception as exc:
             self.finished.emit(None, exc)
@@ -98,14 +141,23 @@ class ConversionWorker(QObject):
         self._cfg = cfg
 
     def run(self) -> None:
+        # Force pygid's import-time basicConfig side effect to run
+        # before we install our handler — see the helper docstring
+        # for the gory details.
+        _trigger_conversion_imports()
+
         handler = _SignalLogHandler(self.log)
-        handler.setFormatter(logging.Formatter("%(levelname)s - %(message)s"))
-        loggers = [logging.getLogger(name) for name in CONVERSION_LOGGERS]
-        prev_levels = [lg.level for lg in loggers]
-        for lg in loggers:
-            lg.addHandler(handler)
-            if lg.level == logging.NOTSET or lg.level > logging.INFO:
-                lg.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(name)s - %(levelname)s - %(message)s"))
+        # Attach to the root logger so propagated records from pygid
+        # (which logs through class-named loggers like ``CoordMaps``,
+        # ``DataLoader``, ``Datasaver``, plus the unnamed root logger)
+        # all reach our sink. Every pygid logger has the default
+        # ``propagate=True``.
+        root = logging.getLogger()
+        root.addHandler(handler)
+        prev_level = root.level
+        if root.level == logging.NOTSET or root.level > logging.INFO:
+            root.setLevel(logging.INFO)
 
         total = len(self._scans)
         try:
@@ -123,9 +175,8 @@ class ConversionWorker(QObject):
             self.log.emit(traceback.format_exc())
             self.finished.emit(None, exc)
         finally:
-            for lg, prev in zip(loggers, prev_levels):
-                lg.removeHandler(handler)
-                lg.setLevel(prev)
+            root.removeHandler(handler)
+            root.setLevel(prev_level)
 
 
 class PipelineWorker(QObject):
@@ -140,14 +191,26 @@ class PipelineWorker(QObject):
         self._command = command
 
     def run(self) -> None:
+        # Force pygid / mlgidbase import-time basicConfig side effects
+        # to run before we install our handler — see the helper
+        # docstring for why this ordering matters.
+        _trigger_pipeline_imports()
+
         handler = _SignalLogHandler(self.log)
-        handler.setFormatter(logging.Formatter("%(levelname)s - %(message)s"))
-        loggers = [logging.getLogger(name) for name in PIPELINE_LOGGERS]
-        prev_levels = [lg.level for lg in loggers]
-        for lg in loggers:
-            lg.addHandler(handler)
-            if lg.level == logging.NOTSET or lg.level > logging.INFO:
-                lg.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(name)s - %(levelname)s - %(message)s"))
+        # Attach to the root logger. Pipeline modules use a mix of
+        # class-named loggers (``mlgidBASE``, ``DataLoader``,
+        # ``CoordMaps``) and the unnamed root logger
+        # (``logging.getLogger()`` in mlgidbase.peak_operations,
+        # mlgidbase.nexus_operations, mlgidbase.mlgiddetect_functions,
+        # pygidfit.process_scans, …). Hooking every one of those by
+        # name is fragile; attaching to root catches them all via
+        # default propagation.
+        root = logging.getLogger()
+        root.addHandler(handler)
+        prev_level = root.level
+        if root.level == logging.NOTSET or root.level > logging.INFO:
+            root.setLevel(logging.INFO)
 
         try:
             result = execute(self._file_path, self._command)
@@ -163,6 +226,5 @@ class PipelineWorker(QObject):
             self.log.emit(traceback.format_exc())
             self.finished.emit(None, exc)
         finally:
-            for lg, prev in zip(loggers, prev_levels):
-                lg.removeHandler(handler)
-                lg.setLevel(prev)
+            root.removeHandler(handler)
+            root.setLevel(prev_level)

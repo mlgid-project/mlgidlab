@@ -14,8 +14,10 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QFrame,
     QPlainTextEdit,
     QProgressDialog,
+    QScrollArea,
     QSlider,
     QTabWidget,
     QVBoxLayout,
@@ -27,12 +29,12 @@ from silx.gui.hdf5 import Hdf5TreeView
 from mlgidbase_gui import file_model
 from mlgidbase_gui.image_viewer import (
     GIWAXSImageViewer,
-    MATCHED_PALETTE,
     MATCHED_STYLE,
     ManualPeak,
     OVERLAY_KINDS,
     OVERLAY_STYLE,
     SelectedPeak,
+    matched_pen_for,
 )
 from mlgidbase_gui.parameter_panel import ParameterPanel
 from mlgidbase_gui.pipeline import (
@@ -71,8 +73,9 @@ def _make_pen_swatch(style: dict, width: int = 26, height: int = 12) -> QPixmap:
 
 
 def _make_color_swatch(color: str, width: int = 26, height: int = 12) -> QPixmap:
-    """Solid-line swatch in the given color — used for matched-structure rows
-    where the line style is fixed and only the color distinguishes structures.
+    """Solid-line swatch in the given color — used for the matched-peaks
+    master row where only the colour matters and there is no per-row
+    line style to mirror.
     """
     return _make_pen_swatch(
         {"color": color, "style": MATCHED_STYLE["style"]}, width, height
@@ -526,8 +529,24 @@ class MainWindow(QMainWindow):
 
         layout.addStretch(1)
 
+        # Wrap the dock content in a QScrollArea so files with many
+        # matched structures (one row per (CIF, hkl) match) don't push
+        # the parameter panel and shortcut hint off the bottom of the
+        # screen. Vertical scrolling kicks in on demand; horizontal is
+        # locked off so narrow docks wrap their form rows instead of
+        # introducing an x-axis scrollbar.
+        display_scroll = QScrollArea(self)
+        display_scroll.setWidgetResizable(True)
+        display_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        display_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        display_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        display_scroll.setWidget(panel)
         self._display_dock = QDockWidget("Display", self)
-        self._display_dock.setWidget(panel)
+        self._display_dock.setWidget(display_scroll)
         self._display_dock.setObjectName("DisplayDock")
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._display_dock)
 
@@ -1448,8 +1467,14 @@ class MainWindow(QMainWindow):
             )
             return
         nexus_file = self.session.temp_path
+        # Pass the active entry through so CifPattern is simulated
+        # against that entry's energy / angle of incidence — multi-
+        # energy datasets need this to match correctly.
+        active_entry = self.entry_combo.currentText() or None
         self._cif_parse_thread = QThread(self)
-        self._cif_parse_worker = CifParseWorker(cif_input, nexus_file)
+        self._cif_parse_worker = CifParseWorker(
+            cif_input, nexus_file, active_entry
+        )
         self._cif_parse_worker.moveToThread(self._cif_parse_thread)
         self._cif_parse_thread.started.connect(self._cif_parse_worker.run)
         self._cif_parse_worker.finished.connect(self._on_parse_cifs_finished)
@@ -1974,12 +1999,15 @@ class MainWindow(QMainWindow):
             return
 
         for i, s in enumerate(structures):
-            color = MATCHED_PALETTE[i % len(MATCHED_PALETTE)]
+            pen = matched_pen_for(i)
             row = QHBoxLayout()
             row.setContentsMargins(0, 0, 0, 0)
             row.setSpacing(6)
             swatch = QLabel()
-            swatch.setPixmap(_make_color_swatch(color))
+            # Mirror the *exact* pen used to render the structure on the
+            # image so the user can map a row to its overlay shape even
+            # when colour repeats — the dashed/dotted swatch flags it.
+            swatch.setPixmap(_make_pen_swatch(pen))
             row.addWidget(swatch)
             chk = QCheckBox(s.label)
             chk.setChecked(self.viewer.matched_visibility(_frame, s.unique_id))

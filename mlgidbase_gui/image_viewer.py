@@ -86,7 +86,41 @@ MATCHED_PALETTE: tuple[str, ...] = (
     "#5ac8fa",  # sky
     "#ac8e68",  # taupe
 )
-MATCHED_STYLE = {"style": Qt.PenStyle.SolidLine, "width": 1.6}
+# Line styles cycled after the palette wraps. Combined with
+# MATCHED_PALETTE this yields ``len(palette) * len(styles)`` unique
+# pens before any (colour, style) pair repeats — enough headroom for
+# the 28-row deduped solutions on real datasets without resorting to
+# colour-only disambiguation.
+MATCHED_LINE_STYLES: tuple[Qt.PenStyle, ...] = (
+    Qt.PenStyle.SolidLine,
+    Qt.PenStyle.DashLine,
+    Qt.PenStyle.DashDotLine,
+    Qt.PenStyle.DotLine,
+)
+MATCHED_LINE_WIDTH = 1.6
+# Backwards-compat: callers that still want the default line style
+# can keep using this dict. New code should prefer ``matched_pen_for``
+# which combines the palette + line-style cycle.
+MATCHED_STYLE = {"style": MATCHED_LINE_STYLES[0], "width": MATCHED_LINE_WIDTH}
+
+
+def matched_pen_for(index: int) -> dict:
+    """Return ``{color, style, width}`` for the ``index``-th structure.
+
+    Colour cycles first so adjacent rows pick up a different hue at
+    the same line style — the palette gives the strongest visual
+    contrast and is enough for files with up to ``len(MATCHED_PALETTE)``
+    matched structures. Once the palette wraps, the line style steps
+    to the next (dashed → dash-dot → dotted) so the next 10 rows are
+    still distinguishable from the first 10 even when their colours
+    repeat. With 10 colours × 4 styles the palette runs out only past
+    40 simultaneous structures.
+    """
+    n_colors = len(MATCHED_PALETTE)
+    n_styles = len(MATCHED_LINE_STYLES)
+    color = MATCHED_PALETTE[index % n_colors]
+    style = MATCHED_LINE_STYLES[(index // n_colors) % n_styles]
+    return {"color": color, "style": style, "width": MATCHED_LINE_WIDTH}
 
 # Curated list of colormaps. Names are matplotlib's; pg.colormap.get falls
 # back to matplotlib's registry, which is always available since matplotlib
@@ -862,15 +896,23 @@ class GIWAXSImageViewer(QWidget):
 
     def matched_color(self, structure: MatchedStructure) -> str:
         """Return the hex color assigned to a structure on the current frame.
-        Color is deterministic per insertion order within the frame so the
-        Display panel and the overlay agree without extra plumbing.
+        Deterministic per insertion order within the frame so the Display
+        panel and the overlay agree without extra plumbing.
+        """
+        return self.matched_pen(structure)["color"]
+
+    def matched_pen(self, structure: MatchedStructure) -> dict:
+        """Return the full ``{color, style, width}`` pen for ``structure``.
+
+        Pairs with ``matched_pen_for(index)`` — the panel uses this so
+        each row's swatch reproduces the exact line style on screen.
         """
         frame = self.current_frame
         lst = self._matched_per_frame.get(frame, [])
         for i, s in enumerate(lst):
             if s.unique_id == structure.unique_id:
-                return MATCHED_PALETTE[i % len(MATCHED_PALETTE)]
-        return MATCHED_PALETTE[0]
+                return matched_pen_for(i)
+        return matched_pen_for(0)
 
     def matched_visibility(self, frame: int, unique_id: str) -> bool:
         return self._matched_visibility.get((frame, unique_id), True)
@@ -1568,8 +1610,7 @@ class GIWAXSImageViewer(QWidget):
             return
         vb = self._plot.getViewBox()
         for i, s in enumerate(structures):
-            color = MATCHED_PALETTE[i % len(MATCHED_PALETTE)]
-            item = _PeakShapeItem(color=color, **MATCHED_STYLE)
+            item = _PeakShapeItem(**matched_pen_for(i))
             if self._mode == MODE_POLAR:
                 item.set_polar(s.peaks)
             else:
@@ -1698,7 +1739,7 @@ class GIWAXSImageViewer(QWidget):
                 if not self._is_matched_item_visible(s.unique_id):
                     continue
                 tbl = s.peaks
-                color = MATCHED_PALETTE[s_idx % len(MATCHED_PALETTE)]
+                color = matched_pen_for(s_idx)["color"]
                 for i in reversed(range(len(tbl))):
                     if _polar_table_row_contains(tbl, i, x, y):
                         self._set_selected(SelectedPeak(

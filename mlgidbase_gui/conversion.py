@@ -31,11 +31,6 @@ from mlgidbase_gui.conversion_panel import (
 )
 
 
-# Loggers we attach a Qt sink to during a conversion run. Mirrors
-# ``pipeline.PIPELINE_LOGGERS`` for the conversion path.
-CONVERSION_LOGGERS: tuple[str, ...] = ("pygid",)
-
-
 def is_pygid_available() -> bool:
     try:
         import pygid  # noqa: F401
