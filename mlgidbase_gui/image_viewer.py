@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QRadioButton,
@@ -127,6 +128,60 @@ def matched_pen_for(index: int) -> dict:
 # is a transitive dep via silx.
 COLORMAPS = ("viridis", "inferno", "plasma", "magma", "cividis", "gray")
 DEFAULT_COLORMAP = "magma"
+
+
+def _disable_viewport_scroll(widget) -> None:
+    """Disable QAbstractScrollArea-level scrolling on a pyqtgraph widget.
+
+    Pyqtgraph's GraphicsView / PlotWidget inherit from QAbstractScrollArea,
+    so even with the scrollbars hidden the viewport can still slide
+    when the scene rect is slightly bigger than the visible area
+    (typically by a few pixels of axis-label padding). Overriding
+    ``scrollContentsBy`` to a no-op blocks every scroll path —
+    scrollbar drag, wheel-on-bar, two-finger gesture, programmatic
+    `setValue` — without touching the inner ViewBox's pan / zoom,
+    which lives one Qt level deeper as a graphics-item event.
+
+    Implemented by reparenting the instance to a dynamically-created
+    subclass; safer than instance-level monkey-patching since Qt
+    dispatches virtual methods through the C++ vtable.
+    """
+    cls = type(widget)
+    if cls.__name__.endswith("_NoScroll"):
+        return
+    new_cls = type(
+        cls.__name__ + "_NoScroll",
+        (cls,),
+        {"scrollContentsBy": lambda self, dx, dy: None},
+    )
+    widget.__class__ = new_cls
+
+
+def _bin_index(axis: np.ndarray, value: float) -> int:
+    """Floor-based bin index for an evenly-spaced axis.
+
+    The image-display routines call ``setImage(pos=axis[0], scale=step)``,
+    so axis[0] is the LOWER edge of pixel 0 and pixel ``i`` covers
+    ``[axis[0] + i*step, axis[0] + (i+1)*step)``. Returning the bin
+    index by ``floor`` instead of ``argmin(|axis - v|)`` keeps the
+    cursor readout constant within a displayed pixel — argmin
+    transitions at axis-midpoints, which is half a pixel off from
+    where the user sees the boundary.
+    """
+    n = len(axis)
+    if n == 0:
+        return 0
+    if n == 1:
+        return 0
+    step = (float(axis[-1]) - float(axis[0])) / (n - 1)
+    if step == 0.0:
+        return 0
+    idx = int(np.floor((float(value) - float(axis[0])) / step))
+    if idx < 0:
+        return 0
+    if idx >= n:
+        return n - 1
+    return idx
 
 
 def _robust_levels(frame: np.ndarray) -> tuple[float, float]:
@@ -347,6 +402,11 @@ class _LabelEventFilter(QObject):
     selectAt = Signal(QPointF)
     # Bare LMB double-click (no modifiers, no drag) — wired to reset zoom.
     doubleClicked = Signal()
+    # Hover-aware cursor tracking — fires on every mouse move (with or
+    # without a button held). The viewer translates the data-space point
+    # into the public ``cursorMoved`` payload consumed by the status bar.
+    cursorPos = Signal(QPointF)
+    cursorLeft = Signal()
 
     # Pixel tolerance below which a press+release counts as a click, not a drag.
     CLICK_TOLERANCE_PX = 4
@@ -364,6 +424,9 @@ class _LabelEventFilter(QObject):
 
     def install(self) -> None:
         self._gv.viewport().installEventFilter(self)
+        # MouseMove only fires with a button held unless tracking is on.
+        # The status-bar cursor readout needs hover updates, so force it.
+        self._gv.viewport().setMouseTracking(True)
 
     def eventFilter(self, _obj: QObject, ev: QEvent) -> bool:  # type: ignore[override]
         et = ev.type()
@@ -389,10 +452,16 @@ class _LabelEventFilter(QObject):
             self._press_pos = ev.position().toPoint()
             self._press_mods = mods
             return False
-        if et == QEvent.Type.MouseMove and self._drawing and self._origin is not None:
-            pos = self._viewport_to_data(ev.position().toPoint())
-            self.drawUpdated.emit(self._origin, pos)
-            return True
+        if et == QEvent.Type.MouseMove:
+            # Always emit cursor position for the status-bar readout —
+            # independent of whether a draw drag is in progress.
+            data_pos = self._viewport_to_data(ev.position().toPoint())
+            self.cursorPos.emit(data_pos)
+            if self._drawing and self._origin is not None:
+                self.drawUpdated.emit(self._origin, data_pos)
+                return True
+        if et == QEvent.Type.Leave:
+            self.cursorLeft.emit()
         if et == QEvent.Type.MouseButtonRelease and ev.button() == Qt.MouseButton.LeftButton:
             if self._drawing and self._origin is not None:
                 end = self._viewport_to_data(ev.position().toPoint())
@@ -595,6 +664,10 @@ class GIWAXSImageViewer(QWidget):
 
     frameChanged = Signal(int)
     modeChanged = Signal(str)
+    # Cursor readout — emits a dict describing the data point under the
+    # cursor (q-mode vs pixel-mode), or None when the pointer leaves
+    # the viewport. Consumers (status bar) format the dict for display.
+    cursorMoved = Signal(object)
     manualPeakAdded = Signal(int, object)     # frame, ManualPeak
     manualPeakRemoved = Signal(int, object)   # frame, ManualPeak
     selectionChanged = Signal(object)         # SelectedPeak | None
@@ -685,10 +758,28 @@ class GIWAXSImageViewer(QWidget):
         # x-axis label area.
         self._view.ui.splitter.setHandleWidth(0)
         self._view.ui.splitter.setSizes([1, 0])
+        # Pyqtgraph's GraphicsView occasionally lets the scene scroll
+        # by a few pixels when its sceneRect has drifted from the
+        # viewport size — kill scrollbars + frame so the plot is
+        # unconditionally pinned inside its tab.
+        gv = self._view.ui.graphicsView
+        gv.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        gv.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        gv.setFrameStyle(QFrame.Shape.NoFrame)
+        # Block QAbstractScrollArea-level scrolling without touching
+        # ViewBox pan / zoom — see _disable_viewport_scroll docstring.
+        _disable_viewport_scroll(gv)
         outer.addWidget(self._view)
 
         self._plot.invertY(False)
         self._plot.setAspectLocked(False)
+        # PyQtGraph occasionally underestimates the bottom axis cell so
+        # the axis label ("radius" / "q_xy") gets clipped by the
+        # viewport's lower edge — and that clip is what creates the
+        # small scrollable region. A small bottom layout margin gives
+        # the label guaranteed clearance and keeps the plot fitted
+        # inside its tab.
+        self._plot.layout.setContentsMargins(0, 0, 0, 12)
 
         self._detected = _PeakShapeItem(**OVERLAY_STYLE["detected"])
         self._fitted = _PeakShapeItem(**OVERLAY_STYLE["fitted"])
@@ -722,6 +813,8 @@ class GIWAXSImageViewer(QWidget):
         self._label_filter.drawFinished.connect(self._on_draw_finished)
         self._label_filter.selectAt.connect(self._on_select_at)
         self._label_filter.doubleClicked.connect(self.reset_zoom)
+        self._label_filter.cursorPos.connect(self._on_cursor_pos)
+        self._label_filter.cursorLeft.connect(self._on_cursor_left)
 
         # Apply default colormap immediately.
         self._apply_cmap(DEFAULT_COLORMAP)
@@ -1793,6 +1886,123 @@ class GIWAXSImageViewer(QWidget):
                 break
         if cmap is not None:
             self._view.setColorMap(cmap)
+
+    # -- Cursor readout (status bar) --
+
+    def _on_cursor_pos(self, pt: QPointF) -> None:
+        info = self._compute_cursor_info(pt)
+        self.cursorMoved.emit(info)
+
+    def _on_cursor_left(self) -> None:
+        self.cursorMoved.emit(None)
+
+    def _compute_cursor_info(self, pt: QPointF) -> dict | None:
+        """Translate a data-space cursor point into a status-bar payload.
+
+        Returns one of three shapes, distinguished by the ``mode`` key:
+
+        - ``"pixel"`` — raw mode: ``row, col, intensity``.
+        - ``"cartesian"`` — q-cartesian view: ``q_xy, q_z, intensity``.
+        - ``"polar"`` — q-polar view: ``r, theta, intensity``.
+
+        Polar-view axes are **x = radius, y = angle** (matches what
+        ``_polar_params`` puts on the plot, NOT the math convention).
+        Intensity is looked up against the polar cache when the polar
+        view is active; if that returns NaN (uncovered region of the
+        polar transform), we fall back to the cartesian grid via the
+        derived ``(q_xy, q_z)`` so users see something useful at the
+        rim of the polar image.
+        """
+        x, y = pt.x(), pt.y()
+        frame = self.current_frame
+        if self._mode == MODE_RAW and self._raw_image_stack is not None:
+            stack = self._raw_image_stack
+            n_fr, n_rows, n_cols = stack.shape
+            col = int(round(x))
+            row = int(round(y))
+            if (
+                0 <= frame < n_fr
+                and 0 <= row < n_rows
+                and 0 <= col < n_cols
+            ):
+                intensity = float(stack[frame, row, col])
+            else:
+                intensity = float("nan")
+            return {
+                "mode": "pixel",
+                "row": row,
+                "col": col,
+                "intensity": intensity,
+            }
+        if self._stack is None:
+            return None
+        if self._mode == MODE_CARTESIAN:
+            q_xy_val = float(x)
+            q_z_val = float(y)
+            intensity = self._lookup_cartesian_intensity(
+                frame, q_xy_val, q_z_val
+            )
+            return {
+                "mode": "cartesian",
+                "q_xy": q_xy_val,
+                "q_z": q_z_val,
+                "intensity": intensity,
+            }
+        # MODE_POLAR — viewer's polar image is laid out with radius on
+        # the x axis and angle on the y axis (see _polar_params).
+        r_val = float(x)
+        theta_deg = float(y)
+        intensity = float("nan")
+        if self._polar_cache is not None:
+            polar_stack, radius_axis, angle_axis = self._polar_cache
+            if (
+                0 <= frame < polar_stack.shape[0]
+                and len(radius_axis) > 0
+                and len(angle_axis) > 0
+            ):
+                r_idx = _bin_index(radius_axis, r_val)
+                a_idx = _bin_index(angle_axis, theta_deg)
+                intensity = float(polar_stack[frame, r_idx, a_idx])
+        # Polar transform leaves NaN in uncovered regions; fall back
+        # to the cartesian grid so the readout still shows a real
+        # intensity near the edge.
+        if intensity != intensity:  # NaN
+            q_xy_val = r_val * np.cos(np.deg2rad(theta_deg))
+            q_z_val = r_val * np.sin(np.deg2rad(theta_deg))
+            intensity = self._lookup_cartesian_intensity(
+                frame, q_xy_val, q_z_val
+            )
+        return {
+            "mode": "polar",
+            "r": r_val,
+            "theta": theta_deg,
+            "intensity": intensity,
+        }
+
+    def _lookup_cartesian_intensity(
+        self, frame: int, q_xy_val: float, q_z_val: float
+    ) -> float:
+        """Pixel-bin intensity lookup against the cartesian stack.
+
+        Uses floor-based binning (not nearest-neighbour) so the
+        returned intensity stays constant while the cursor is inside
+        the same displayed pixel — matches pyqtgraph's ``pos=axis[0]``
+        / ``scale=step`` image transform exactly.
+        """
+        if self._stack is None:
+            return float("nan")
+        stack3d = self._stack.image_stack
+        qxy_axis = self._stack.q_xy
+        qz_axis = self._stack.q_z
+        if not (
+            0 <= frame < stack3d.shape[0]
+            and len(qxy_axis) > 0
+            and len(qz_axis) > 0
+        ):
+            return float("nan")
+        qxy_idx = _bin_index(qxy_axis, q_xy_val)
+        qz_idx = _bin_index(qz_axis, q_z_val)
+        return float(stack3d[frame, qz_idx, qxy_idx])
 
     # -- Labelling event handlers (polar mode only for now) --
 

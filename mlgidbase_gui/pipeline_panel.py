@@ -188,9 +188,12 @@ class PipelinePanel(QWidget):
             return
         self.btn_detect.setEnabled(not running)
         self.btn_fit.setEnabled(not running)
-        # Match button additionally requires either a CIF or pickle path:
+        # Match + run-all both additionally require an active matching
+        # source — let _update_match_enabled re-evaluate that gate when
+        # a run finishes.
         if running:
             self.btn_match.setEnabled(False)
+            self.btn_run_all.setEnabled(False)
         else:
             self._update_match_enabled()
 
@@ -232,6 +235,21 @@ class PipelinePanel(QWidget):
             scroll.setWidget(content)
             return
 
+        # Run-all button — created up-front because the matching
+        # section's initial _update_match_enabled call (during section
+        # construction) reaches for self.btn_run_all to set its gated
+        # state. The widget is added to the layout further down so it
+        # sits pinned to the bottom of the dock.
+        self.btn_run_all = QPushButton("Run full pipeline")
+        self.btn_run_all.setToolTip(
+            "Run Detection, Fitting, and Matching back-to-back using the "
+            "current section kwargs.\n\n"
+            "Disabled until the active matching source (CIF or pickle) "
+            "has a value."
+        )
+        self.btn_run_all.setEnabled(False)
+        self.btn_run_all.clicked.connect(self._on_run_all)
+
         # Sections are independent now: any combination of them can be
         # open at once. Detection starts open so the user has something
         # actionable on first sight.
@@ -245,8 +263,11 @@ class PipelinePanel(QWidget):
 
         # Logs live in their own dock now (see MainWindow._logs_dock); the
         # trailing stretch keeps the sections at the top of the scroll
-        # area when they don't fill the visible height.
+        # area when they don't fill the visible height. The run-all
+        # button sits below the stretch so it stays pinned to the
+        # bottom regardless of how many sections are expanded.
         inner.addStretch(1)
+        inner.addWidget(self.btn_run_all)
         scroll.setWidget(content)
 
     def _build_detection_section(self) -> QWidget:
@@ -544,13 +565,16 @@ class PipelinePanel(QWidget):
         return section
 
     def _update_match_enabled(self) -> None:
-        # Run is gated only on the *selected* source having a value;
-        # text in the inactive row is irrelevant.
+        # Run-Match and Run-Full-Pipeline are both gated on the *selected*
+        # source having a value; text in the inactive row is irrelevant.
+        # Run-Full-Pipeline shares the gate because Matching is the last
+        # stage of the chain and it can't proceed without a source.
         if self._use_pickle_source():
             has_input = bool(self.pickle_path.text().strip())
         else:
             has_input = bool(self.cif_path.text().strip())
         self.btn_match.setEnabled(has_input)
+        self.btn_run_all.setEnabled(has_input)
 
     def _use_pickle_source(self) -> bool:
         return self.rb_pickle_source.isChecked()
@@ -613,6 +637,30 @@ class PipelinePanel(QWidget):
         kwargs["use_pool"] = bool(self.fit_use_pool.isChecked())
         kwargs["debug"] = bool(self.fit_debug.isChecked())
         self.runRequested.emit(PipelineCommand("run_fitting", kwargs))
+
+    def _on_run_all(self) -> None:
+        """Chain Detection → Fitting → Matching as three queued commands.
+
+        Each stage reuses its per-stage handler so kwarg-building stays
+        in one place. The host's runRequested dispatcher queues each
+        emitted command onto the same worker thread, so the three
+        stages run sequentially without overlapping. "All entries"
+        scope is still expanded per-entry inside each stage.
+
+        Errors in earlier stages don't abort the chain — the existing
+        queue logs and continues, matching the per-entry batch behaviour.
+        """
+        # Belt-and-braces — the button is gated, but a programmatic
+        # caller could still reach this with no source set.
+        if self._use_pickle_source():
+            if not self.pickle_path.text().strip():
+                return
+        else:
+            if not self.cif_path.text().strip():
+                return
+        self._on_run_detection()
+        self._on_run_fitting()
+        self._on_run_matching()
 
     def _on_run_matching(self) -> None:
         # The Source selector decides which input is used; the inactive

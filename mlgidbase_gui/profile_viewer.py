@@ -6,12 +6,17 @@ os.environ.setdefault("PYQTGRAPH_QT_LIB", "PySide6")
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QHBoxLayout, QWidget
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QWidget
 
 from mlgidbase_gui.fit import GaussianFit, fit_gaussian_on_axis
-from mlgidbase_gui.image_viewer import OVERLAY_STYLE, ManualPeak, SelectedPeak
+from mlgidbase_gui.image_viewer import (
+    OVERLAY_STYLE,
+    ManualPeak,
+    SelectedPeak,
+    _disable_viewport_scroll,
+)
 
 # Multiple of box width on each side over which the rendered Gaussian curve
 # extends past the box bounds. Big enough that the tails fade into the
@@ -79,6 +84,23 @@ class ProfileViewer(QWidget):
         self._radial_plot.setTitle("Radial profile")
         self._radial_plot.showGrid(x=True, y=True, alpha=0.2)
         self._radial_plot.getViewBox().setMouseEnabled(x=True, y=False)
+        # Bottom margin keeps the "radius" axis label off the viewport's
+        # lower edge — pyqtgraph's auto-sized bottom-axis cell can leave
+        # too little room and the clipped label opens a small scrollable
+        # region in the dock.
+        self._radial_plot.plotItem.layout.setContentsMargins(0, 0, 0, 12)
+        # PlotWidget is a QGraphicsView under the hood — pin the
+        # scrollbars off and drop the frame border so the plot
+        # contents (axes + labels) sit flush against the dock and
+        # the user can't accidentally pan/scroll the scene.
+        self._radial_plot.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._radial_plot.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._radial_plot.setFrameStyle(QFrame.Shape.NoFrame)
+        _disable_viewport_scroll(self._radial_plot)
         self._radial_curve = self._radial_plot.plot([], [], pen=pen)
         self._radial_fit_curve = self._radial_plot.plot([], [], pen=fit_pen)
         self._radial_region = pg.LinearRegionItem(
@@ -96,6 +118,15 @@ class ProfileViewer(QWidget):
         self._angular_plot.setTitle("Angular profile")
         self._angular_plot.showGrid(x=True, y=True, alpha=0.2)
         self._angular_plot.getViewBox().setMouseEnabled(x=True, y=False)
+        self._angular_plot.plotItem.layout.setContentsMargins(0, 0, 0, 12)
+        self._angular_plot.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._angular_plot.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._angular_plot.setFrameStyle(QFrame.Shape.NoFrame)
+        _disable_viewport_scroll(self._angular_plot)
         self._angular_curve = self._angular_plot.plot([], [], pen=pen)
         self._angular_fit_curve = self._angular_plot.plot([], [], pen=fit_pen)
         self._angular_region = pg.LinearRegionItem(

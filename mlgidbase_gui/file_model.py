@@ -5,8 +5,10 @@ No Qt imports — keep this module independently testable.
 """
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterator
 
 import h5py
 import numpy as np
@@ -499,7 +501,12 @@ def normalize_for_pygid(file_path: Path) -> dict[str, list[str]]:
     return {"angle": patched_angle, "frames": patched_frames}
 
 
-def clear_peaks(file_path: Path, entry: str, kind: str) -> int:
+def clear_peaks(
+    file_path: Path,
+    entry: str,
+    kind: str,
+    frame: int | None = None,
+) -> int:
     """Empty every ``<kind>_peaks`` dataset under ``entry/data/analysis/``.
 
     ``kind`` is one of:
@@ -508,6 +515,11 @@ def clear_peaks(file_path: Path, entry: str, kind: str) -> int:
     - ``"fitted"``     — empties ``fitted_peaks`` and ``fitted_peaks_errors``
                          per frame (the two are paired by id).
     - ``"matched"``    — empties every ``matched_*`` dataset per frame.
+
+    ``frame`` restricts the wipe to a single ``frameNNNNN`` group when
+    given; the default ``None`` clears every frame in the entry. The
+    frame-scoped form is used by the Tools → Reset → Active-frame
+    action; pipeline-level cascades pass ``None``.
 
     Datasets are recreated empty (shape ``(0,)``) preserving dtype + attrs,
     because pygid creates them as fixed-shape datasets so ``.resize`` is
@@ -525,7 +537,12 @@ def clear_peaks(file_path: Path, entry: str, kind: str) -> int:
         if ana_path not in f:
             return 0
         ana_group = f[ana_path]
-        for frame_name in list(ana_group.keys()):
+        if frame is None:
+            frame_names = list(ana_group.keys())
+        else:
+            target = FRAME_KEY_FMT.format(frame)
+            frame_names = [target] if target in ana_group else []
+        for frame_name in frame_names:
             frame_group = ana_group[frame_name]
             if not isinstance(frame_group, h5py.Group):
                 continue
@@ -542,6 +559,200 @@ def clear_peaks(file_path: Path, entry: str, kind: str) -> int:
                 if ds_name in frame_group:
                     removed += _empty_dataset_in_place(frame_group, ds_name)
     return removed
+
+
+def _iter_frame_keys(
+    ana_group: h5py.Group, frame: int | None
+) -> Iterator[tuple[str, int]]:
+    """Yield ``(frame_group_name, frame_index)`` pairs in the entry.
+
+    When ``frame`` is None every ``frameNNNNN`` group under the entry's
+    analysis group is yielded; otherwise just the matching one (if it
+    exists). Frame index is parsed from the trailing digits of the
+    group name so it matches the value the viewer reports for
+    ``current_frame`` and the ``frame_num`` column the rest of the
+    pipeline writes into peak rows.
+    """
+    if frame is None:
+        for name in ana_group.keys():
+            if not name.startswith("frame"):
+                continue
+            try:
+                idx = int(name[len("frame"):])
+            except ValueError:
+                continue
+            yield name, idx
+    else:
+        target = FRAME_KEY_FMT.format(frame)
+        if target in ana_group:
+            yield target, int(frame)
+
+
+def _csv_value(v):
+    """Coerce a structured-array element into something the csv module
+    can serialise without surprises (bytes → utf-8 str, numpy scalars
+    pass through as their repr)."""
+    if isinstance(v, bytes):
+        return v.decode("utf-8", errors="replace")
+    return v
+
+
+def export_peaks_csv(
+    file_path: Path,
+    targets: list[tuple[str, int | None]],
+    kind: str,
+    out_path: Path,
+) -> int:
+    """Write detected or fitted peaks to ``out_path`` as CSV.
+
+    ``targets`` is a list of ``(entry, frame_or_None)`` tuples; pass
+    ``frame=None`` to dump every frame in the entry. ``kind`` is
+    ``"detected"`` or ``"fitted"``; for fitted, the ``fitted_peaks_errors``
+    sibling dataset is joined per row and its fields appear as
+    ``<name>_err`` columns. Returns the row count written.
+
+    The header is the union of every dtype field seen in the scope
+    (in first-encounter order), prefixed with ``entry`` and
+    ``frame_num``. Missing fields on a row become empty strings —
+    the writer uses ``DictWriter`` so heterogeneity across entries
+    is tolerated.
+    """
+    if kind not in ("detected", "fitted"):
+        raise ValueError(f"export_peaks_csv: kind must be detected/fitted, got {kind!r}")
+    ds_name = "detected_peaks" if kind == "detected" else "fitted_peaks"
+    err_ds_name = "fitted_peaks_errors" if kind == "fitted" else None
+
+    rows: list[dict] = []
+    fieldnames: list[str] = ["entry", "frame_num"]
+    seen: set[str] = set(fieldnames)
+
+    with h5py.File(file_path, "r") as f:
+        for entry, frame in targets:
+            ana_path = f"{entry}/{ANALYSIS_REL}"
+            if ana_path not in f:
+                continue
+            ana_group = f[ana_path]
+            for frame_name, frame_idx in _iter_frame_keys(ana_group, frame):
+                fg = ana_group[frame_name]
+                if ds_name not in fg:
+                    continue
+                arr = fg[ds_name][()]
+                if len(arr) == 0:
+                    continue
+                err_arr = None
+                if err_ds_name is not None and err_ds_name in fg:
+                    err_arr = fg[err_ds_name][()]
+                for i in range(len(arr)):
+                    row = {"entry": entry, "frame_num": frame_idx}
+                    for name in arr.dtype.names:
+                        row[name] = _csv_value(arr[name][i])
+                        if name not in seen:
+                            fieldnames.append(name)
+                            seen.add(name)
+                    if err_arr is not None and i < len(err_arr):
+                        for name in err_arr.dtype.names:
+                            col = f"{name}_err"
+                            row[col] = _csv_value(err_arr[name][i])
+                            if col not in seen:
+                                fieldnames.append(col)
+                                seen.add(col)
+                    rows.append(row)
+
+    with open(out_path, "w", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    return len(rows)
+
+
+def export_matched_csv(
+    file_path: Path,
+    targets: list[tuple[str, int | None]],
+    out_path: Path,
+) -> int:
+    """Write matched solutions to ``out_path`` as CSV, one row per solution.
+
+    Mirrors what silx shows in its Data tab for the ``matched_*``
+    datasets: every solution gets a single row, with its referenced
+    fitted peaks compacted into a ``peak_list`` cell formatted as
+    ``[id_a, id_b, …]``. CIF is decoded and stripped of its ``.cif``
+    suffix to match the Display dock; any extra dtype fields on the
+    matched dataset are passed through verbatim so schema additions
+    don't silently disappear from the export.
+
+    Returns the row count written.
+    """
+    rows: list[dict] = []
+    fieldnames: list[str] = [
+        "entry", "frame_num", "solution_field", "local_idx",
+        "cif", "h", "k", "l", "probability", "peak_list",
+    ]
+    seen: set[str] = set(fieldnames)
+    extra_solution_fields: list[str] = []  # any dtype field beyond the well-known ones
+
+    with h5py.File(file_path, "r") as f:
+        for entry, frame in targets:
+            ana_path = f"{entry}/{ANALYSIS_REL}"
+            if ana_path not in f:
+                continue
+            ana_group = f[ana_path]
+            for frame_name, frame_idx in _iter_frame_keys(ana_group, frame):
+                fg = ana_group[frame_name]
+                for sol_name in sorted(fg.keys()):
+                    if not sol_name.startswith("matched_"):
+                        continue
+                    sol_arr = fg[sol_name][()]
+                    if len(sol_arr) == 0:
+                        continue
+                    sol_dtype_names = sol_arr.dtype.names or ()
+                    well_known = {"CIF", "h", "k", "l", "probability", "peak_list"}
+                    for name in sol_dtype_names:
+                        if name in well_known or name in seen:
+                            continue
+                        fieldnames.append(name)
+                        seen.add(name)
+                        extra_solution_fields.append(name)
+                    for i in range(len(sol_arr)):
+                        cif_raw = sol_arr["CIF"][i]
+                        cif_str = (
+                            cif_raw.decode("utf-8", errors="replace")
+                            if isinstance(cif_raw, bytes) else str(cif_raw)
+                        )
+                        if cif_str.lower().endswith(".cif"):
+                            cif_str = cif_str[:-4]
+                        peak_list = np.atleast_1d(
+                            np.asarray(sol_arr["peak_list"][i], dtype=int)
+                        )
+                        # Verbatim list of indices as silx shows them in
+                        # the Data tab. Negative padding sentinels are
+                        # filtered so the cell shows just the real
+                        # peaks; users who need raw values can read the
+                        # HDF5 dataset directly.
+                        peak_ids = [int(x) for x in peak_list if int(x) >= 0]
+                        row = {
+                            "entry": entry,
+                            "frame_num": frame_idx,
+                            "solution_field": sol_name,
+                            "local_idx": int(i),
+                            "cif": cif_str,
+                            "h": int(sol_arr["h"][i]),
+                            "k": int(sol_arr["k"][i]),
+                            "l": int(sol_arr["l"][i]),
+                            "probability": float(sol_arr["probability"][i]),
+                            "peak_list": "[" + ", ".join(str(x) for x in peak_ids) + "]",
+                        }
+                        for name in extra_solution_fields:
+                            if name in sol_dtype_names:
+                                row[name] = _csv_value(sol_arr[name][i])
+                        rows.append(row)
+
+    with open(out_path, "w", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    return len(rows)
 
 
 def _empty_dataset_in_place(parent: h5py.Group, name: str) -> int:

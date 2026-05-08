@@ -1,15 +1,31 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QSignalBlocker, QThread
-from PySide6.QtGui import QAction, QCloseEvent, QColor, QFont, QKeySequence, QPainter, QPen, QPixmap
+from PySide6.QtCore import Qt, QSettings, QSignalBlocker, QThread
+from PySide6.QtGui import (
+    QAction,
+    QCloseEvent,
+    QColor,
+    QDragEnterEvent,
+    QDropEvent,
+    QFont,
+    QKeySequence,
+    QPainter,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDockWidget,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -17,6 +33,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QPlainTextEdit,
     QProgressDialog,
+    QRadioButton,
     QScrollArea,
     QSlider,
     QTabWidget,
@@ -24,7 +41,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from silx.gui.data.DataViewerFrame import DataViewerFrame
-from silx.gui.hdf5 import Hdf5TreeView
+from silx.gui.hdf5 import Hdf5TreeModel, Hdf5TreeView
+from silx.gui.hdf5.NexusSortFilterProxyModel import NexusSortFilterProxyModel
 
 from mlgidbase_gui import file_model
 from mlgidbase_gui.image_viewer import (
@@ -55,7 +73,8 @@ from mlgidbase_gui.workers import (
 
 APP_NAME = "mlgidBASE GUI"
 NEXUS_FILTER = "HDF5 / NeXus (*.h5 *.hdf5 *.nxs);;All files (*)"
-RAW_FILTER = "HDF5 raw data (*.h5 *.hdf5 *.nxs);;All files (*)"
+# Open dialog now auto-classifies NeXus vs raw; one filter does for both.
+OPEN_FILTER = "HDF5 (*.h5 *.hdf5 *.nxs);;All files (*)"
 
 
 def _make_pen_swatch(style: dict, width: int = 26, height: int = 12) -> QPixmap:
@@ -80,6 +99,141 @@ def _make_color_swatch(color: str, width: int = 26, height: int = 12) -> QPixmap
     return _make_pen_swatch(
         {"color": color, "style": MATCHED_STYLE["style"]}, width, height
     )
+
+
+class _MlgidHdf5TreeModel(Hdf5TreeModel):
+    """Silx tree model that swaps the file-root icon for raw sessions.
+
+    The default ``Hdf5TreeModel`` uses ``SP_FileIcon`` for every loaded
+    HDF5 file. Distinguishing converted-NeXus files (the pipeline runs
+    on these) from raw detector files (they need conversion first)
+    helps the user spot which is which when both are open in the file
+    browser dock at the same time.
+
+    The set of "raw" filesystem paths is owned by ``MainWindow`` and
+    pushed in via ``set_raw_paths``; the model emits ``dataChanged``
+    so existing rows refresh without a full rebuild.
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._raw_paths: set[str] = set()
+        from PySide6.QtWidgets import QApplication, QStyle
+        style = QApplication.style()
+        self._raw_icon = style.standardIcon(QStyle.StandardPixmap.SP_DriveHDIcon)
+        self._nexus_icon = style.standardIcon(QStyle.StandardPixmap.SP_FileIcon)
+
+    def set_raw_paths(self, paths) -> None:
+        # No dataChanged.emit here on purpose. Forcing silx's tree to
+        # repaint while h5py items may still be in lazy-init has
+        # produced reentrancy storms in QSortFilterProxyModel under
+        # PySide6. Icons just take effect on the next natural paint
+        # (resize / scroll / new insert), which is good enough.
+        self._raw_paths = {str(p) for p in paths}
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if (
+            role == Qt.ItemDataRole.DecorationRole
+            and index.column() == self.NAME_COLUMN
+            and not index.parent().isValid()
+        ):
+            try:
+                node = self.nodeFromIndex(index)
+                obj = getattr(node, "obj", None)
+                if obj is not None:
+                    filename = getattr(obj, "filename", None)
+                    if filename:
+                        if str(filename) in self._raw_paths:
+                            return self._raw_icon
+                        return self._nexus_icon
+            except Exception:
+                # If silx / h5py is in a transient bad state, fall
+                # through to super().data() rather than propagating
+                # an exception that Qt would re-fire endlessly.
+                pass
+        return super().data(index, role)
+
+
+class _MlgidHdf5TreeView(Hdf5TreeView):
+    """Hdf5TreeView that builds its default model from our subclass.
+
+    Also disables silx's built-in file-drop handler so all drag-and-
+    drop events fall through to ``MainWindow.dropEvent``. Silx's
+    default behaviour is to accept any URL drop on the tree and call
+    ``insertFileAsync`` directly — that creates an orphan tree node
+    with no matching ``Session`` in our session list, and later
+    queries (selection changes, pipeline detach/reattach) blow up
+    against the orphan's stale h5py handle.
+    """
+
+    def createDefaultModel(self):
+        model = _MlgidHdf5TreeModel(self)
+        model.setFileDropEnabled(False)
+        proxy = NexusSortFilterProxyModel(self)
+        proxy.setSourceModel(model)
+        return proxy
+
+
+class _ExportPeaksDialog(QDialog):
+    """Modal kind/scope picker for Tools → Export peaks as CSV.
+
+    Two QButtonGroups hold the kind (Detected/Fitted/Matched) and the
+    scope (Active frame / Active entry / All entries) respectively;
+    Active-frame is greyed when the active stack has only one frame
+    so the option doesn't masquerade as different from Active-entry.
+    """
+
+    def __init__(self, parent: QWidget, *, has_multiple_frames: bool) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Export peaks as CSV")
+        layout = QVBoxLayout(self)
+
+        kind_box = QGroupBox("Peak kind")
+        kind_layout = QVBoxLayout(kind_box)
+        self._rb_detected = QRadioButton("Detected")
+        self._rb_fitted = QRadioButton("Fitted (with fit errors)")
+        self._rb_matched = QRadioButton("Matched (flattened: one row per peak)")
+        self._rb_fitted.setChecked(True)
+        for rb in (self._rb_detected, self._rb_fitted, self._rb_matched):
+            kind_layout.addWidget(rb)
+        layout.addWidget(kind_box)
+
+        scope_box = QGroupBox("Scope")
+        scope_layout = QVBoxLayout(scope_box)
+        self._rb_frame = QRadioButton("Active frame")
+        self._rb_entry = QRadioButton("Active entry (all frames)")
+        self._rb_all = QRadioButton("All entries (one combined CSV)")
+        self._rb_entry.setChecked(True)
+        if not has_multiple_frames:
+            self._rb_frame.setEnabled(False)
+            self._rb_frame.setToolTip(
+                "Available only when the active entry has more than one frame."
+            )
+        for rb in (self._rb_frame, self._rb_entry, self._rb_all):
+            scope_layout.addWidget(rb)
+        layout.addWidget(scope_box)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def selected_kind(self) -> str:
+        if self._rb_detected.isChecked():
+            return "detected"
+        if self._rb_matched.isChecked():
+            return "matched"
+        return "fitted"
+
+    def selected_scope(self) -> str:
+        if self._rb_frame.isChecked():
+            return "frame"
+        if self._rb_all.isChecked():
+            return "all"
+        return "entry"
 
 
 class MainWindow(QMainWindow):
@@ -139,8 +293,15 @@ class MainWindow(QMainWindow):
         # View menu is built last because it pulls toggleViewAction()s from
         # the docks created in _build_docks.
         self._build_view_menu()
+        # Status bar depends on the viewer + entry combo existing; build
+        # after central + docks.
+        self._build_status_bar()
         self._update_title()
         self._update_actions()
+        # Accept dropped files anywhere on the main window so the user
+        # can drag NeXus / raw paths in from a file manager. The drop
+        # handler classifies each file by content and dispatches.
+        self.setAcceptDrops(True)
 
     @property
     def session(self) -> Session | None:
@@ -192,10 +353,6 @@ class MainWindow(QMainWindow):
         # "Clear peaks" submenu rather than cluttering the Tools root.
         clear_menu = tools_menu.addMenu("&Clear peaks")
 
-        self.action_clear_manual = QAction("Manual", self)
-        self.action_clear_manual.triggered.connect(self._action_clear_manual)
-        clear_menu.addAction(self.action_clear_manual)
-
         self.action_clear_detected = QAction("Detected", self)
         self.action_clear_detected.triggered.connect(
             lambda: self._action_clear_file_peaks("detected")
@@ -208,11 +365,61 @@ class MainWindow(QMainWindow):
         )
         clear_menu.addAction(self.action_clear_fitted)
 
-        self.action_clear_matched = QAction("Matched", self)
+        # "Matched and fitted" rather than just "Matched" because the
+        # action cascades — clearing matched here also wipes fitted on
+        # the same scope, since matched solutions reference fitted ids
+        # and an orphaned matched_* group would render against missing
+        # peak rows.
+        self.action_clear_matched = QAction("Matched and fitted", self)
         self.action_clear_matched.triggered.connect(
             lambda: self._action_clear_file_peaks("matched")
         )
         clear_menu.addAction(self.action_clear_matched)
+
+        # Reset submenu — full wipe of det + fit + match (and manual,
+        # in-memory) at three scopes. "Active frame" is greyed out
+        # when fewer than two frames are loaded since on a single-
+        # frame file it would just duplicate "Active entry".
+        clear_menu.addSeparator()
+        reset_menu = clear_menu.addMenu("&Reset all peaks")
+        reset_menu.setToolTipsVisible(True)
+        self._reset_menu = reset_menu
+
+        self.action_reset_entry = QAction("Active entry (all frames)", self)
+        self.action_reset_entry.setToolTip(
+            "Clear detected, fitted, matched, and manual peaks on the "
+            "currently displayed entry."
+        )
+        self.action_reset_entry.triggered.connect(
+            lambda: self._action_reset_analysis("entry")
+        )
+        reset_menu.addAction(self.action_reset_entry)
+
+        self.action_reset_all = QAction("All entries", self)
+        self.action_reset_all.setToolTip(
+            "Clear detected, fitted, matched, and manual peaks on every "
+            "entry in the active file."
+        )
+        self.action_reset_all.triggered.connect(
+            lambda: self._action_reset_analysis("all")
+        )
+        reset_menu.addAction(self.action_reset_all)
+
+        self.action_reset_frame = QAction("Active frame", self)
+        self.action_reset_frame.setToolTip(
+            "Clear detected, fitted, and matched peaks on just the "
+            "currently displayed frame of the active entry. Manual "
+            "peaks are wiped (they live in memory across frames)."
+        )
+        self.action_reset_frame.triggered.connect(
+            lambda: self._action_reset_analysis("frame")
+        )
+        reset_menu.addAction(self.action_reset_frame)
+        # Re-evaluate the per-scope enabled states right before the
+        # submenu is shown — n_frames / session state can change between
+        # menu opens, and aboutToShow keeps the gate cheap (no signal
+        # plumbing on every viewer event).
+        reset_menu.aboutToShow.connect(self._refresh_reset_menu_state)
 
         # Export the current frame to PNG. Works for either NeXus or
         # raw mode — pyqtgraph's ImageExporter operates on the active
@@ -222,19 +429,20 @@ class MainWindow(QMainWindow):
         self.action_export_png.triggered.connect(self._action_export_png)
         tools_menu.addAction(self.action_export_png)
 
-    def _action_clear_manual(self) -> None:
-        """Drop every manual peak. In-memory only, no file write."""
-        if not self._confirm_clear("manual"):
-            return
-        self.viewer.clear_all_manual_peaks()
-        self.pipeline_panel.append_log("Cleared all manual peaks")
+        # CSV export of detected/fitted/matched peaks. NeXus-only.
+        self.action_export_csv = QAction("Export peaks as CSV…", self)
+        self.action_export_csv.triggered.connect(self._action_export_csv)
+        tools_menu.addAction(self.action_export_csv)
 
     def _action_clear_file_peaks(self, kind: str) -> None:
         """Empty every ``<kind>_peaks`` dataset for the active entry.
 
-        Cascade rule: clearing fitted also clears matched, because matched
-        rows reference fitted ids — leaving stale matched_* solutions
-        pointing at deleted fitted rows is worse than wiping them.
+        Cascade rules:
+        - clearing ``fitted`` also clears ``matched`` (matched rows
+          reference fitted ids; orphaned matched_* groups can't render).
+        - the menu's ``matched`` action is labelled "Matched and fitted"
+          and likewise wipes both — see Tools-menu wiring above for the
+          rename rationale.
         """
         if self.session is None or self._pipe_thread is not None:
             return
@@ -246,6 +454,8 @@ class MainWindow(QMainWindow):
         kinds_to_clear = [kind]
         if kind == "fitted":
             kinds_to_clear.append("matched")
+        elif kind == "matched":
+            kinds_to_clear.append("fitted")
 
         self._detach_silx_tree()
         try:
@@ -268,6 +478,97 @@ class MainWindow(QMainWindow):
         self._load_entry_into_viewer(entry, preserve_view=True)
         self.pipeline_panel.append_log(
             f"Cleared {kind} peaks ({removed_total} rows total) on {entry}"
+        )
+
+    def _refresh_reset_menu_state(self) -> None:
+        """Gate Reset submenu actions on session + frame availability.
+
+        Active-frame is greyed out with a single frame loaded since the
+        clear would be identical to Active-entry. Active-entry / All
+        entries need only an open session.
+        """
+        has_session = self.session is not None and self._pipe_thread is None
+        n_frames = getattr(self.viewer, "n_frames", 0) if has_session else 0
+        self.action_reset_entry.setEnabled(has_session)
+        self.action_reset_all.setEnabled(has_session)
+        self.action_reset_frame.setEnabled(has_session and n_frames > 1)
+
+    def _action_reset_analysis(self, scope: str) -> None:
+        """Wipe det + fit + match (and manual peaks) at the requested scope.
+
+        ``scope`` is one of:
+        - ``"entry"`` — active entry, every frame in it.
+        - ``"all"``   — every entry in the active file, every frame.
+        - ``"frame"`` — active entry, just the active frame.
+
+        Manual peaks are session-wide and live in memory only; every
+        scope clears them outright since the user asked for a true reset.
+        """
+        if self.session is None or self._pipe_thread is not None:
+            return
+        active_entry = self.entry_combo.currentText()
+        if scope in ("entry", "frame") and not active_entry:
+            return
+        if scope == "frame" and getattr(self.viewer, "n_frames", 0) <= 1:
+            return
+
+        # Build the scope-specific list of (entry, frame|None) tuples
+        # the inner h5 wipe loop iterates over.
+        if scope == "all":
+            try:
+                targets = [(e, None) for e in file_model.list_entries(self.session.temp_path)]
+            except Exception as exc:
+                QMessageBox.critical(self, "Reset failed", f"Could not list entries: {exc}")
+                return
+            scope_label = f"all {len(targets)} entries"
+        elif scope == "entry":
+            targets = [(active_entry, None)]
+            scope_label = f"entry {active_entry}"
+        else:  # frame
+            frame_idx = int(self.viewer.current_frame)
+            targets = [(active_entry, frame_idx)]
+            scope_label = f"frame {frame_idx} of {active_entry}"
+
+        reply = QMessageBox.question(
+            self,
+            "Reset analysis",
+            f"Remove every detected, fitted, matched, and manual peak "
+            f"on {scope_label}?\n\nThis cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # Manual peaks are global session state — drop them once,
+        # regardless of scope.
+        self.viewer.clear_all_manual_peaks()
+
+        self._detach_silx_tree()
+        try:
+            removed_total = 0
+            for entry, frame in targets:
+                for kind in ("detected", "fitted", "matched"):
+                    removed_total += file_model.clear_peaks(
+                        self.session.temp_path, entry, kind, frame=frame
+                    )
+        except Exception as exc:
+            QMessageBox.critical(self, "Reset failed", str(exc))
+            self._reattach_silx_tree()
+            return
+        self._reattach_silx_tree()
+
+        self.session.mark_dirty()
+        self._update_title()
+        self.viewer.clear_history()
+        self.viewer.clear_selection()
+        # Refresh the displayed entry — the cleared one if the user
+        # was looking at it, otherwise the currently-active one.
+        if active_entry:
+            self._load_entry_into_viewer(active_entry, preserve_view=True)
+        self.pipeline_panel.append_log(
+            f"Reset analysis: cleared {removed_total} peak rows on {scope_label} "
+            f"(plus all manual peaks)"
         )
 
     def _action_export_png(self) -> None:
@@ -303,18 +604,97 @@ class MainWindow(QMainWindow):
         # Confirm visually so the user knows where the file landed.
         self.statusBar().showMessage(f"Wrote {path}", 5000)
 
+    def _action_export_csv(self) -> None:
+        """Pop the kind/scope dialog and write peaks to a CSV.
+
+        NeXus-only — raw sessions don't have peak datasets. The actual
+        flatten + write lives in ``file_model.export_peaks_csv`` /
+        ``export_matched_csv``; the GUI's job here is dialog wiring,
+        scope resolution, and the silx detach/reattach that frees the
+        file's HDF5 handle for r-mode reads.
+        """
+        if self.session is None or self.session.kind != "nexus":
+            QMessageBox.information(
+                self, "Export peaks",
+                "Open a NeXus file first — raw files have no peak datasets.",
+            )
+            return
+        active_entry = self.entry_combo.currentText()
+        if not active_entry:
+            QMessageBox.information(
+                self, "Export peaks", "No active entry to export from."
+            )
+            return
+        n_frames = getattr(self.viewer, "n_frames", 0)
+        dlg = _ExportPeaksDialog(self, has_multiple_frames=n_frames > 1)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        kind = dlg.selected_kind()
+        scope = dlg.selected_scope()
+
+        # Suggest a filename rooted at the original-file basename so
+        # batched exports from multiple opens don't collide on disk.
+        base = self.session.original_path.stem
+        suggest = f"{base}_{kind}_{scope}.csv"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export peaks as CSV", suggest,
+            "CSV (*.csv);;All files (*)",
+        )
+        if not path:
+            return
+
+        # Resolve the scope into an (entry, frame|None) target list
+        # consumed by the file_model exporters.
+        if scope == "all":
+            try:
+                entries = file_model.list_entries(self.session.temp_path)
+            except Exception as exc:
+                QMessageBox.critical(self, "Export failed", f"Could not list entries: {exc}")
+                return
+            targets: list[tuple[str, int | None]] = [(e, None) for e in entries]
+        elif scope == "entry":
+            targets = [(active_entry, None)]
+        else:
+            targets = [(active_entry, int(self.viewer.current_frame))]
+
+        # silx may hold a read handle on the temp file; detach so h5py
+        # can open it without contention.
+        self._detach_silx_tree()
+        try:
+            if kind == "matched":
+                n = file_model.export_matched_csv(
+                    self.session.temp_path, targets, Path(path)
+                )
+            else:
+                n = file_model.export_peaks_csv(
+                    self.session.temp_path, targets, kind, Path(path)
+                )
+        except Exception as exc:
+            QMessageBox.critical(self, "Export failed", str(exc))
+            self._reattach_silx_tree()
+            return
+        self._reattach_silx_tree()
+
+        self.statusBar().showMessage(
+            f"Wrote {n} {kind} peak rows ({scope}) to {path}", 6000
+        )
+        self.pipeline_panel.append_log(
+            f"Exported {n} {kind} peak rows ({scope}) to {path}"
+        )
+
     def _confirm_clear(self, kind: str) -> bool:
         descriptions = {
-            "manual":   ("manual peaks (in-memory)",
-                         "every manual peak in this session"),
             "detected": ("detected peaks",
                          "every row of detected_peaks for the active entry"),
             "fitted":   ("fitted + matched peaks",
                          "every row of fitted_peaks AND every matched_* "
                          "solution for the active entry "
                          "(matched references fitted, so it has to go too)"),
-            "matched":  ("matched peaks",
-                         "every matched_* solution for the active entry"),
+            "matched":  ("matched and fitted peaks",
+                         "every matched_* solution AND every row of "
+                         "fitted_peaks for the active entry "
+                         "(matched references fitted, so the cascade goes "
+                         "both ways here — see the Tools menu)"),
         }
         title, body = descriptions.get(kind, (kind, kind))
         reply = QMessageBox.question(
@@ -343,6 +723,18 @@ class MainWindow(QMainWindow):
             self._profile_dock,
         ):
             view_menu.addAction(dock.toggleViewAction())
+        view_menu.addSeparator()
+        # Toggle for the cursor-readout segment of the status bar — some
+        # users find the per-pixel readout distracting; on by default.
+        self.action_toggle_cursor_readout = QAction(
+            "Show cursor readout", self
+        )
+        self.action_toggle_cursor_readout.setCheckable(True)
+        self.action_toggle_cursor_readout.setChecked(True)
+        self.action_toggle_cursor_readout.toggled.connect(
+            self._set_cursor_readout_visible
+        )
+        view_menu.addAction(self.action_toggle_cursor_readout)
 
     def _action_undo(self) -> None:
         # Covers manual add/remove, manual geom edits, and detected/fitted
@@ -357,19 +749,25 @@ class MainWindow(QMainWindow):
 
     def _build_file_menu(self, file_menu) -> None:
 
-        self.action_open = QAction("Open &NeXus…", self)
+        # Single Open action — file content is auto-classified as
+        # NeXus or raw inside ``_action_open`` so users don't have to
+        # pick the right entry point. Raw files are bundled into one
+        # ``RawSession`` in the same way the old "Open raw" action did.
+        self.action_open = QAction("&Open…", self)
         self.action_open.setShortcut(QKeySequence.StandardKey.Open)
         self.action_open.triggered.connect(self._action_open)
         file_menu.addAction(self.action_open)
 
-        # Distinct entry point for raw detector data: routes through pygid
-        # conversion before the rest of the pipeline becomes usable. The
-        # two flows are kept separate by design — auto-detecting raw vs
-        # converted from file content is brittle.
-        self.action_open_raw = QAction("Open &raw data…", self)
-        self.action_open_raw.setShortcut(QKeySequence("Ctrl+Shift+O"))
-        self.action_open_raw.triggered.connect(self._action_open_raw)
-        file_menu.addAction(self.action_open_raw)
+        # Recent-files submenu — populated lazily on aboutToShow so the
+        # missing-file filter stays accurate across sessions.
+        self._recent_menu = file_menu.addMenu("Open &recent")
+        self._recent_menu.setToolTipsVisible(True)
+        self._recent_menu.aboutToShow.connect(self._refresh_recent_files_menu)
+        # Build once now so the menu shows real entries on first open
+        # (aboutToShow only fires when the user actually opens the
+        # submenu — but the parent File menu's expansion looks better
+        # if the count is right from the start).
+        self._refresh_recent_files_menu()
 
         self.action_save = QAction("&Save", self)
         self.action_save.setShortcut(QKeySequence.StandardKey.Save)
@@ -393,11 +791,150 @@ class MainWindow(QMainWindow):
         action_exit.triggered.connect(self.close)
         file_menu.addAction(action_exit)
 
+    # -- Recent files (QSettings-backed) --
+
+    _RECENT_FILES_KEY = "recentFiles"
+    _MAX_RECENT_FILES = 10
+
+    def _load_recent_files(self) -> list[dict]:
+        """Return the persisted recent-files list as a list of dicts.
+
+        Each entry is ``{"type": "nexus"|"raw", "path": str}``. The
+        list is stored as a JSON string in QSettings to keep the
+        serialization explicit and robust across PySide/Qt platforms
+        (raw QStringList round-tripping has bitten us before).
+        """
+        settings = QSettings()
+        blob = settings.value(self._RECENT_FILES_KEY, "[]")
+        if not isinstance(blob, str):
+            return []
+        try:
+            data = json.loads(blob)
+        except Exception:
+            return []
+        if not isinstance(data, list):
+            return []
+        return [
+            d for d in data
+            if isinstance(d, dict)
+            and d.get("type") in ("nexus", "raw")
+            and isinstance(d.get("path"), str)
+        ]
+
+    def _save_recent_files(self, items: list[dict]) -> None:
+        QSettings().setValue(self._RECENT_FILES_KEY, json.dumps(items))
+
+    def _add_recent_file(self, path: str | Path, kind: str) -> None:
+        """Push ``path`` onto the front of the recent list.
+
+        Move-to-front semantics: if ``path`` is already in the list it
+        gets bubbled up to the top instead of duplicated. The list is
+        capped at ``_MAX_RECENT_FILES``.
+        """
+        if kind not in ("nexus", "raw"):
+            return
+        path_str = str(path)
+        items = self._load_recent_files()
+        items = [i for i in items if i.get("path") != path_str]
+        items.insert(0, {"type": kind, "path": path_str})
+        items = items[: self._MAX_RECENT_FILES]
+        self._save_recent_files(items)
+        self._refresh_recent_files_menu()
+
+    def _refresh_recent_files_menu(self) -> None:
+        """Rebuild the submenu, dropping entries whose files have moved."""
+        self._recent_menu.clear()
+        items = self._load_recent_files()
+        # Filter to existing files and rewrite the persisted list
+        # if any are missing — keeps the user from being surprised
+        # by stale entries reappearing the next session.
+        present = [i for i in items if Path(i["path"]).exists()]
+        if len(present) != len(items):
+            self._save_recent_files(present)
+        if not present:
+            empty = QAction("(no recent files)", self)
+            empty.setEnabled(False)
+            self._recent_menu.addAction(empty)
+            return
+        for entry in present:
+            path = entry["path"]
+            kind = entry["type"]
+            basename = Path(path).name
+            # NeXus rows show plain basename; raw rows get a "[raw] "
+            # prefix so the two are distinguishable without an icon.
+            label = basename if kind == "nexus" else f"[raw]  {basename}"
+            action = QAction(label, self)
+            # Tooltip shows the full path so the user can disambiguate
+            # files with the same basename living in different folders.
+            action.setToolTip(path)
+            action.triggered.connect(
+                lambda checked=False, p=path, k=kind: self._open_recent(p, k)
+            )
+            self._recent_menu.addAction(action)
+        self._recent_menu.addSeparator()
+        clear_action = QAction("Clear recent files", self)
+        clear_action.triggered.connect(self._clear_recent_files)
+        self._recent_menu.addAction(clear_action)
+
+    def _clear_recent_files(self) -> None:
+        self._save_recent_files([])
+        self._refresh_recent_files_menu()
+
+    def _open_recent(self, path: str, kind: str) -> None:
+        """Open a file from the Recent-files submenu.
+
+        Routes by recorded ``kind`` (``"nexus"`` or ``"raw"``) so we
+        don't depend on extension sniffing. Drops the entry from the
+        list if the file has gone missing since it was recorded.
+        """
+        p = Path(path)
+        if not p.exists():
+            QMessageBox.warning(
+                self,
+                "Recent files",
+                f"File no longer exists:\n{path}\n\n"
+                "Removing from the recent list.",
+            )
+            items = [i for i in self._load_recent_files() if i.get("path") != path]
+            self._save_recent_files(items)
+            self._refresh_recent_files_menu()
+            return
+        if kind == "nexus":
+            self._open_queue.append(p)
+            self._process_open_queue()
+            return
+        # Raw mode — synchronous open through RawSession; same shape
+        # as the unified _open_paths raw branch but without the
+        # classification step (kind was recorded with the recent
+        # entry, so we already know).
+        try:
+            session = RawSession.open([p])
+        except Exception as exc:
+            QMessageBox.critical(self, "Open failed", str(exc))
+            return
+        model = self.tree.findHdf5TreeModel()
+        for raw_path in session.raw_paths:
+            model.insertFile(str(raw_path))
+        self._sessions.append(session)
+        self._set_active_session(session)
+        self._refresh_tree_raw_paths()
+
     def _build_central(self) -> None:
         self.viewer = GIWAXSImageViewer(self)
         self.data_viewer = DataViewerFrame(self)
 
         self.tabs = QTabWidget(self)
+        # documentMode flattens the tab-pane border so the image fills
+        # the full tab area without the small inset that lets pyqtgraph
+        # show a few pixels of scrollable margin.
+        self.tabs.setDocumentMode(True)
+        # documentMode is partial under qdarkstyle — the pane keeps a
+        # small border + padding from the dark stylesheet which traps
+        # ~2 px of overflow from the central widget. Override via an
+        # explicit zero-pad stylesheet so the viewer fills flush.
+        self.tabs.setStyleSheet(
+            "QTabWidget::pane { border: 0px; padding: 0px; margin: 0px; }"
+        )
         self.tabs.addTab(self.viewer, "Image")
         self.tabs.addTab(self.data_viewer, "Data")
         self.setCentralWidget(self.tabs)
@@ -412,8 +949,9 @@ class MainWindow(QMainWindow):
             Qt.Corner.BottomRightCorner, Qt.DockWidgetArea.RightDockWidgetArea
         )
 
-        # Left: HDF5 tree (silx)
-        self.tree = Hdf5TreeView(self)
+        # Left: HDF5 tree (silx) — subclass swaps the root icon for raw
+        # sessions so NeXus and raw files are distinguishable at a glance.
+        self.tree = _MlgidHdf5TreeView(self)
         self.tree.setSortingEnabled(True)
         # Single-click silently updates Data tab; double-click jumps to it.
         self.tree.selectionModel().selectionChanged.connect(
@@ -700,44 +1238,107 @@ class MainWindow(QMainWindow):
     # -- Actions --
 
     def _action_open(self) -> None:
-        # Multi-select supported: every selected file is added to the file
-        # browser of THIS window (no new windows are spawned). Opens run
-        # serially through one CopyWorker thread — extra paths queue up.
-        paths, _ = QFileDialog.getOpenFileNames(
-            self, "Open NeXus file(s)", "", NEXUS_FILTER
-        )
-        if not paths:
-            return
-        self._open_queue.extend(Path(p) for p in paths)
-        self._process_open_queue()
+        """Unified open: pick HDF5 files and auto-classify each as NeXus or raw.
 
-    def _action_open_raw(self) -> None:
-        """Open one or more raw HDF5 detector files for conversion.
-
-        All selected files are bundled into a single ``RawSession`` so the
-        Conversion panel can apply one shared config to the whole batch.
-        Inputs are read-only — pygid only reads them — so no temp copy is
-        made and the open is synchronous (no CopyWorker needed).
+        Multi-select is supported. Each picked file is classified by
+        content (not extension) inside ``_open_paths`` — NeXus files
+        stream through the per-file copy worker queue, raw files are
+        bundled into a single shared ``RawSession`` matching the old
+        Open-raw bulk behaviour. Files that match neither classifier
+        are reported in the log and skipped.
         """
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "Open raw HDF5 file(s)", "", RAW_FILTER
+            self, "Open file(s)", "", OPEN_FILTER
         )
         if not paths:
             return
+        self._open_paths([Path(p) for p in paths])
+
+    def _classify_h5_path(self, path: Path) -> str | None:
+        """Return ``"nexus"``, ``"raw"``, or ``None`` from file content.
+
+        NeXus is detected by the presence of at least one entry whose
+        ``data`` group has ``signal == "img_gid_q"`` (the same filter
+        used everywhere else in the GUI). Raw detection falls back to
+        any 3D detector-shaped dataset. Both readers swallow their
+        exceptions so a non-HDF5 file or a permissions error returns
+        ``None`` rather than crashing the open.
+        """
         try:
-            session = RawSession.open([Path(p) for p in paths])
-        except Exception as exc:
-            QMessageBox.critical(self, "Open failed", str(exc))
-            return
-        # Insert each raw file into the silx tree as a read-only entry so
-        # the user can browse the HDF5 structure before configuring the
-        # conversion. The tree model accepts the same insertFile() call
-        # that ``_on_open_finished`` uses for converted files.
+            if file_model.list_entries(path):
+                return "nexus"
+        except Exception:
+            pass
+        try:
+            if file_model.list_raw_entries(path):
+                return "raw"
+        except Exception:
+            pass
+        return None
+
+    def _open_paths(self, paths: list[Path]) -> None:
+        """Open a mixed batch of NeXus + raw files, auto-classifying each.
+
+        Used by both the unified File → Open action and the drag-and-drop
+        handler. NeXus paths queue through the existing copy worker;
+        raw paths are bundled into one ``RawSession`` so the Conversion
+        panel can apply one config to the whole batch.
+        """
+        nexus_paths: list[Path] = []
+        raw_paths: list[Path] = []
+        rejected: list[Path] = []
+        for p in paths:
+            if not p.is_file():
+                rejected.append(p)
+                continue
+            kind = self._classify_h5_path(p)
+            if kind == "nexus":
+                nexus_paths.append(p)
+            elif kind == "raw":
+                raw_paths.append(p)
+            else:
+                rejected.append(p)
+        if rejected:
+            self.pipeline_panel.append_log(
+                "Could not classify (no q-signal entries, no raw 3D "
+                "detector datasets): "
+                + ", ".join(str(p) for p in rejected)
+            )
+        if nexus_paths:
+            self._open_queue.extend(nexus_paths)
+            self._process_open_queue()
+        if raw_paths:
+            try:
+                session = RawSession.open(raw_paths)
+            except Exception as exc:
+                QMessageBox.critical(self, "Open failed", str(exc))
+                return
+            model = self.tree.findHdf5TreeModel()
+            for raw_path in session.raw_paths:
+                model.insertFile(str(raw_path))
+            self._sessions.append(session)
+            self._set_active_session(session)
+            for raw_path in session.raw_paths:
+                self._add_recent_file(raw_path, "raw")
+            self._refresh_tree_raw_paths()
+
+    def _refresh_tree_raw_paths(self) -> None:
+        """Push the active set of raw filesystem paths into the tree model.
+
+        Called whenever the session list changes so the file browser's
+        custom raw-icon stays accurate. NeXus sessions don't need to be
+        listed — anything the model hasn't been told about as raw
+        renders with the default NeXus icon.
+        """
         model = self.tree.findHdf5TreeModel()
-        for raw_path in session.raw_paths:
-            model.insertFile(str(raw_path))
-        self._sessions.append(session)
-        self._set_active_session(session)
+        if not isinstance(model, _MlgidHdf5TreeModel):
+            return
+        raw_paths: set[str] = set()
+        for s in self._sessions:
+            if s.kind == "raw" and isinstance(s, RawSession):
+                for p in s.raw_paths:
+                    raw_paths.add(str(p))
+        model.set_raw_paths(raw_paths)
 
     def _process_open_queue(self) -> None:
         """Kick off the next queued open if no copy is in flight.
@@ -822,6 +1423,9 @@ class MainWindow(QMainWindow):
         self._detach_silx_tree()
         self._reattach_silx_tree()
         self._update_title()
+        # The user just wrote a new file at ``path``; surface it in the
+        # recent menu so it's reopenable from the next session.
+        self._add_recent_file(path, "nexus")
 
     def _action_close_file(self) -> None:
         """Close just the currently-active file. Other files stay open."""
@@ -904,6 +1508,10 @@ class MainWindow(QMainWindow):
             # Newly-opened file becomes the active one — the user almost
             # always wants to inspect what they just opened.
             self._set_active_session(session)
+            # Remember the original (not the temp) so the recent menu
+            # reopens the file at its real location next session.
+            self._add_recent_file(session.original_path, "nexus")
+            self._refresh_tree_raw_paths()
 
         # Keep draining the queue regardless of this open's outcome so a
         # single bad file in a batch doesn't strand the rest.
@@ -933,6 +1541,8 @@ class MainWindow(QMainWindow):
             self._active_session = None
         session.close()
         self._reattach_silx_tree()
+        # Closed session may have been raw — rebuild the tree's raw set.
+        self._refresh_tree_raw_paths()
         if was_active:
             new_active = self._sessions[-1] if self._sessions else None
             if new_active is not None:
@@ -977,6 +1587,12 @@ class MainWindow(QMainWindow):
         self._apply_session_mode(session)
         self._update_title()
         self._update_actions()
+        # Status bar reflects the active session's entry / frame; the
+        # entry change handler will fire shortly when the entry combo
+        # repopulates, but pushing the file label now keeps the bar
+        # consistent with the title bar even before that fires.
+        self._update_status_entry()
+        self._update_status_frame()
 
     def _apply_session_mode(self, session: BaseSession | None) -> None:
         """Toggle dock visibility + viewer affordances for the session kind.
@@ -1009,7 +1625,6 @@ class MainWindow(QMainWindow):
         self.viewer.set_mode_radios_visible(not is_raw)
         # Tools > Clear peaks submenu has nothing to clear in raw mode.
         for action in (
-            getattr(self, "action_clear_manual", None),
             getattr(self, "action_clear_detected", None),
             getattr(self, "action_clear_fitted", None),
             getattr(self, "action_clear_matched", None),
@@ -1054,7 +1669,9 @@ class MainWindow(QMainWindow):
 
         NeXus sessions contribute one file (the temp working copy); raw
         sessions contribute every selected raw input so the user can keep
-        browsing all of them while configuring conversion.
+        browsing all of them while configuring conversion. The custom
+        per-file icon set is repushed afterwards because clear() emptied
+        the model.
         """
         model = self.tree.findHdf5TreeModel()
         for s in self._sessions:
@@ -1063,6 +1680,7 @@ class MainWindow(QMainWindow):
                     model.insertFile(str(raw_path))
             else:
                 model.insertFile(str(s.temp_path))
+        self._refresh_tree_raw_paths()
 
     # -- Entry / viewer wiring --
 
@@ -1212,6 +1830,8 @@ class MainWindow(QMainWindow):
             self._load_raw_entry_into_viewer(entry)
         else:
             self._load_entry_into_viewer(entry)
+        self._update_status_entry()
+        self._update_status_frame()
 
     def _on_frame_slider_changed(self, value: int) -> None:
         """User dragged the Display-dock slider — push to the viewer.
@@ -1228,13 +1848,13 @@ class MainWindow(QMainWindow):
         re-emitting valueChanged back into the viewer.
         """
         self.frame_label.setText(self._frame_label_text(frame))
-        if self.frame_slider.value() == frame:
-            return
-        self.frame_slider.blockSignals(True)
-        try:
-            self.frame_slider.setValue(int(frame))
-        finally:
-            self.frame_slider.blockSignals(False)
+        if self.frame_slider.value() != frame:
+            self.frame_slider.blockSignals(True)
+            try:
+                self.frame_slider.setValue(int(frame))
+            finally:
+                self.frame_slider.blockSignals(False)
+        self._update_status_frame()
 
     def _refresh_frame_slider(self) -> None:
         """Match the slider's range + value to the active stack's
@@ -1283,8 +1903,33 @@ class MainWindow(QMainWindow):
             return "Frame —"
         return f"Frame {int(idx)} / {n - 1}"
 
+    def _safe_selected_h5_nodes(self) -> list:
+        """Return ``selectedH5Nodes`` results, swallowing silx model errors.
+
+        Under certain races (mid-pipeline detach/reattach, freshly
+        inserted file with not-yet-resolved h5py state), silx's tree
+        model can raise on attribute lookup deep inside the proxy
+        chain. Qt then re-fires the call, producing a stack-busting
+        recursion that brings down the click handler. We catch
+        anything from that path here so a single bad click can't
+        wedge the GUI.
+        """
+        try:
+            return list(self.tree.selectedH5Nodes())
+        except (RecursionError, RuntimeError, KeyError, OSError) as exc:
+            self.pipeline_panel.append_log(
+                f"WARN — silx tree query failed ({type(exc).__name__}); "
+                "rebuilding the file browser"
+            )
+            # Drastic but reliable: tear the tree down and rebuild it
+            # from the live session list. Any orphan / half-loaded
+            # silx items get dropped in the process.
+            self._detach_silx_tree()
+            self._reattach_silx_tree()
+            return []
+
     def _on_tree_selection_changed(self, *_: object) -> None:
-        nodes = list(self.tree.selectedH5Nodes())
+        nodes = self._safe_selected_h5_nodes()
         if not nodes:
             return
         node = nodes[0]
@@ -1300,7 +1945,7 @@ class MainWindow(QMainWindow):
         self._activate_entry_for_node(node)
 
     def _on_tree_activated(self, *_: object) -> None:
-        nodes = list(self.tree.selectedH5Nodes())
+        nodes = self._safe_selected_h5_nodes()
         if not nodes:
             return
         node = nodes[0]
@@ -1708,6 +2353,7 @@ class MainWindow(QMainWindow):
         self.pipeline_panel.set_running(True)
         self.parameter_panel.set_busy(True)
         self.viewer.set_busy(True)
+        self._update_status_pipeline(command, running=True)
         # Any pipeline op that reshuffles peak ids (everything except
         # add_peak, which only appends) invalidates pending FileGeomActions.
         # add_peak is handled by commit_manual_peak's targeted scrub.
@@ -1870,6 +2516,7 @@ class MainWindow(QMainWindow):
         self.pipeline_panel.set_running(False)
         self.parameter_panel.set_busy(False)
         self.viewer.set_busy(False)
+        self._update_status_pipeline(running=False)
         self._reattach_silx_tree()
         if self.session is not None:
             entry = self.entry_combo.currentText()
@@ -2216,11 +2863,109 @@ class MainWindow(QMainWindow):
     def _update_title(self) -> None:
         if self.session is None:
             self.setWindowTitle(APP_NAME)
+            self._update_status_file()
             return
         marker = "*" if self.session.dirty else ""
         self.setWindowTitle(
             f"{self.session.original_path.name}{marker} — {APP_NAME}"
         )
+        self._update_status_file()
+
+    def _build_status_bar(self) -> None:
+        """Permanent status-bar widgets: file / entry / frame / pipeline + cursor.
+
+        Each label lives in the status bar's permanent-widget slot so
+        Qt's transient ``showMessage`` calls (PNG / CSV export confirmations)
+        still render correctly alongside them — Qt clears the transient
+        message after its timeout but leaves the permanent labels alone.
+        """
+        sb = self.statusBar()
+        self._sb_file = QLabel("no file")
+        self._sb_entry = QLabel("")
+        self._sb_frame = QLabel("")
+        self._sb_pipeline = QLabel("idle")
+        self._sb_cursor = QLabel("")
+        for w in (self._sb_file, self._sb_entry, self._sb_frame,
+                  self._sb_pipeline, self._sb_cursor):
+            # Light separation so the eye can scan the row.
+            w.setStyleSheet("padding: 0 8px; border-left: 1px solid #444;")
+            sb.addPermanentWidget(w)
+        # The cursor readout is the chattiest widget; let it stretch
+        # so values don't truncate, others stay tight.
+        self._sb_cursor.setMinimumWidth(360)
+        self.viewer.cursorMoved.connect(self._on_status_cursor_moved)
+        self._status_cursor_visible = True
+
+    def _update_status_file(self) -> None:
+        if self.session is None:
+            self._sb_file.setText("no file")
+            return
+        marker = "*" if self.session.dirty else ""
+        self._sb_file.setText(
+            f"{self.session.original_path.name}{marker}"
+        )
+
+    def _update_status_entry(self) -> None:
+        entry = self.entry_combo.currentText() if hasattr(self, "entry_combo") else ""
+        self._sb_entry.setText(entry or "")
+
+    def _update_status_frame(self) -> None:
+        n = getattr(self.viewer, "n_frames", 0)
+        if n <= 0:
+            self._sb_frame.setText("")
+            return
+        cur = int(getattr(self.viewer, "current_frame", 0))
+        # Frames are 0-indexed everywhere else in the GUI (peak rows,
+        # NeXus group keys), so the denominator is the max index
+        # ``n - 1``, not the count. 17-frame stack → "frame 16 / 16"
+        # at the end. Single-frame entries elide the "/ total" since
+        # there's no navigation possible.
+        if n == 1:
+            self._sb_frame.setText(f"frame {cur}")
+        else:
+            self._sb_frame.setText(f"frame {cur} / {n - 1}")
+
+    def _update_status_pipeline(self, command=None, *, running: bool) -> None:
+        if not running:
+            self._sb_pipeline.setText("idle")
+            return
+        if command is None:
+            self._sb_pipeline.setText("running…")
+            return
+        op = command.op_name if hasattr(command, "op_name") else str(command)
+        entry = command.kwargs.get("entry") if hasattr(command, "kwargs") else None
+        self._sb_pipeline.setText(
+            f"running: {op} on {entry}" if entry else f"running: {op}"
+        )
+
+    def _on_status_cursor_moved(self, info) -> None:
+        if not self._status_cursor_visible:
+            self._sb_cursor.setText("")
+            return
+        if not info:
+            self._sb_cursor.setText("")
+            return
+        mode = info.get("mode")
+        inten = info.get("intensity", float("nan"))
+        inten_str = "—" if inten != inten else f"{inten:.3g}"  # NaN check
+        if mode == "pixel":
+            self._sb_cursor.setText(
+                f"row={info['row']}, col={info['col']}, I={inten_str}"
+            )
+        elif mode == "cartesian":
+            self._sb_cursor.setText(
+                f"q_xy={info['q_xy']:.3f}, q_z={info['q_z']:.3f}, I={inten_str}"
+            )
+        elif mode == "polar":
+            self._sb_cursor.setText(
+                f"r={info['r']:.3f}, θ={info['theta']:.1f}°, I={inten_str}"
+            )
+        else:
+            self._sb_cursor.setText("")
+
+    def _set_cursor_readout_visible(self, visible: bool) -> None:
+        self._status_cursor_visible = bool(visible)
+        self._sb_cursor.setVisible(self._status_cursor_visible)
 
     def _update_actions(self) -> None:
         has_session = self.session is not None
@@ -2230,6 +2975,47 @@ class MainWindow(QMainWindow):
         self.action_save.setEnabled(is_nexus)
         self.action_save_as.setEnabled(is_nexus)
         self.action_close_file.setEnabled(has_session)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        """Accept drops carrying local file URLs.
+
+        Acceptance is loose at enter time — content classification
+        happens in ``dropEvent`` so the cursor reflects "yes you can
+        drop" while the user drags over the window. Non-file payloads
+        (text, internal Qt drags) are ignored.
+        """
+        mime = event.mimeData()
+        if mime.hasUrls() and any(u.isLocalFile() for u in mime.urls()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event: QDragEnterEvent) -> None:
+        # Same gate as dragEnter — Qt fires move events repeatedly while
+        # the drag is in flight and the proposed-action state has to
+        # stay accepted across them or the drop won't fire.
+        mime = event.mimeData()
+        if mime.hasUrls() and any(u.isLocalFile() for u in mime.urls()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        """Open every dropped file via the unified _open_paths classifier."""
+        urls = event.mimeData().urls()
+        paths: list[Path] = []
+        for u in urls:
+            if not u.isLocalFile():
+                continue
+            local = u.toLocalFile()
+            if not local:
+                continue
+            paths.append(Path(local))
+        if not paths:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self._open_paths(paths)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         # Each loaded file may have unsaved changes — prompt per dirty
