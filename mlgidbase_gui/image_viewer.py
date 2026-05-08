@@ -257,6 +257,33 @@ class ManualGeomAction:
 
 
 @dataclass
+class ManualReplaceAction:
+    """Atomic swap of the single manual peak on a frame.
+
+    With the new "at most one manual box per frame" policy, drawing a
+    new box replaces any existing one. We model that as a single undo
+    entry (instead of separate add + remove entries) so a single
+    Ctrl+Z rewinds the whole replace cleanly. ``old_peak`` may be None
+    when the user drew the very first manual peak on this frame —
+    redo then just adds the new one without removing anything.
+    """
+
+    frame: int
+    old_peak: ManualPeak | None
+    new_peak: ManualPeak
+
+    def undo(self, viewer: "GIWAXSImageViewer") -> None:
+        viewer._undoable_remove_manual(self.frame, self.new_peak)
+        if self.old_peak is not None:
+            viewer._undoable_add_manual(self.frame, self.old_peak)
+
+    def redo(self, viewer: "GIWAXSImageViewer") -> None:
+        if self.old_peak is not None:
+            viewer._undoable_remove_manual(self.frame, self.old_peak)
+        viewer._undoable_add_manual(self.frame, self.new_peak)
+
+
+@dataclass
 class FileGeomAction:
     frame: int
     kind: str  # "detected" | "fitted"
@@ -416,11 +443,18 @@ class _PeakShapeItem(pg.GraphicsObject):
         self._path = QPainterPath()
         self._bounding = QRectF()
 
-    def set_polar(self, peaks: PeakTable | None) -> None:
+    def set_polar(
+        self,
+        peaks: PeakTable | None,
+        extent: tuple[float, float] | None = None,
+    ) -> None:
         path = QPainterPath()
         if peaks is not None and len(peaks) > 0:
             for i in range(len(peaks)):
-                clip = _clip_angle(float(peaks.angle[i]), float(peaks.angle_width[i]))
+                clip = _clip_angle(
+                    float(peaks.angle[i]), float(peaks.angle_width[i]),
+                    extent=extent,
+                )
                 if clip is None:
                     continue
                 a_lo, a_hi = clip
@@ -429,11 +463,18 @@ class _PeakShapeItem(pg.GraphicsObject):
                 path.addRect(QRectF(r - dr / 2, a_lo, dr, a_hi - a_lo))
         self._update_path(path)
 
-    def set_cartesian(self, peaks: PeakTable | None) -> None:
+    def set_cartesian(
+        self,
+        peaks: PeakTable | None,
+        extent: tuple[float, float] | None = None,
+    ) -> None:
         path = QPainterPath()
         if peaks is not None and len(peaks) > 0:
             for i in range(len(peaks)):
-                clip = _clip_angle(float(peaks.angle[i]), float(peaks.angle_width[i]))
+                clip = _clip_angle(
+                    float(peaks.angle[i]), float(peaks.angle_width[i]),
+                    extent=extent,
+                )
                 if clip is None:
                     continue
                 a_lo, a_hi = clip
@@ -484,20 +525,36 @@ def _polar_table_row_contains(table: PeakTable, i: int, x: float, y: float) -> b
     return r_lo <= x <= r_hi and a_lo <= y <= a_hi
 
 
-def _clip_angle(a_deg: float, da_deg: float) -> tuple[float, float] | None:
+def _clip_angle(
+    a_deg: float,
+    da_deg: float,
+    extent: tuple[float, float] | None = None,
+) -> tuple[float, float] | None:
     """Clip a polar angular box to the viewer's visible range.
 
     Treats infinite or non-finite angle_width as 'spans the whole quadrant',
     so rings (whose angle_width is sometimes inf) still draw correctly.
+    ``extent`` is the actual displayed angular axis of the active polar
+    stack — pass it so ring overlays stop at the image edge instead of
+    extending to the global ``[-180°, 180°]`` clipping bounds. When
+    ``extent`` is None the global bounds are used as a fallback (raw-
+    mode renders, unit tests).
+
     Returns (lo, hi) in degrees, or None if the box is empty/invalid.
     """
+    if extent is None:
+        ext_lo, ext_hi = ANGLE_MIN_DEG, ANGLE_MAX_DEG
+    else:
+        ext_lo, ext_hi = float(extent[0]), float(extent[1])
+        if ext_hi < ext_lo:
+            ext_lo, ext_hi = ext_hi, ext_lo
     if not np.isfinite(a_deg) or not np.isfinite(da_deg):
-        a_lo, a_hi = ANGLE_MIN_DEG, ANGLE_MAX_DEG
+        a_lo, a_hi = ext_lo, ext_hi
     else:
         a_lo = a_deg - da_deg / 2.0
         a_hi = a_deg + da_deg / 2.0
-    a_lo = max(a_lo, ANGLE_MIN_DEG)
-    a_hi = min(a_hi, ANGLE_MAX_DEG)
+    a_lo = max(a_lo, ext_lo)
+    a_hi = min(a_hi, ext_hi)
     if a_hi <= a_lo:
         return None
     return a_lo, a_hi
@@ -1000,6 +1057,70 @@ class GIWAXSImageViewer(QWidget):
         self._undoable_remove_manual(frame, peak)
         self._push_undo(ManualRemoveAction(frame=frame, peak=peak))
 
+    def angular_extent(self) -> tuple[float, float] | None:
+        """Return ``(angle_min_deg, angle_max_deg)`` for the active polar
+        stack. Used by the host to size ring-mode expansions to the
+        actual displayed angular range — converted files vary
+        (``[0, 90]`` for the upper-right quadrant; ``[-180, 180]`` for
+        full-quadrant data). Returns None when no polar stack is
+        currently rendered (raw mode, no file open).
+        """
+        if self._polar_cache is None:
+            return None
+        _, _, angle = self._polar_cache
+        if angle.size == 0:
+            return None
+        return float(angle[0]), float(angle[-1])
+
+    def set_manual_geometry(
+        self,
+        peak: ManualPeak,
+        radius: float,
+        angle: float,
+        radius_width: float,
+        angle_width: float,
+        is_ring: bool,
+    ) -> None:
+        """Mutate every geometry field on ``peak`` (including ``is_ring``)
+        and trigger the standard refresh path. Skips the undo stack —
+        this is for transient state changes driven by UI toggles
+        (e.g. the ring checkbox), not user-initiated edits that should
+        be reversible via Ctrl+Z. The host stashes its own pre-state
+        when it needs to revert.
+
+        Mirrors `_apply_manual_geom` but adds `is_ring` so we can flip
+        the ring/segment kind in lockstep with the angular sweep.
+        """
+        peak.radius = radius
+        peak.angle = angle
+        peak.radius_width = radius_width
+        peak.angle_width = angle_width
+        peak.is_ring = is_ring
+        if (
+            self._selected is not None
+            and self._selected.kind == "manual"
+            and self._selected.manual_ref is peak
+        ):
+            self._selected.radius = radius
+            self._selected.angle = angle
+            self._selected.radius_width = radius_width
+            self._selected.angle_width = angle_width
+            self._selected.is_ring = is_ring
+            self._sync_roi_geometry()
+        # Find the frame this peak lives on so the overlay refreshes
+        # against the right bucket.
+        for fr, peaks in self._manual_peaks.items():
+            if peak in peaks:
+                if fr == self.current_frame:
+                    self._render_overlays(fr)
+                break
+        if (
+            self._selected is not None
+            and self._selected.kind == "manual"
+            and self._selected.manual_ref is peak
+        ):
+            self.peakGeometryChanged.emit(self._selected)
+
     def commit_manual_peak(self, frame: int, peak: ManualPeak) -> None:
         """Drop a manual peak that has been persisted to the NeXus file.
 
@@ -1174,13 +1295,23 @@ class GIWAXSImageViewer(QWidget):
         self._redo_stack.clear()
 
     def _undoable_add_manual(self, frame: int, peak: ManualPeak) -> None:
-        """Insert a manual peak without touching the undo stack."""
+        """Insert a manual peak without touching the undo stack.
+
+        Single-box policy invariant: whenever a manual peak is on
+        screen it is also the active selection. This applies to every
+        add path — the user-draw flow already auto-selected before;
+        now undo of a remove (which restores the manual box) and redo
+        of an add do too. Skipped when the peak is added on a non-
+        current frame because the user can't see / interact with it.
+        """
         bucket = self._manual_peaks.setdefault(frame, [])
         if peak not in bucket:
             bucket.append(peak)
         if frame == self.current_frame:
             self._render_overlays(frame)
         self.manualPeakAdded.emit(frame, peak)
+        if frame == self.current_frame:
+            self._set_selected(SelectedPeak.from_manual(peak, frame))
 
     def _undoable_remove_manual(self, frame: int, peak: ManualPeak) -> None:
         """Remove a manual peak without touching the undo stack."""
@@ -1567,28 +1698,33 @@ class GIWAXSImageViewer(QWidget):
                     )
                 ])
 
+        # Live angular extent of the displayed polar stack so ring
+        # overlays (and any segment whose stored angle_width spills
+        # past the image bounds) clip to the data instead of the
+        # global ±180° fallback.
+        extent = self.angular_extent()
         if self._mode == MODE_POLAR:
-            self._detected.set_polar(det)
-            self._fitted.set_polar(fit)
-            self._manual.set_polar(manual_table)
+            self._detected.set_polar(det, extent=extent)
+            self._fitted.set_polar(fit, extent=extent)
+            self._manual.set_polar(manual_table, extent=extent)
             if sel_table is not None:
-                self._selection.set_polar(sel_table)
+                self._selection.set_polar(sel_table, extent=extent)
             else:
                 self._selection.clear_path()
             if preview_table is not None:
-                self._fitted_preview.set_polar(preview_table)
+                self._fitted_preview.set_polar(preview_table, extent=extent)
             else:
                 self._fitted_preview.clear_path()
         else:
-            self._detected.set_cartesian(det)
-            self._fitted.set_cartesian(fit)
-            self._manual.set_cartesian(manual_table)
+            self._detected.set_cartesian(det, extent=extent)
+            self._fitted.set_cartesian(fit, extent=extent)
+            self._manual.set_cartesian(manual_table, extent=extent)
             if sel_table is not None:
-                self._selection.set_cartesian(sel_table)
+                self._selection.set_cartesian(sel_table, extent=extent)
             else:
                 self._selection.clear_path()
             if preview_table is not None:
-                self._fitted_preview.set_cartesian(preview_table)
+                self._fitted_preview.set_cartesian(preview_table, extent=extent)
             else:
                 self._fitted_preview.clear_path()
 
@@ -1608,13 +1744,14 @@ class GIWAXSImageViewer(QWidget):
         structures = self._matched_per_frame.get(frame, [])
         if not structures:
             return
+        extent = self.angular_extent()
         vb = self._plot.getViewBox()
         for i, s in enumerate(structures):
             item = _PeakShapeItem(**matched_pen_for(i))
             if self._mode == MODE_POLAR:
-                item.set_polar(s.peaks)
+                item.set_polar(s.peaks, extent=extent)
             else:
-                item.set_cartesian(s.peaks)
+                item.set_cartesian(s.peaks, extent=extent)
             item.setVisible(self._is_matched_item_visible(s.unique_id))
             vb.addItem(item, ignoreBounds=True)
             self._matched_items.append((s.unique_id, item))
@@ -1688,9 +1825,20 @@ class GIWAXSImageViewer(QWidget):
             temp_id=self._next_manual_id,
         )
         self._next_manual_id -= 1
-        self.add_manual_peak(self.current_frame, peak)
-        # Auto-select the freshly drawn peak so the user can adjust edges.
-        self._set_selected(SelectedPeak.from_manual(peak, self.current_frame))
+        # Single-manual-box policy: any pre-existing manual peak on this
+        # frame is replaced atomically. Modelled as one undo entry so
+        # Ctrl+Z rewinds the whole swap rather than two staged steps.
+        frame = self.current_frame
+        existing = self._manual_peaks.get(frame, [])
+        old_peak = existing[0] if existing else None
+        if old_peak is not None:
+            self._undoable_remove_manual(frame, old_peak)
+        # _undoable_add_manual auto-selects on the current frame, so no
+        # explicit selection call is needed here.
+        self._undoable_add_manual(frame, peak)
+        self._push_undo(
+            ManualReplaceAction(frame=frame, old_peak=old_peak, new_peak=peak)
+        )
 
     def _on_select_at(self, pos: QPointF) -> None:
         if self._mode != MODE_POLAR or self._busy:
@@ -1792,6 +1940,20 @@ class GIWAXSImageViewer(QWidget):
                 # File-resident peaks go through MainWindow → mlgidbase
                 # delete_peak (cascading + with confirmation).
                 self.deletePeakRequested.emit(sel)
+            ev.accept()
+            return
+        # Esc on a selected manual peak removes it. Manual boxes are an
+        # in-memory scratchpad — no file write, no confirmation.
+        # File-resident selections fall through (Esc is meaningless for
+        # them; Delete is the documented binding).
+        if (
+            ev.key() == Qt.Key.Key_Escape
+            and self._selected is not None
+            and self._selected.kind == "manual"
+            and self._selected.manual_ref is not None
+            and not self._busy
+        ):
+            self.remove_manual_peak(self.current_frame, self._selected.manual_ref)
             ev.accept()
             return
         super().keyPressEvent(ev)

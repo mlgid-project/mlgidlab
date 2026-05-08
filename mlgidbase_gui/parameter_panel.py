@@ -58,24 +58,26 @@ class ParameterPanel(QGroupBox):
         outer.addWidget(form_widget)
 
         self._source_label = self._make_value_label()
-        # Color swatch shown alongside the source row only for matched
-        # selections — color matches the matched-overlay palette so the
-        # user can map the readout back to the box on screen at a glance.
-        self._source_swatch = QLabel()
-        self._source_swatch.setFixedSize(14, 14)
-        self._source_swatch.setVisible(False)
-        self._source_row = QWidget()
-        _src_h = QHBoxLayout(self._source_row)
-        _src_h.setContentsMargins(0, 0, 0, 0)
-        _src_h.setSpacing(6)
-        _src_h.addWidget(self._source_label, 1)
-        _src_h.addWidget(self._source_swatch)
         self._radius_label = self._make_value_label()
         self._radius_width_label = self._make_value_label()
         self._angle_label = self._make_value_label()
         self._angle_width_label = self._make_value_label()
         self._type_label = self._make_value_label()
         self._id_label = self._make_value_label()
+        # Color swatch shown next to the ID for matched selections —
+        # matches the matched-overlay palette so the user can map the
+        # readout back to the box on screen at a glance. Lives on the
+        # ID row (not Source) because the structure ID is what the
+        # colour identifies.
+        self._source_swatch = QLabel()
+        self._source_swatch.setFixedSize(14, 14)
+        self._source_swatch.setVisible(False)
+        self._id_row = QWidget()
+        _id_h = QHBoxLayout(self._id_row)
+        _id_h.setContentsMargins(0, 0, 0, 0)
+        _id_h.setSpacing(6)
+        _id_h.addWidget(self._id_label, 1)
+        _id_h.addWidget(self._source_swatch)
         # Fit-derived rows. Populated from the profile viewer's last 1D
         # Gaussian fits (manual peaks: real refit; non-manual: synthetic
         # Gaussian honoring the FWHM_r / 2·FWHM_a box convention).
@@ -87,20 +89,36 @@ class ParameterPanel(QGroupBox):
 
         # Source / Type / ID describe the peak itself and apply to every
         # kind, so they sit above the kind-specific Detected/Fitted blocks.
-        form.addRow("Source:", self._source_row)
+        form.addRow("Source:", self._source_label)
         form.addRow("Type:", self._type_label)
-        form.addRow("ID:", self._id_label)
-        form.addRow(self._make_section_label("Detected peak"))
+        form.addRow("ID:", self._id_row)
+        # Track row indices for the section blocks so set_peak can hide
+        # the irrelevant section wholesale (header + 4-5 value rows).
+        # Only the section the peak's kind actually populates stays
+        # visible; the other is removed from the layout flow rather
+        # than just blanked.
+        self._detected_section_label = self._make_section_label("Detected peak")
+        form.addRow(self._detected_section_label)
+        self._row_detected_header = form.rowCount() - 1
         form.addRow("Radius:", self._radius_label)
         form.addRow("Δ radius:", self._radius_width_label)
         form.addRow("Angle:", self._angle_label)
         form.addRow("Δ angle:", self._angle_width_label)
-        form.addRow(self._make_section_label("Fitted peak"))
+        self._detected_rows = list(range(
+            self._row_detected_header, form.rowCount()
+        ))
+        self._fitted_section_label = self._make_section_label("Fitted peak")
+        form.addRow(self._fitted_section_label)
+        self._row_fitted_header = form.rowCount() - 1
         form.addRow("Center r:", self._fit_radius_label)
         form.addRow("FWHM r:", self._fit_fwhm_r_label)
         form.addRow("Center a:", self._fit_angle_label)
         form.addRow("FWHM a:", self._fit_fwhm_a_label)
         form.addRow("Amplitude:", self._fit_amp_label)
+        self._fitted_rows = list(range(
+            self._row_fitted_header, form.rowCount()
+        ))
+        self._form = form
 
         self._mlgidbase_available = is_mlgidbase_available()
 
@@ -197,6 +215,13 @@ class ParameterPanel(QGroupBox):
             ):
                 lbl.setText(EMPTY)
             self._source_swatch.setVisible(False)
+            # No selection → collapse both kind-specific sections so
+            # the panel doesn't show stale section headers above empty
+            # rows.
+            for r in self._detected_rows:
+                self._form.setRowVisible(r, False)
+            for r in self._fitted_rows:
+                self._form.setRowVisible(r, False)
             return
         source = _SOURCE_LABEL.get(peak.kind, peak.kind.capitalize())
         if peak.kind == "matched":
@@ -223,23 +248,29 @@ class ParameterPanel(QGroupBox):
         # Ring/segment toggle is sticky across selection changes (set by
         # the user, reset only by Add-to-fitted) — see chk_save_as_ring.
 
+        # Show only the section(s) relevant to this peak's kind:
+        #   manual           → Detected + Fitted (user is choosing what to commit)
+        #   detected         → Detected only
+        #   fitted / matched → Fitted only
         show_detected = peak.kind in ("manual", "detected")
+        show_fitted = peak.kind in ("manual", "fitted", "matched")
+        for r in self._detected_rows:
+            self._form.setRowVisible(r, show_detected)
+        for r in self._fitted_rows:
+            self._form.setRowVisible(r, show_fitted)
+
         if show_detected:
             self._radius_label.setText(f"{peak.radius:.3f} Å⁻¹")
             self._radius_width_label.setText(f"{peak.radius_width:.3f} Å⁻¹")
             self._angle_label.setText(f"{peak.angle:.2f}°")
             self._angle_width_label.setText(f"{peak.angle_width:.2f}°")
-        else:
-            for lbl in (
-                self._radius_label, self._radius_width_label,
-                self._angle_label, self._angle_width_label,
-            ):
-                lbl.setText(EMPTY)
+        # Detected rows are hidden when ``show_detected`` is False, so
+        # we don't blank them — set_fits / next show will refresh.
 
         # If the new selection has no Fitted section, blank those rows
-        # immediately so a stale value from the previous selection doesn't
-        # linger until set_fits fires.
-        if peak.kind == "detected":
+        # so a stale value from the previous selection can't linger if
+        # the section is later re-shown without set_fits running.
+        if not show_fitted:
             for lbl in (
                 self._fit_radius_label, self._fit_fwhm_r_label,
                 self._fit_angle_label, self._fit_fwhm_a_label,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread
+from PySide6.QtCore import Qt, QSignalBlocker, QThread
 from PySide6.QtGui import QAction, QCloseEvent, QColor, QFont, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -117,6 +117,18 @@ class MainWindow(QMainWindow):
         self._conv_thread: QThread | None = None
         self._conv_worker: ConversionWorker | None = None
         self._conv_progress: QProgressDialog | None = None
+
+        # Stash of the manual peak's geometry captured the moment the
+        # "Save fitted as ring" toggle goes ON. Set to a tuple of
+        # (peak_ref, radius, angle, radius_width, angle_width, is_ring)
+        # while ring is active; cleared on the toggle's OFF transition
+        # after the box has been restored. Allows the auto-uncheck
+        # that follows a successful Add-to-fitted to revert the box
+        # to its pre-ring shape without the host needing to track a
+        # commit/cancel distinction.
+        self._ring_pre_geom: tuple[
+            ManualPeak, float, float, float, float, bool
+        ] | None = None
 
         self.setWindowTitle(APP_NAME)
         self.resize(1400, 900)
@@ -454,11 +466,16 @@ class MainWindow(QMainWindow):
         self._set_frame_slider_visible(False)
 
         layout.addWidget(QLabel("Overlays"))
+        # Manual peaks intentionally omitted: the GUI now keeps at most
+        # one manual box per frame (drawn → replaced → committed via
+        # Add-to-fitted/detected, removed via Esc / Delete), so a
+        # visibility toggle for "all manual peaks" no longer has work
+        # to do. The viewer's internal _visibility["manual"] stays True
+        # by default — see GIWAXSImageViewer.__init__.
         self._overlay_checks: dict[str, QCheckBox] = {}
         for kind, label in (
             ("detected", "Detected peaks"),
             ("fitted", "Fitted peaks"),
-            ("manual", "Manual peaks"),
         ):
             row = QHBoxLayout()
             row.setContentsMargins(0, 0, 0, 0)
@@ -488,9 +505,12 @@ class MainWindow(QMainWindow):
         matched_master_row.addSpacing(_make_pen_swatch(OVERLAY_STYLE["detected"]).width() + 4)
         self._matched_master_check = QCheckBox("Matched peaks")
         self._matched_master_check.setChecked(True)
-        self._matched_master_check.toggled.connect(
-            self.viewer.set_matched_master_visible
-        )
+        self._matched_master_check.toggled.connect(self._on_matched_master_toggled)
+        # Per-structure checkboxes are rebuilt in _refresh_matched_panel
+        # but kept indexed here so the master-toggle cascade and the
+        # "single structure on while master off" promotion path can
+        # reach them by uid.
+        self._matched_struct_checkboxes: dict[str, QCheckBox] = {}
         matched_master_row.addWidget(self._matched_master_check)
         matched_master_row.addStretch(1)
         matched_master_widget = QWidget()
@@ -668,6 +688,14 @@ class MainWindow(QMainWindow):
         self.viewer.peakRowWriteRequested.connect(self._on_peak_row_write_requested)
         # Delete keypress on file-resident peaks.
         self.viewer.deletePeakRequested.connect(self._on_delete_peak_requested)
+
+        # Keep _ring_pre_geom in sync with the manual peak it points at.
+        # When the user replaces the box (single-box policy) while ring
+        # is active, the new box also needs ring expansion; when the
+        # box is removed (Esc / Delete / Add-to-detected), the stash
+        # goes stale and must be invalidated.
+        self.viewer.manualPeakRemoved.connect(self._on_manual_peak_removed)
+        self.viewer.manualPeakAdded.connect(self._on_manual_peak_added)
 
     # -- Actions --
 
@@ -1438,16 +1466,136 @@ class MainWindow(QMainWindow):
         )
 
     def _on_save_as_ring_changed(self, is_ring: bool) -> None:
-        """Toggle between segment / ring preview without waiting for the
-        next profile recompute. Also tells the profile viewer to skip the
-        angular Gaussian fit while ring is active — that fit wouldn't be
-        saved by Add-to-fitted in ring mode.
+        """Toggle between segment / ring preview.
+
+        Three coordinated effects:
+
+        1. The profile viewer skips the angular Gaussian fit while ring
+           is active — that fit wouldn't be saved by Add-to-fitted.
+        2. If a manual peak is selected, its angular sweep is widened
+           to span the full polar plot height (so the radial profile
+           integrates over the entire angular axis, matching what the
+           ring fit will eventually represent). The pre-ring geometry
+           is stashed so unticking the box — including the auto-uncheck
+           that fires after Add-to-fitted commits — restores the box.
+        3. The fitted-preview is recomputed against the new fit cache.
         """
+        sel = self.viewer.selected_peak
+        manual_ref = (
+            sel.manual_ref if sel is not None and sel.kind == "manual" else None
+        )
+
+        if is_ring and manual_ref is not None:
+            # Stash pre-ring geometry once. If the user ticks → unticks
+            # → re-ticks without committing, we keep the original stash
+            # so the eventual restore returns to the very first state,
+            # not the intermediate ring state.
+            if self._ring_pre_geom is None:
+                self._ring_pre_geom = (
+                    manual_ref,
+                    manual_ref.radius,
+                    manual_ref.angle,
+                    manual_ref.radius_width,
+                    manual_ref.angle_width,
+                    manual_ref.is_ring,
+                )
+            extent = self.viewer.angular_extent()
+            if extent is not None:
+                a_lo, a_hi = extent
+                ring_angle = 0.5 * (a_lo + a_hi)
+                ring_width = abs(a_hi - a_lo)
+                self.viewer.set_manual_geometry(
+                    manual_ref,
+                    radius=manual_ref.radius,
+                    angle=ring_angle,
+                    radius_width=manual_ref.radius_width,
+                    angle_width=ring_width,
+                    is_ring=True,
+                )
+        elif not is_ring and self._ring_pre_geom is not None:
+            (
+                stashed_peak,
+                pre_r,
+                pre_a,
+                pre_dr,
+                pre_da,
+                pre_is_ring,
+            ) = self._ring_pre_geom
+            self._ring_pre_geom = None
+            # Only restore if the stashed peak still exists — the user
+            # may have drawn a replacement (which removes the original
+            # via the single-box policy) while ring was active. In that
+            # case the new peak inherited the ring geometry but has no
+            # captured pre-state, so leave it alone.
+            for peaks in self.viewer._manual_peaks.values():
+                if stashed_peak in peaks:
+                    self.viewer.set_manual_geometry(
+                        stashed_peak,
+                        radius=pre_r,
+                        angle=pre_a,
+                        radius_width=pre_dr,
+                        angle_width=pre_da,
+                        is_ring=pre_is_ring,
+                    )
+                    break
+
         # Drop the angular fit *before* recomputing the preview so the
         # cached afit is None when _update_fitted_preview reads it.
         self.profile_viewer.set_skip_angular_fit(is_ring)
         fits = self.profile_viewer.last_fit_params()
         self._update_fitted_preview(fits.get("radial"), fits.get("angular"))
+
+    def _on_manual_peak_added(self, _frame: int, peak: ManualPeak) -> None:
+        """Apply the active ring expansion to a freshly added manual peak.
+
+        When the user draws a new manual box while the ring checkbox is
+        on, the single-box-replace removes the old (with its ring stash)
+        and adds the new one. Without this slot, the new box would stay
+        as drawn — confusing because the checkbox is still ticked. We
+        mirror what ``_on_save_as_ring_changed(True)`` would do for the
+        new peak: stash its pre-ring shape, then expand to the full
+        angular sweep.
+        """
+        if not self.parameter_panel.save_as_ring():
+            return
+        # Stash pre-ring state for the new peak. Any earlier stash
+        # already pointed at a peak that's been removed (which our
+        # manualPeakRemoved slot has already cleared).
+        self._ring_pre_geom = (
+            peak,
+            peak.radius,
+            peak.angle,
+            peak.radius_width,
+            peak.angle_width,
+            peak.is_ring,
+        )
+        extent = self.viewer.angular_extent()
+        if extent is None:
+            return
+        a_lo, a_hi = extent
+        self.viewer.set_manual_geometry(
+            peak,
+            radius=peak.radius,
+            angle=0.5 * (a_lo + a_hi),
+            radius_width=peak.radius_width,
+            angle_width=abs(a_hi - a_lo),
+            is_ring=True,
+        )
+
+    def _on_manual_peak_removed(self, _frame: int, peak: ManualPeak) -> None:
+        """Invalidate ``_ring_pre_geom`` when the peak it references goes away.
+
+        Without this, an Esc / Delete / Add-to-detected on a ring-
+        expanded peak would leave a dangling stash; later unticking
+        the ring checkbox would walk the manual list looking for that
+        ghost and find nothing, but the stash stays set and could
+        mis-fire on a later toggle cycle.
+        """
+        if (
+            self._ring_pre_geom is not None
+            and self._ring_pre_geom[0] is peak
+        ):
+            self._ring_pre_geom = None
 
     # -- Pipeline --
 
@@ -1991,6 +2139,7 @@ class MainWindow(QMainWindow):
             if w is not None:
                 w.deleteLater()
         self._matched_empty_label = None
+        self._matched_struct_checkboxes.clear()
 
         if not structures:
             self._matched_empty_label = QLabel("<i>No matched solutions for this frame.</i>")
@@ -2012,13 +2161,57 @@ class MainWindow(QMainWindow):
             chk = QCheckBox(s.label)
             chk.setChecked(self.viewer.matched_visibility(_frame, s.unique_id))
             chk.toggled.connect(
-                lambda v, uid=s.unique_id: self.viewer.set_matched_structure_visible(uid, v)
+                lambda v, uid=s.unique_id: self._on_matched_structure_toggled(uid, v)
             )
             row.addWidget(chk)
             row.addStretch(1)
             row_widget = QWidget()
             row_widget.setLayout(row)
             self._matched_struct_layout.addWidget(row_widget)
+            self._matched_struct_checkboxes[s.unique_id] = chk
+
+    def _on_matched_master_toggled(self, checked: bool) -> None:
+        """Master toggles cascade to every per-structure row.
+
+        Unchecking the master now also unchecks every structure
+        checkbox; checking it back rechecks them all. The viewer's
+        own master flag is updated either way so its hit-test gating
+        stays in sync. Per-checkbox ``setChecked`` calls are blocked
+        from re-emitting ``toggled`` so the structure-toggled slot
+        doesn't interpret the cascade as a user-driven single-show.
+        """
+        self.viewer.set_matched_master_visible(checked)
+        for uid, chk in self._matched_struct_checkboxes.items():
+            with QSignalBlocker(chk):
+                chk.setChecked(checked)
+            self.viewer.set_matched_structure_visible(uid, checked)
+
+    def _on_matched_structure_toggled(self, uid: str, checked: bool) -> None:
+        """Per-structure toggle. Promotes a ``check while master is off``
+        click into a "show only this one" view: every other structure is
+        unchecked, the master is auto-ticked (without re-cascading), and
+        only the freshly-checked structure ends up visible.
+        """
+        self.viewer.set_matched_structure_visible(uid, checked)
+        if not checked:
+            return
+        if self._matched_master_check.isChecked():
+            return
+        # Master was off → user wants to see this single structure.
+        # Force the others off (both UI + viewer state) before flipping
+        # the master ON, since the master toggle would otherwise
+        # cascade and re-show every structure.
+        for other_uid, chk in self._matched_struct_checkboxes.items():
+            if other_uid == uid:
+                continue
+            with QSignalBlocker(chk):
+                chk.setChecked(False)
+            self.viewer.set_matched_structure_visible(other_uid, False)
+        with QSignalBlocker(self._matched_master_check):
+            self._matched_master_check.setChecked(True)
+        # blockSignals suppressed _on_matched_master_toggled, so call
+        # the viewer's master flag directly.
+        self.viewer.set_matched_master_visible(True)
 
     def _update_title(self) -> None:
         if self.session is None:

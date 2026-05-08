@@ -18,6 +18,7 @@ from typing import Callable
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSpinBox,
     QToolButton,
@@ -391,6 +393,32 @@ class PipelinePanel(QWidget):
         self.match_frame_scope.addItems([FRAME_ALL, FRAME_ACTIVE])
         form.addRow("Frames:", self.match_frame_scope)
 
+        # Mutually-exclusive radio buttons in a single QButtonGroup —
+        # one sits at the start of each input row, so the user picks
+        # the active source by ticking the radio next to the field
+        # they want to use. The unticked row's widgets are greyed out
+        # to remove any ambiguity about which value Run-Matching
+        # consumes.
+        self.rb_cif_source = QRadioButton()
+        self.rb_pickle_source = QRadioButton()
+        self.rb_cif_source.setToolTip(
+            "Use the raw CIF input below as the matching source."
+        )
+        self.rb_pickle_source.setToolTip(
+            "Use the pickle file below as the matching source."
+        )
+        self._source_group = QButtonGroup(self)
+        self._source_group.setExclusive(True)
+        self._source_group.addButton(self.rb_cif_source)
+        self._source_group.addButton(self.rb_pickle_source)
+        self.rb_cif_source.setChecked(True)
+        # Either toggled signal fires for both buttons in an exclusive
+        # group, so we get one update per user click. ``buttonToggled``
+        # gives us the QAbstractButton + new state.
+        self._source_group.buttonToggled.connect(
+            lambda *_: self._on_match_source_changed()
+        )
+
         self.cif_path = QLineEdit()
         self.cif_path.setPlaceholderText("Raw .cif file(s) or folder…")
         self.cif_path.setToolTip(
@@ -399,22 +427,22 @@ class PipelinePanel(QWidget):
             "  • one or more raw .cif files (semicolon-separated)\n"
             "  • a folder containing .cif files\n\n"
             "ExpParameters are auto-derived from the active NeXus file's "
-            "instrument metadata.\n"
-            "For preprocessed pickle input, use the Pickle input below."
+            "instrument metadata."
         )
-        cif_browse = QPushButton("Browse…")
-        cif_browse.clicked.connect(self._browse_cif)
-        cif_browse_dir = QPushButton("Folder…")
-        cif_browse_dir.setToolTip(
+        self._cif_browse_btn = QPushButton("Browse…")
+        self._cif_browse_btn.clicked.connect(self._browse_cif)
+        self._cif_browse_dir_btn = QPushButton("Folder…")
+        self._cif_browse_dir_btn.setToolTip(
             "Pick a directory; every .cif inside is used."
         )
-        cif_browse_dir.clicked.connect(self._browse_cif_dir)
+        self._cif_browse_dir_btn.clicked.connect(self._browse_cif_dir)
         cif_row = QWidget()
         cif_h = QHBoxLayout(cif_row)
         cif_h.setContentsMargins(0, 0, 0, 0)
+        cif_h.addWidget(self.rb_cif_source)
         cif_h.addWidget(self.cif_path, 1)
-        cif_h.addWidget(cif_browse)
-        cif_h.addWidget(cif_browse_dir)
+        cif_h.addWidget(self._cif_browse_btn)
+        cif_h.addWidget(self._cif_browse_dir_btn)
         form.addRow("CIF input:", cif_row)
 
         # Parse button + cache-state label. CIF preprocessing simulates
@@ -452,19 +480,20 @@ class PipelinePanel(QWidget):
         )
         self.pickle_path.setToolTip(
             "Path to a preprocessed CifPattern pickle. Forwarded as "
-            "``cif_prepr`` to mlgidBASE.run_matching when set; takes "
-            "priority over the CIF input above."
+            "``cif_prepr`` to mlgidBASE.run_matching when ``Source`` "
+            "above is set to ``Pickle file``."
         )
-        pickle_browse = QPushButton("Browse…")
-        pickle_browse.clicked.connect(self._browse_pickle)
-        pickle_clear = QPushButton("Clear")
-        pickle_clear.clicked.connect(lambda: self.pickle_path.setText(""))
+        self._pickle_browse_btn = QPushButton("Browse…")
+        self._pickle_browse_btn.clicked.connect(self._browse_pickle)
+        self._pickle_clear_btn = QPushButton("Clear")
+        self._pickle_clear_btn.clicked.connect(lambda: self.pickle_path.setText(""))
         pickle_row = QWidget()
         pickle_h = QHBoxLayout(pickle_row)
         pickle_h.setContentsMargins(0, 0, 0, 0)
+        pickle_h.addWidget(self.rb_pickle_source)
         pickle_h.addWidget(self.pickle_path, 1)
-        pickle_h.addWidget(pickle_browse)
-        pickle_h.addWidget(pickle_clear)
+        pickle_h.addWidget(self._pickle_browse_btn)
+        pickle_h.addWidget(self._pickle_clear_btn)
         form.addRow("Pickle input:", pickle_row)
 
         self.peaks_type = QComboBox()
@@ -503,19 +532,60 @@ class PipelinePanel(QWidget):
         self.btn_match = QPushButton("Run matching")
         self.btn_match.setEnabled(False)
         self.btn_match.clicked.connect(self._on_run_matching)
-        # Gate run button on either input being set — matching can't
-        # proceed without a CIF or pickle source.
+        # Gate run button on the active source having text — matching
+        # can't proceed without an input value.
         self.cif_path.textChanged.connect(self._update_match_enabled)
         self.pickle_path.textChanged.connect(self._update_match_enabled)
         section.body_layout.addWidget(self.btn_match)
+        # Apply the initial enabled / disabled state now that all
+        # widgets exist; running the slot earlier would crash because
+        # btn_match isn't built until this line.
+        self._on_match_source_changed()
         return section
 
     def _update_match_enabled(self) -> None:
-        has_input = (
-            bool(self.cif_path.text().strip())
-            or bool(self.pickle_path.text().strip())
-        )
+        # Run is gated only on the *selected* source having a value;
+        # text in the inactive row is irrelevant.
+        if self._use_pickle_source():
+            has_input = bool(self.pickle_path.text().strip())
+        else:
+            has_input = bool(self.cif_path.text().strip())
         self.btn_match.setEnabled(has_input)
+
+    def _use_pickle_source(self) -> bool:
+        return self.rb_pickle_source.isChecked()
+
+    def _on_match_source_changed(self, *_args) -> None:
+        """Enable only the input row matching the active source.
+
+        Greying the unused row out (instead of hiding it) keeps the
+        layout stable and lets the user see what's typed in the
+        inactive field — useful when alternating between sources.
+        Run-Matching gating is recomputed because the enabled-text
+        check now points at the other field.
+        """
+        use_pickle = self._use_pickle_source()
+        # CIF inputs + parse machinery are CIF-only.
+        for w in (
+            self.cif_path,
+            self._cif_browse_btn,
+            self._cif_browse_dir_btn,
+            self.btn_parse_cifs,
+            self.cif_cache_label,
+        ):
+            w.setEnabled(not use_pickle)
+        # Re-apply the parse button's text-based gating after the
+        # source flip so it doesn't sit enabled on an empty CIF field.
+        if not use_pickle:
+            self.btn_parse_cifs.setEnabled(bool(self.cif_path.text().strip()))
+        # Pickle widgets.
+        for w in (
+            self.pickle_path,
+            self._pickle_browse_btn,
+            self._pickle_clear_btn,
+        ):
+            w.setEnabled(use_pickle)
+        self._update_match_enabled()
 
     # -- Click handlers --
 
@@ -545,21 +615,26 @@ class PipelinePanel(QWidget):
         self.runRequested.emit(PipelineCommand("run_fitting", kwargs))
 
     def _on_run_matching(self) -> None:
-        pkl = self.pickle_path.text().strip()
-        cif = self.cif_path.text().strip()
-        if not pkl and not cif:
-            return
-        # Pickle path takes priority. mlgidBASE.run_matching's
+        # The Source selector decides which input is used; the inactive
+        # row is greyed out and its content ignored. mlgidBASE.run_matching's
         # ``load_cif_prepr`` accepts a path-to-pickle string verbatim, so
-        # we forward it untouched. Otherwise reuse the cached CifPattern
-        # when the user pre-parsed the input, else pass the string and
-        # let the worker translate raw .cif paths.
-        if pkl:
+        # the pickle path is forwarded untouched. For raw CIFs we reuse
+        # the cached CifPattern when the input hasn't changed since the
+        # last parse, otherwise we send the string and let the worker
+        # build the pattern.
+        if self._use_pickle_source():
+            pkl = self.pickle_path.text().strip()
+            if not pkl:
+                return
             cif_value: object = pkl
-        elif self._cached_cif_obj is not None and self._cached_cif_input == cif:
-            cif_value = self._cached_cif_obj
         else:
-            cif_value = cif
+            cif = self.cif_path.text().strip()
+            if not cif:
+                return
+            if self._cached_cif_obj is not None and self._cached_cif_input == cif:
+                cif_value = self._cached_cif_obj
+            else:
+                cif_value = cif
         kwargs: dict = {
             "cif_prepr": cif_value,
             "peaks_type": self.peaks_type.currentText(),

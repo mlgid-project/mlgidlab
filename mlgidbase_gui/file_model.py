@@ -103,10 +103,17 @@ def list_entry_signals(file_path: Path) -> dict[str, str | None]:
     Used by the host to diagnose files that load with no usable entries
     (the entry combo would otherwise look mysteriously empty when the
     file contains only 1D-cut entries or polar-only data).
+
+    Iteration uses the file's native ``f.keys()`` order — for files
+    created with ``track_order=True`` (recent pygid conversions, the
+    GUI's own appends) this is the original insertion order, so the
+    Entry combo lists scans in the order they were collected. Files
+    written without ``track_order`` fall back to HDF5's default
+    alphanumeric order, which matches the previous behaviour.
     """
     out: dict[str, str | None] = {}
     with h5py.File(file_path, "r") as f:
-        for name in sorted(f.keys()):
+        for name in f.keys():
             if not is_entry_group_name(name):
                 continue
             data = f.get(f"{name}/data")

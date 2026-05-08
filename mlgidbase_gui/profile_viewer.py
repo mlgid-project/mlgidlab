@@ -247,6 +247,18 @@ class ProfileViewer(QWidget):
             sel = peak
         r_range = _radial_fit_range(sel)
         a_range = _angular_fit_range(sel)
+        # Geometry changes can flip ``is_ring`` (via the Save-fitted-as-
+        # ring toggle) or the angular_width (via the 2D ROI), so the
+        # angular region's visibility has to be re-evaluated here.
+        # ``set_selected_peak`` only fires on selection *change*, which
+        # would otherwise leave the angular region painting the pre-
+        # ring borders even after the box is expanded to a full sweep.
+        # Radial visibility / movability depend only on selection kind,
+        # which doesn't change here.
+        is_ring_box = sel.is_ring or not np.isfinite(sel.angle_width)
+        show_regions = sel.kind in ("manual", "detected")
+        self._angular_region.setVisible(show_regions and not is_ring_box)
+
         self._radial_region.blockSignals(True)
         try:
             self._radial_region.setRegion(
@@ -266,6 +278,15 @@ class ProfileViewer(QWidget):
                 self._angular_region.blockSignals(False)
         # The integration window changed → recompute the slice profiles.
         self._recompute_curves()
+        # When the box moved via the 2D ROI (manual/detected drag), the
+        # region may now sit outside the profile's current X range.
+        # Pan/expand each plot so the borders stay visible — without
+        # this the user dragging the ROI past the visible profile
+        # window loses sight of the interval.
+        if self._radial_region.isVisible():
+            self._ensure_region_in_view(self._radial_plot, self._radial_region)
+        if a_range is not None and self._angular_region.isVisible():
+            self._ensure_region_in_view(self._angular_plot, self._angular_region)
 
     # -- Internals --
 
@@ -441,28 +462,47 @@ class ProfileViewer(QWidget):
     def _ensure_region_in_view(
         self, plot: pg.PlotWidget, region_item: pg.LinearRegionItem,
     ) -> None:
-        """Expand the plot's X range so the selection region is fully
-        visible with a small padding. Never shrinks the existing view —
-        if the user has zoomed out, that stays. Only widens when the
-        region's edges have moved outside the current viewport (e.g.
-        the user dragged an edge past the plot boundary while editing
-        a manual peak).
+        """Keep the selection region's borders inside the plot's X
+        range. Pans the view to follow the region when it has moved
+        outside the current window, expands when the region is wider
+        than the current view. Padding leaves a small gap so the
+        edges aren't flush with the plot boundary.
+
+        Called both on direct profile-region drags (manual peak edge
+        edits) and on programmatic syncs from the 2D ROI (manual /
+        detected peak moves) — the latter is what was previously
+        leaving the box stranded off-screen.
         """
         lo, hi = region_item.getRegion()
         lo, hi = float(lo), float(hi)
         if not (np.isfinite(lo) and np.isfinite(hi)):
             return
         span = max(abs(hi - lo), 1e-9)
-        # Pad keeps the region edges off the plot boundary so the
-        # user can still grab them.
         pad = 0.5 * span
         target_lo, target_hi = lo - pad, hi + pad
         vb = plot.getViewBox()
         cur_lo, cur_hi = vb.viewRange()[0]
-        new_lo = min(float(cur_lo), target_lo)
-        new_hi = max(float(cur_hi), target_hi)
-        if new_lo < cur_lo or new_hi > cur_hi:
-            plot.setXRange(new_lo, new_hi, padding=0)
+        cur_lo, cur_hi = float(cur_lo), float(cur_hi)
+        cur_width = cur_hi - cur_lo
+        target_width = target_hi - target_lo
+
+        if target_width > cur_width:
+            # Region is wider than the visible window — expand to fit
+            # without losing the existing centre point.
+            new_lo = min(cur_lo, target_lo)
+            new_hi = max(cur_hi, target_hi)
+        elif target_lo < cur_lo:
+            # Region's left edge fell off-screen → slide the view left
+            # by exactly the overshoot, keeping the original width.
+            shift = cur_lo - target_lo
+            new_lo, new_hi = cur_lo - shift, cur_hi - shift
+        elif target_hi > cur_hi:
+            # Region's right edge fell off-screen → slide the view right.
+            shift = target_hi - cur_hi
+            new_lo, new_hi = cur_lo + shift, cur_hi + shift
+        else:
+            return  # already fully visible
+        plot.setXRange(new_lo, new_hi, padding=0)
 
 
 def _radial_fit_range(peak: SelectedPeak) -> tuple[float, float] | None:
