@@ -10,8 +10,8 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QWidget
 
-from mlgidbase_gui.fit import GaussianFit, fit_gaussian_on_axis
-from mlgidbase_gui.image_viewer import (
+from mlgidlab.fit import GaussianFit, fit_gaussian_on_axis
+from mlgidlab.image_viewer import (
     OVERLAY_STYLE,
     ManualPeak,
     SelectedPeak,

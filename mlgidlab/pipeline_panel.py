@@ -37,7 +37,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from mlgidbase_gui.pipeline import PipelineCommand, is_mlgidbase_available
+from mlgidlab.pipeline import PipelineCommand, is_mlgidbase_available
 
 
 # Sentinels for the entry-scope and frame-scope dropdowns. The panel resolves

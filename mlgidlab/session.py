@@ -66,7 +66,7 @@ class NexusSession(BaseSession):
         if not original.is_file():
             raise FileNotFoundError(original)
 
-        temp_dir = Path(tempfile.mkdtemp(prefix="mlgidbase_gui_"))
+        temp_dir = Path(tempfile.mkdtemp(prefix="mlgidlab_"))
         temp_path = temp_dir / original.name
         try:
             shutil.copy2(original, temp_path)

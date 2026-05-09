@@ -6,7 +6,7 @@ scans through the matching pygid ``Conversion`` method. Output paths are
 returned so MainWindow can auto-open the freshly-converted file in NeXus
 mode.
 
-Group naming follows the NeXus convention the rest of mlgidBASE_GUI's
+Group naming follows the NeXus convention the rest of mlgidLAB's
 NeXus reader expects: ``entry_NNNN`` (zero-padded, four digits). Anything
 else gets filtered out by ``file_model.is_entry_group_name``.
 
@@ -19,7 +19,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from mlgidbase_gui.conversion_panel import (
+from mlgidlab.conversion_panel import (
     CONV_DET2POL,
     CONV_DET2POL_GID,
     CONV_DET2Q,
@@ -185,7 +185,7 @@ def execute(
 
 
 def _entry_group_name(index: int) -> str:
-    """Format an HDF5 entry-group name in mlgidBASE_GUI's NeXus shape.
+    """Format an HDF5 entry-group name in mlgidLAB's NeXus shape.
 
     The downstream reader (``file_model.is_entry_group_name``) accepts
     only ``entry`` and ``entry_*``. Every group we write must follow

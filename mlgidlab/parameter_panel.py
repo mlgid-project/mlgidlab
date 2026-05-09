@@ -21,9 +21,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from mlgidbase_gui.fit import GaussianFit
-from mlgidbase_gui.image_viewer import SelectedPeak
-from mlgidbase_gui.pipeline import is_mlgidbase_available
+from mlgidlab.fit import GaussianFit
+from mlgidlab.image_viewer import SelectedPeak
+from mlgidlab.pipeline import is_mlgidbase_available
 
 EMPTY = "—"
 

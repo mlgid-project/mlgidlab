@@ -1,4 +1,4 @@
-# mlgidBASE_GUI
+# mlgidLAB
 
 A desktop GUI for the [mlgidBASE](https://gitlab.com/mlgid/mlgidbase) GIWAXS
 analysis pipeline. Drives the full
@@ -18,7 +18,7 @@ images can be **converted to NeXus**, then **detected / fitted / matched**,
 
 2. **Launch:**
    ```bash
-   mlgidbase-gui
+   mlgidlab
    ```
 
 3. **Open files** with **File → Open…**, drag-and-drop onto the window,
@@ -238,7 +238,7 @@ so peaks outside the upper-right quadrant still render.
 ### Repository layout
 
 ```
-mlgidbase_gui/
+mlgidlab/
   main_window.py     QMainWindow: menus, docks, status bar,
                      session / pipeline / conversion plumbing,
                      drag-and-drop + recent-files
@@ -305,7 +305,7 @@ mode). Same pattern as `pipeline.py` for `mlgidbase`.
 
 ### Persistent settings
 
-- `QSettings` org `mlgidBASE_GUI`, app `mlgidBASE GUI`. Currently
+- `QSettings` org `mlgidLAB`, app `mlgidLAB`. Currently
   stores the recent-files list as a JSON string under key
   `recentFiles`.
 

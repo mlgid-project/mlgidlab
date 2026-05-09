@@ -5,14 +5,14 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 
-from mlgidbase_gui.conversion import execute as conversion_execute
-from mlgidbase_gui.conversion_panel import ConversionConfig, RawScan
-from mlgidbase_gui.pipeline import (
+from mlgidlab.conversion import execute as conversion_execute
+from mlgidlab.conversion_panel import ConversionConfig, RawScan
+from mlgidlab.pipeline import (
     PipelineCommand,
     execute,
     parse_cif_input,
 )
-from mlgidbase_gui.session import Session
+from mlgidlab.session import Session
 
 
 def _trigger_pipeline_imports() -> None:

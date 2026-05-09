@@ -171,7 +171,7 @@ def _backfill_fitted_peaks_polar_to_cartesian(
     import h5py
     import numpy as np
 
-    from mlgidbase_gui.file_model import is_entry_group_name
+    from mlgidlab.file_model import is_entry_group_name
 
     if entry is not None:
         entries = [entry]
@@ -264,7 +264,7 @@ def _dedupe_matched_groups(
     import h5py
     import numpy as np
 
-    from mlgidbase_gui.file_model import is_entry_group_name
+    from mlgidlab.file_model import is_entry_group_name
 
     prefix = f"matched_{peaks_type}_"
 
@@ -546,7 +546,7 @@ def _exp_params_from_nexus(
         import h5py
         import numpy as np
 
-        from mlgidbase_gui.file_model import is_entry_group_name
+        from mlgidlab.file_model import is_entry_group_name
 
         with h5py.File(nexus_file, "r") as f:
             if entry is not None and entry in f:

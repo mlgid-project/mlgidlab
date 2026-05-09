@@ -24,8 +24,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from mlgidbase_gui.file_model import EntryStack, MatchedStructure, PeakTable
-from mlgidbase_gui.polar import stack_to_polar
+from mlgidlab.file_model import EntryStack, MatchedStructure, PeakTable
+from mlgidlab.polar import stack_to_polar
 
 OVERLAY_KINDS = ("detected", "fitted", "manual")
 MODE_CARTESIAN = "cartesian"

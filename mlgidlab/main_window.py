@@ -44,8 +44,8 @@ from silx.gui.data.DataViewerFrame import DataViewerFrame
 from silx.gui.hdf5 import Hdf5TreeModel, Hdf5TreeView
 from silx.gui.hdf5.NexusSortFilterProxyModel import NexusSortFilterProxyModel
 
-from mlgidbase_gui import file_model
-from mlgidbase_gui.image_viewer import (
+from mlgidlab import file_model
+from mlgidlab.image_viewer import (
     GIWAXSImageViewer,
     MATCHED_STYLE,
     ManualPeak,
@@ -54,24 +54,24 @@ from mlgidbase_gui.image_viewer import (
     SelectedPeak,
     matched_pen_for,
 )
-from mlgidbase_gui.parameter_panel import ParameterPanel
-from mlgidbase_gui.pipeline import (
+from mlgidlab.parameter_panel import ParameterPanel
+from mlgidlab.pipeline import (
     PipelineCommand,
     add_peak_kwargs_for,
     is_mlgidbase_available,
 )
-from mlgidbase_gui.pipeline_panel import PipelinePanel
-from mlgidbase_gui.profile_viewer import ProfileViewer
-from mlgidbase_gui.conversion_panel import ConversionPanel
-from mlgidbase_gui.session import BaseSession, NexusSession, RawSession, Session
-from mlgidbase_gui.workers import (
+from mlgidlab.pipeline_panel import PipelinePanel
+from mlgidlab.profile_viewer import ProfileViewer
+from mlgidlab.conversion_panel import ConversionPanel
+from mlgidlab.session import BaseSession, NexusSession, RawSession, Session
+from mlgidlab.workers import (
     CifParseWorker,
     ConversionWorker,
     CopyWorker,
     PipelineWorker,
 )
 
-APP_NAME = "mlgidBASE GUI"
+APP_NAME = "mlgidLAB"
 NEXUS_FILTER = "HDF5 / NeXus (*.h5 *.hdf5 *.nxs);;All files (*)"
 # Open dialog now auto-classifies NeXus vs raw; one filter does for both.
 OPEN_FILTER = "HDF5 (*.h5 *.hdf5 *.nxs);;All files (*)"

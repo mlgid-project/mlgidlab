@@ -42,7 +42,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from mlgidbase_gui.file_model import RawEntry
+from mlgidlab.file_model import RawEntry
 
 
 # Conversion-type identifiers — kept as plain strings so ``ConversionConfig``
