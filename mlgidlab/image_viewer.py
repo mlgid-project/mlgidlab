@@ -737,21 +737,12 @@ class GIWAXSImageViewer(QWidget):
         )
         self._log_check.toggled.connect(self._on_log_toggled)
         bar.addWidget(self._log_check)
-        bar.addSpacing(16)
-        # Optional bottom timeline strip. The Display-dock slider is the
-        # primary frame control; this toggle re-exposes pyqtgraph's
-        # built-in timeline (with frame ticks + draggable line) for
-        # users who want it. Default off so the image gets the full
-        # vertical canvas — and so the x-axis label isn't shadowed by
-        # the splitter handle.
-        self._timeline_check = QCheckBox("Timeline")
-        self._timeline_check.setChecked(False)
-        self._timeline_check.setToolTip(
-            "Show/hide pyqtgraph's bottom timeline strip. The Display-"
-            "dock slider drives the same frame index either way."
-        )
-        self._timeline_check.toggled.connect(self._set_timeline_visible)
-        bar.addWidget(self._timeline_check)
+        # NB: the "Timeline" toggle (pyqtgraph's bottom timeline strip)
+        # was removed after the lazy-loading switch. We no longer feed
+        # pyqtgraph a 3D stack, so its built-in timeline has no
+        # ``tVals`` and would render an empty strip. Frame navigation
+        # is exclusively driven by the Display-dock slider →
+        # viewer.set_frame chain.
         bar.addStretch(1)
         bar_widget = QWidget(self)
         bar_widget.setLayout(bar)
@@ -1796,19 +1787,28 @@ class GIWAXSImageViewer(QWidget):
         if self._display_params is None:
             return
         p = self._display_params
-        # Fetch the actual 2D frame for ``idx``.
-        if self._mode == MODE_RAW:
-            if self._raw_image_stack is None:
-                return
-            frame = np.asarray(self._raw_image_stack[idx]).T
-        elif self._mode == MODE_POLAR:
-            if self._frame_source is None:
-                return
-            frame = self._frame_source.get_polar(idx)
-        else:  # MODE_CARTESIAN
-            if self._frame_source is None:
-                return
-            frame = self._frame_source.get_cartesian(idx).T
+        # Fetch the actual 2D frame for ``idx``. Wrapped in
+        # try/except because the FrameSource can be in a briefly-
+        # released state during the silx detach/reattach dance —
+        # if a play-tick or scrub fires in that window, get_polar
+        # / get_cartesian raise ``RuntimeError("FrameSource not
+        # acquired")``. We swallow that quietly; the reattach path
+        # re-renders the active frame once acquire completes.
+        try:
+            if self._mode == MODE_RAW:
+                if self._raw_image_stack is None:
+                    return
+                frame = np.asarray(self._raw_image_stack[idx]).T
+            elif self._mode == MODE_POLAR:
+                if self._frame_source is None or not self._frame_source.is_open:
+                    return
+                frame = self._frame_source.get_polar(idx)
+            else:  # MODE_CARTESIAN
+                if self._frame_source is None or not self._frame_source.is_open:
+                    return
+                frame = self._frame_source.get_cartesian(idx).T
+        except (RuntimeError, ValueError, OSError, KeyError):
+            return
 
         self._plot.setLabel("bottom", p.x_label[0], units=p.x_label[1])
         self._plot.setLabel("left", p.y_label[0], units=p.y_label[1])
@@ -1824,9 +1824,10 @@ class GIWAXSImageViewer(QWidget):
         # pyqtgraph's setImage internally calls roiClicked() which
         # force-shows the bottom timeline strip whenever the image has
         # a time axis. With single 2D frames there is no time axis so
-        # the strip stays hidden; we still re-apply the user's choice
-        # explicitly so the checkbox state is the source of truth.
-        self._set_timeline_visible(self._timeline_check.isChecked())
+        # the strip stays hidden naturally — no extra action needed
+        # since the Timeline toggle was removed in the lazy-loading
+        # milestone.
+        self._hide_pyqtgraph_timeline()
 
     def _maybe_apply_log(
         self, image: np.ndarray, levels: tuple[float, float]
@@ -1877,22 +1878,21 @@ class GIWAXSImageViewer(QWidget):
             except Exception:
                 pass
 
-    def _set_timeline_visible(self, visible: bool) -> None:
-        """Show / hide pyqtgraph's bottom timeline strip.
+    def _hide_pyqtgraph_timeline(self) -> None:
+        """Keep pyqtgraph's bottom timeline strip hidden.
 
-        When hidden, the splitter is collapsed to size [1, 0] and the
-        handle is already 0-width (set in __init__) so there's no
-        residual line clipping the image's x-axis label. When shown,
-        we hand the strip ~20% of the height — enough for frame ticks
-        and the draggable timeLine without crowding the image.
+        pyqtgraph's ``setImage`` internally calls ``roiClicked()``
+        which re-shows the strip whenever the image has a time axis.
+        After the lazy-loading milestone we only ever pass 2D frames
+        (no time axis), so the strip stays hidden naturally — but
+        we re-apply hidden state explicitly to defend against future
+        pyqtgraph versions that might force it back on. The splitter
+        handle is set to 0-width in ``__init__`` so there's no
+        residual line clipping the image's x-axis label.
         """
         ui = self._view.ui
-        ui.roiPlot.setVisible(visible)
-        if visible:
-            total = max(self.height(), 200)
-            ui.splitter.setSizes([int(total * 0.8), int(total * 0.2)])
-        else:
-            ui.splitter.setSizes([1, 0])
+        ui.roiPlot.setVisible(False)
+        ui.splitter.setSizes([1, 0])
 
     # NB: _on_time_changed (the old pyqtgraph sigTimeChanged slot) is
     # removed. Frame changes flow through set_frame; emissions of

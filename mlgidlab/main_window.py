@@ -1,9 +1,19 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QSettings, QSignalBlocker, QThread
+from PySide6.QtCore import (
+    QCoreApplication,
+    QSettings,
+    QSignalBlocker,
+    Qt,
+    QThread,
+    QTimer,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -34,9 +44,13 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressDialog,
     QRadioButton,
+    QDoubleSpinBox,
     QScrollArea,
     QSlider,
+    QSpinBox,
+    QStyle,
     QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -69,6 +83,7 @@ from mlgidlab.workers import (
     ConversionWorker,
     CopyWorker,
     PipelineWorker,
+    PrefetchWorker,
 )
 
 APP_NAME = "mlgidLAB"
@@ -113,7 +128,29 @@ class _MlgidHdf5TreeModel(Hdf5TreeModel):
     The set of "raw" filesystem paths is owned by ``MainWindow`` and
     pushed in via ``set_raw_paths``; the model emits ``dataChanged``
     so existing rows refresh without a full rebuild.
+
+    All read-only model overrides (``data`` / ``flags`` / ``rowCount`` /
+    ``columnCount`` / ``hasChildren`` / ``index``) are wrapped in
+    defensive try/except blocks that swallow ``ValueError`` /
+    ``RecursionError`` / ``KeyError`` / ``OSError`` / ``RuntimeError``
+    and return safe defaults. silx's ``Hdf5Item`` keeps an
+    ``h5py.Group`` reference that can outlive the file handle
+    (post-pipeline-run detach/reattach, session swap, file close);
+    silx's own model methods don't defend against that and raise
+    ``ValueError: Invalid group (or file) id`` from inside
+    ``len(self.obj)``. Qt's QSortFilterProxyModel then re-fires the
+    failing call through every proxy layer, producing a stack-busting
+    recursion (40+ frames of ``QSortFilterProxyModel::data`` →
+    ``QSortFilterProxyModel::rowCount`` → ``mapToSource``). Swallowing
+    the error at our layer stops the storm at its source; the view
+    paints a blank row for that frame, which the next natural repaint
+    (after the proxy/source rebuild that follows the silx-dance
+    completes) overwrites with the correct content.
     """
+
+    # Exceptions raised when an Hdf5Item holds a stale h5py reference
+    # or when Qt re-fires a failed call recursively.
+    _STALE_EXC = (ValueError, KeyError, OSError, RuntimeError, RecursionError)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -146,12 +183,59 @@ class _MlgidHdf5TreeModel(Hdf5TreeModel):
                         if str(filename) in self._raw_paths:
                             return self._raw_icon
                         return self._nexus_icon
-            except Exception:
+            except self._STALE_EXC:
                 # If silx / h5py is in a transient bad state, fall
                 # through to super().data() rather than propagating
                 # an exception that Qt would re-fire endlessly.
                 pass
-        return super().data(index, role)
+        try:
+            return super().data(index, role)
+        except self._STALE_EXC:
+            # silx's Hdf5Item.dataDescription walks `len(self.obj)` on
+            # a possibly-stale h5py group and propagates a ValueError
+            # ("Invalid group (or file) id") through every proxy layer.
+            # Returning None lets the view paint a blank cell; the next
+            # repaint after the silx-dance completes shows real data.
+            return None
+
+    def flags(self, index):
+        try:
+            return super().flags(index)
+        except self._STALE_EXC:
+            return Qt.ItemFlag.NoItemFlags
+
+    def rowCount(self, parent=None):
+        try:
+            if parent is None:
+                return super().rowCount()
+            return super().rowCount(parent)
+        except self._STALE_EXC:
+            return 0
+
+    def columnCount(self, parent=None):
+        try:
+            if parent is None:
+                return super().columnCount()
+            return super().columnCount(parent)
+        except self._STALE_EXC:
+            return 0
+
+    def hasChildren(self, parent=None):
+        try:
+            if parent is None:
+                return super().hasChildren()
+            return super().hasChildren(parent)
+        except self._STALE_EXC:
+            return False
+
+    def index(self, row, column, parent=None):
+        try:
+            if parent is None:
+                return super().index(row, column)
+            return super().index(row, column, parent)
+        except self._STALE_EXC:
+            from PySide6.QtCore import QModelIndex
+            return QModelIndex()
 
 
 class _MlgidHdf5TreeView(Hdf5TreeView):
@@ -236,7 +320,180 @@ class _ExportPeaksDialog(QDialog):
         return "entry"
 
 
+# Playback settings persisted via QSettings under the keys below. The
+# defaults give a 2× speed-up over the previous fixed 100 ms interval
+# while still leaving headroom for cold-cache disk reads (~70-100 ms
+# per fresh frame on local SSD). Users who want true frame-by-frame
+# stepping can dial Frame interval up; users who want a fixed total
+# duration (e.g. 5 s overview regardless of frame count) can flip to
+# Total play time.
+PLAYBACK_MODE_FRAME = "frame_interval_ms"
+PLAYBACK_MODE_TOTAL = "total_time_s"
+DEFAULT_PLAYBACK_FRAME_MS = 50          # 20 fps — was 100 ms / 10 fps
+DEFAULT_PLAYBACK_TOTAL_S = 3.0
+PLAYBACK_FRAME_MS_MIN = 10              # 100 fps requested ceiling
+PLAYBACK_FRAME_MS_MAX = 2000            # 0.5 fps floor
+PLAYBACK_TOTAL_S_MIN = 0.5
+PLAYBACK_TOTAL_S_MAX = 600.0            # 10 minutes max
+
+# Real tick cap. The eye stops perceiving extra frames much above
+# ~20 fps, and large frames cannot be painted faster than ~50 ms
+# regardless. When the user requests a faster per-frame rate (e.g.
+# 3 s total over 300 frames = 10 ms / frame) we keep the timer at
+# 50 ms and skip frames instead — see ``_compute_play_schedule``.
+PLAYBACK_TICK_FLOOR_MS = 50
+
+
+class _SettingsDialog(QDialog):
+    """Application-wide settings dialog.
+
+    Currently only carries the frame-playback section, but its
+    layout reserves room for future settings groups (rendering,
+    pipeline defaults, etc.) so adding a new section is just
+    appending another ``QGroupBox`` to the outer layout.
+
+    On accept, every changed value is written back to QSettings and
+    the host MainWindow is told to re-apply (so an in-flight
+    playback timer picks up the new interval immediately).
+    """
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setMinimumWidth(380)
+
+        outer = QVBoxLayout(self)
+
+        # --- Playback section -------------------------------------------------
+        playback_box = QGroupBox("Frame playback")
+        playback_layout = QVBoxLayout(playback_box)
+
+        hint = QLabel(
+            "<i>Controls the speed of the Display-dock Play button.</i>"
+        )
+        hint.setWordWrap(True)
+        playback_layout.addWidget(hint)
+
+        # Two mutually-exclusive modes. The active radio's spinbox is
+        # the one that takes effect; the other stays editable so the
+        # user can flip between modes without losing their values.
+        mode_box = QButtonGroup(self)
+        mode_box.setExclusive(True)
+        self._rb_frame = QRadioButton("Time per frame")
+        self._rb_total = QRadioButton("Total play time")
+        mode_box.addButton(self._rb_frame)
+        mode_box.addButton(self._rb_total)
+        self._rb_frame.toggled.connect(self._refresh_enabled)
+
+        form = QFormLayout()
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+
+        self._spin_frame_ms = QSpinBox()
+        self._spin_frame_ms.setRange(
+            PLAYBACK_FRAME_MS_MIN, PLAYBACK_FRAME_MS_MAX
+        )
+        self._spin_frame_ms.setSingleStep(10)
+        self._spin_frame_ms.setSuffix(" ms")
+        self._spin_frame_ms.setToolTip(
+            "Time spent on each frame. Lower = faster playback. The 10 ms "
+            "lower bound caps playback at 100 fps; cold-cache disk reads "
+            "may stutter below ~50 ms on large files."
+        )
+
+        self._spin_total_s = QDoubleSpinBox()
+        self._spin_total_s.setRange(
+            PLAYBACK_TOTAL_S_MIN, PLAYBACK_TOTAL_S_MAX
+        )
+        self._spin_total_s.setSingleStep(0.5)
+        self._spin_total_s.setDecimals(2)
+        self._spin_total_s.setSuffix(" s")
+        self._spin_total_s.setToolTip(
+            "Total time to traverse the whole stack (first frame → last "
+            "frame). The per-frame interval is computed at play-start "
+            "from the active entry's frame count, so swapping entries "
+            "automatically adjusts the speed."
+        )
+
+        form.addRow(self._rb_frame, self._spin_frame_ms)
+        form.addRow(self._rb_total, self._spin_total_s)
+        playback_layout.addLayout(form)
+        outer.addWidget(playback_box)
+
+        # --- Buttons + outer wiring -------------------------------------------
+        outer.addStretch(1)
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        outer.addWidget(btns)
+
+        # Load current values from QSettings (with defaults).
+        settings = QSettings()
+        mode = settings.value(
+            MainWindow._PLAYBACK_MODE_KEY, PLAYBACK_MODE_FRAME
+        )
+        # QSettings returns strings on Linux but raw types on macOS;
+        # coerce defensively.
+        try:
+            frame_ms = int(settings.value(
+                MainWindow._PLAYBACK_FRAME_MS_KEY, DEFAULT_PLAYBACK_FRAME_MS
+            ))
+        except (TypeError, ValueError):
+            frame_ms = DEFAULT_PLAYBACK_FRAME_MS
+        try:
+            total_s = float(settings.value(
+                MainWindow._PLAYBACK_TOTAL_S_KEY, DEFAULT_PLAYBACK_TOTAL_S
+            ))
+        except (TypeError, ValueError):
+            total_s = DEFAULT_PLAYBACK_TOTAL_S
+        # Clamp into the spinbox range so out-of-bounds stored values
+        # don't silently revert to the spinbox minimum.
+        frame_ms = max(PLAYBACK_FRAME_MS_MIN,
+                       min(PLAYBACK_FRAME_MS_MAX, frame_ms))
+        total_s = max(PLAYBACK_TOTAL_S_MIN,
+                      min(PLAYBACK_TOTAL_S_MAX, total_s))
+        self._spin_frame_ms.setValue(frame_ms)
+        self._spin_total_s.setValue(total_s)
+        if mode == PLAYBACK_MODE_TOTAL:
+            self._rb_total.setChecked(True)
+        else:
+            self._rb_frame.setChecked(True)
+        self._refresh_enabled()
+
+    def _refresh_enabled(self) -> None:
+        frame_active = self._rb_frame.isChecked()
+        self._spin_frame_ms.setEnabled(frame_active)
+        self._spin_total_s.setEnabled(not frame_active)
+
+    def save_to_qsettings(self) -> None:
+        """Write the dialog's current values to QSettings.
+
+        Called by the host on accept. Stores both spinbox values so a
+        later mode-flip preserves the user's last value in each mode.
+        """
+        settings = QSettings()
+        mode = PLAYBACK_MODE_FRAME if self._rb_frame.isChecked() else PLAYBACK_MODE_TOTAL
+        settings.setValue(MainWindow._PLAYBACK_MODE_KEY, mode)
+        settings.setValue(
+            MainWindow._PLAYBACK_FRAME_MS_KEY, int(self._spin_frame_ms.value())
+        )
+        settings.setValue(
+            MainWindow._PLAYBACK_TOTAL_S_KEY, float(self._spin_total_s.value())
+        )
+
+
 class MainWindow(QMainWindow):
+    # Cross-thread invocation signals for the prefetch worker (queued
+    # auto-connection to slots on the worker's own QThread). Emitting
+    # is the safe cross-thread equivalent of calling the worker's
+    # methods directly; the queued delivery serialises with the
+    # worker's other queued slots and its internal QTimer ticks.
+    _prefetchConfigure = Signal(str, str, int, int)
+    _prefetchUpdate = Signal(int, bool, int)
+    _prefetchRelease = Signal()
+
     def __init__(self) -> None:
         super().__init__()
         # Multiple files can be open at once — each as its own Session in the
@@ -272,6 +529,25 @@ class MainWindow(QMainWindow):
         self._conv_worker: ConversionWorker | None = None
         self._conv_progress: QProgressDialog | None = None
 
+        # Background prefetch worker. Lives on its own QThread so it
+        # can read frames + compute polar resamples without ever
+        # blocking the GUI. Spawned lazily on first entry load (no
+        # cost on cold startup) and survives across entry switches —
+        # the worker is reconfigured per-entry rather than rebuilt.
+        # See ``_ensure_prefetch_worker`` and the ``_prefetch*``
+        # signals on the class for the cross-thread wiring.
+        self._prefetch_thread: QThread | None = None
+        self._prefetch_worker: PrefetchWorker | None = None
+
+        # Frame step per play-tick. Stays at 1 unless the requested
+        # per-frame interval drops below ``PLAYBACK_TICK_FLOOR_MS``,
+        # in which case ``_compute_play_schedule`` bumps it so the
+        # play-head jumps multiple frames per tick to honour the
+        # total-time target without overrunning the 20 fps practical
+        # ceiling. Refreshed on every Play press + every settings
+        # change while playing.
+        self._play_step: int = 1
+
         # Stash of the manual peak's geometry captured the moment the
         # "Save fitted as ring" toggle goes ON. Set to a tuple of
         # (peak_ref, radius, angle, radius_width, angle_width, is_ring)
@@ -290,9 +566,12 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._build_central()
         self._build_docks()
-        # View menu is built last because it pulls toggleViewAction()s from
-        # the docks created in _build_docks.
+        # View menu is built after docks because it pulls
+        # toggleViewAction()s from them. Settings is built last so it
+        # sits at the right end of the menu bar — the conventional
+        # rightmost-menu placement that matches user expectations.
         self._build_view_menu()
+        self._build_settings_menu()
         # Status bar depends on the viewer + entry combo existing; build
         # after central + docks.
         self._build_status_bar()
@@ -736,6 +1015,57 @@ class MainWindow(QMainWindow):
         )
         view_menu.addAction(self.action_toggle_cursor_readout)
 
+    def _build_settings_menu(self) -> None:
+        """Build the top-level Settings menu.
+
+        Houses application-wide preferences that don't justify a
+        dedicated dock or main-toolbar slot. Currently exposes the
+        frame-playback settings; future entries (e.g. default
+        colormap, default render quality, log-verbosity toggle) hang
+        off the same menu.
+
+        The menu is built after View so it sits at the rightmost
+        position, which is where users instinctively reach for
+        Settings in cross-platform apps.
+        """
+        settings_menu = self.menuBar().addMenu("&Settings")
+        self.action_playback_settings = QAction(
+            "&Playback settings…", self
+        )
+        self.action_playback_settings.setToolTip(
+            "Configure how the Display-dock Play button drives frame "
+            "advance — either fixed time per frame or fixed total "
+            "duration regardless of frame count."
+        )
+        self.action_playback_settings.triggered.connect(
+            self._action_playback_settings
+        )
+        settings_menu.addAction(self.action_playback_settings)
+
+    def _action_playback_settings(self) -> None:
+        """Open the playback-settings dialog.
+
+        On accept, persist the dialog's values via QSettings and, if
+        the play timer is currently running, re-apply the new
+        interval mid-flight so the change is felt immediately. The
+        next press of Play also re-reads via ``_compute_play_schedule``
+        so a setting change applied while paused still takes effect.
+        """
+        dlg = _SettingsDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        dlg.save_to_qsettings()
+        # If playback is currently running, push the new schedule onto
+        # the timer right away. The next tick will use it.
+        if self._play_timer.isActive():
+            interval, step = self._compute_play_schedule()
+            self._play_timer.setInterval(interval)
+            self._play_step = step
+            if self._prefetch_worker is not None:
+                self._prefetchUpdate.emit(
+                    self.viewer.current_frame, True, step,
+                )
+
     def _action_undo(self) -> None:
         # Covers manual add/remove, manual geom edits, and detected/fitted
         # geom edits. File-level deletes (delete_peak) are not undoable —
@@ -795,6 +1125,12 @@ class MainWindow(QMainWindow):
 
     _RECENT_FILES_KEY = "recentFiles"
     _MAX_RECENT_FILES = 10
+
+    # Playback settings (persisted via QSettings). See the module-level
+    # PLAYBACK_* constants for defaults and bounds.
+    _PLAYBACK_MODE_KEY = "playbackMode"
+    _PLAYBACK_FRAME_MS_KEY = "playbackFrameIntervalMs"
+    _PLAYBACK_TOTAL_S_KEY = "playbackTotalTimeS"
 
     def _load_recent_files(self) -> list[dict]:
         """Return the persisted recent-files list as a list of dicts.
@@ -973,9 +1309,9 @@ class MainWindow(QMainWindow):
         self.entry_combo.currentTextChanged.connect(self._on_entry_changed)
         form.addRow("Entry:", self.entry_combo)
 
-        # Frame slider — bidirectional sync with the image viewer's
-        # built-in timeline. Hidden for single-frame stacks where it
-        # would just take vertical space without any function.
+        # Frame slider — drives viewer.set_frame; Hidden for single-
+        # frame stacks where it would just take vertical space without
+        # any function.
         self.frame_slider = QSlider(Qt.Orientation.Horizontal)
         self.frame_slider.setMinimum(0)
         self.frame_slider.setMaximum(0)
@@ -989,10 +1325,41 @@ class MainWindow(QMainWindow):
         self.frame_label.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
+        # Play / pause toggle. Drives a QTimer that calls
+        # viewer.set_frame(current + 1) on every tick; stops when the
+        # last frame is reached. Standard-icon based so qdarkstyle
+        # picks up the right colour automatically.
+        self.play_button = QToolButton()
+        self.play_button.setCheckable(True)
+        self._icon_play = self.style().standardIcon(
+            QStyle.StandardPixmap.SP_MediaPlay
+        )
+        self._icon_pause = self.style().standardIcon(
+            QStyle.StandardPixmap.SP_MediaPause
+        )
+        self.play_button.setIcon(self._icon_play)
+        self.play_button.setToolTip(
+            "Play frames from the current position to the end.\n"
+            "Stops at the last frame; click again to pause."
+        )
+        self.play_button.toggled.connect(self._on_play_toggled)
+        # Driver for playback. Interval + step are resolved from
+        # QSettings (see ``_compute_play_schedule``) on every Play
+        # start, so a setting change picks up on the next press
+        # without restarting the timer. Default mode is "time per
+        # frame" at 50 ms = 20 fps. Requested rates below 50 ms /
+        # frame don't speed up the timer — instead, the play-head
+        # advances by ``self._play_step`` frames per tick so the
+        # target total time is honoured while the timer stays at the
+        # 20 fps practical ceiling.
+        self._play_timer = QTimer(self)
+        self._play_timer.setInterval(DEFAULT_PLAYBACK_FRAME_MS)
+        self._play_timer.timeout.connect(self._on_play_tick)
         frame_row = QWidget()
         frame_h = QHBoxLayout(frame_row)
         frame_h.setContentsMargins(0, 0, 0, 0)
         frame_h.setSpacing(6)
+        frame_h.addWidget(self.play_button)
         frame_h.addWidget(self.frame_slider, 1)
         frame_h.addWidget(self.frame_label)
         # Stash the row's parent label so we can hide both in unison.
@@ -1539,6 +1906,11 @@ class MainWindow(QMainWindow):
         was_active = session is self._active_session
         if session not in self._sessions:
             return
+        # Stop playback before pulling the file out from under the
+        # viewer — the timer's next tick would otherwise read from a
+        # released FrameSource.
+        if was_active:
+            self._pause_playback()
         self._sessions.remove(session)
         # silx exposes no "remove single file" API on Hdf5TreeModel, so we
         # rebuild the tree from the remaining sessions. Cheap — sessions
@@ -1578,6 +1950,9 @@ class MainWindow(QMainWindow):
             return
         if self._pipe_thread is not None:
             return
+        # Stop playback before swapping so the timer doesn't tick into
+        # the new session's viewer state mid-construction.
+        self._pause_playback()
         # Tear down viewer-side state belonging to the prior active session
         # before swapping — the new session's overlays must replace, not
         # accumulate on top of, whatever was previously shown.
@@ -1677,10 +2052,33 @@ class MainWindow(QMainWindow):
         block the writer. After the lazy-loading milestone the viewer
         also holds a long-lived h5py handle through its FrameSource —
         that handle must be released here in addition to silx's.
+
+        Both calls are wrapped in try/except: silx's ``clear()`` walks
+        every Hdf5Item to close its owned file via ``obj.filename``,
+        and on a stale ``obj`` that raises ``ValueError: Not a file or
+        file object``. We swallow such errors so a partial-clear
+        doesn't strand the detach half-done — the next reattach
+        rebuilds the model from scratch anyway.
         """
-        self.tree.findHdf5TreeModel().clear()
-        self.data_viewer.setData(None)
+        try:
+            self.tree.findHdf5TreeModel().clear()
+        except Exception:
+            # silx's clear() can blow up when an Hdf5Item references a
+            # closed h5py file. Swallow it; the reattach rebuilds the
+            # whole tree from the live session list.
+            pass
+        try:
+            self.data_viewer.setData(None)
+        except Exception:
+            pass
         self.viewer.release_frame_source()
+        # Tell the background prefetch worker to drop its own h5py
+        # handle too. mlgidbase opens the same file r+ in the worker
+        # we're about to spawn; an outstanding read handle from the
+        # prefetcher would either contend (Windows) or silently
+        # serve pre-write data into the LRU mid-pipeline (Linux).
+        if self._prefetch_worker is not None:
+            self._prefetchRelease.emit()
 
     def _reattach_silx_tree(self) -> None:
         """Re-insert every session's files + reopen the viewer's
@@ -1692,14 +2090,24 @@ class MainWindow(QMainWindow):
         per-file icon set is repushed afterwards because clear() emptied
         the model. The viewer's FrameSource is reopened so subsequent
         frame reads can stream from disk again.
+
+        Each ``insertFile`` is independent — one bad path doesn't
+        strand the rest. silx returns a node reference on success and
+        raises ``OSError`` on a missing/corrupt file; either way we
+        continue with the next session.
         """
         model = self.tree.findHdf5TreeModel()
         for s in self._sessions:
-            if isinstance(s, RawSession):
-                for raw_path in s.raw_paths:
-                    model.insertFile(str(raw_path))
-            else:
-                model.insertFile(str(s.temp_path))
+            try:
+                if isinstance(s, RawSession):
+                    for raw_path in s.raw_paths:
+                        model.insertFile(str(raw_path))
+                else:
+                    model.insertFile(str(s.temp_path))
+            except Exception:
+                # One bad session shouldn't strand the rest. The user
+                # will see the missing entry; rebuild at next detach.
+                pass
         self._refresh_tree_raw_paths()
         self.viewer.acquire_frame_source()
 
@@ -1866,7 +2274,9 @@ class MainWindow(QMainWindow):
     def _on_viewer_frame_changed(self, frame: int) -> None:
         """Viewer changed frame (timeline scrub, programmatic seek, etc.)
         — keep the Display-dock slider + label in sync without
-        re-emitting valueChanged back into the viewer.
+        re-emitting valueChanged back into the viewer. Also pushes
+        the new play-head into the background prefetch worker so
+        its sliding window slides with the user.
         """
         self.frame_label.setText(self._frame_label_text(frame))
         if self.frame_slider.value() != frame:
@@ -1876,6 +2286,264 @@ class MainWindow(QMainWindow):
             finally:
                 self.frame_slider.blockSignals(False)
         self._update_status_frame()
+        # Tell the prefetch worker where the play-head is now. The
+        # ``active`` flag tracks the play-button state so a manual
+        # scrub doesn't accidentally wake the worker. Pass the live
+        # step so the worker walks the same stride as the player.
+        if self._prefetch_worker is not None:
+            active = self.play_button.isChecked()
+            step = self._play_step if active else 1
+            self._prefetchUpdate.emit(int(frame), active, step)
+
+    def _on_play_toggled(self, checked: bool) -> None:
+        """Start / stop the frame-playback timer.
+
+        Press → if the current frame is already at the end, restart
+        from frame 0; otherwise advance from the current frame. Press
+        again to pause. The icon flips between Play and Pause.
+
+        Refuses to start during a pipeline run (the viewer is gated
+        ``busy`` during those, so frame edits would block anyway).
+
+        Reads the current playback settings from QSettings on every
+        press so a setting change applies on the next play without
+        any restart machinery.
+        """
+        if checked:
+            if self._pipe_thread is not None or self.viewer.n_frames <= 1:
+                # Bail: the play button toggle was either an erroneous
+                # programmatic click or fired while a pipeline run owns
+                # the viewer. Unchecking re-fires this slot with
+                # checked=False, which is a no-op.
+                self.play_button.setChecked(False)
+                return
+            # Wrap around when at the end so the second click of Play
+            # always plays the full sequence.
+            if self.viewer.current_frame >= self.viewer.n_frames - 1:
+                self.viewer.set_frame(0)
+            interval, step = self._compute_play_schedule()
+            self._play_timer.setInterval(interval)
+            self._play_step = step
+            self.play_button.setIcon(self._icon_pause)
+            self.play_button.setToolTip("Pause playback")
+            self._play_timer.start()
+            # Activate the background prefetch worker — it'll start
+            # warming frames just ahead of the play-head, stepping
+            # the same way the player does so prefetched frames
+            # actually match the ones we'll display.
+            if self._prefetch_worker is not None:
+                self._prefetchUpdate.emit(
+                    self.viewer.current_frame, True, step,
+                )
+        else:
+            self._play_timer.stop()
+            self._play_step = 1
+            self.play_button.setIcon(self._icon_play)
+            self.play_button.setToolTip(
+                "Play frames from the current position to the end.\n"
+                "Stops at the last frame; click again to pause."
+            )
+            if self._prefetch_worker is not None:
+                self._prefetchUpdate.emit(
+                    self.viewer.current_frame, False, 1,
+                )
+
+    def _compute_play_schedule(self) -> tuple[int, int]:
+        """Resolve ``(timer_interval_ms, frame_step)`` from QSettings.
+
+        The user expresses a desired *per-frame* duration — either
+        directly (Time-per-frame mode) or implicitly (Total-time mode
+        ÷ n_frames). If that desired duration is at or above
+        ``PLAYBACK_TICK_FLOOR_MS`` (≈ 20 fps), playback uses it
+        directly with ``step=1``. If it's *below* that floor, the
+        timer is held at the floor and ``step`` is bumped so the
+        play-head jumps multiple frames per tick — i.e. we honour the
+        target total time by skipping frames instead of asking Qt to
+        fire faster than the display + disk can keep up. 20 fps is
+        more than enough to perceive the time-series motion; the
+        skipped frames are still reachable via the slider.
+
+        Out-of-bounds / unparseable stored values fall back to the
+        defaults so a corrupted QSettings entry can't soft-lock the
+        Play button.
+        """
+        settings = QSettings()
+        mode = settings.value(self._PLAYBACK_MODE_KEY, PLAYBACK_MODE_FRAME)
+        if mode == PLAYBACK_MODE_TOTAL:
+            try:
+                total_s = float(settings.value(
+                    self._PLAYBACK_TOTAL_S_KEY, DEFAULT_PLAYBACK_TOTAL_S
+                ))
+            except (TypeError, ValueError):
+                total_s = DEFAULT_PLAYBACK_TOTAL_S
+            total_s = max(PLAYBACK_TOTAL_S_MIN,
+                          min(PLAYBACK_TOTAL_S_MAX, total_s))
+            steps = max(self.viewer.n_frames - 1, 1)
+            desired_ms = total_s * 1000.0 / steps
+        else:
+            try:
+                frame_ms = int(settings.value(
+                    self._PLAYBACK_FRAME_MS_KEY, DEFAULT_PLAYBACK_FRAME_MS
+                ))
+            except (TypeError, ValueError):
+                frame_ms = DEFAULT_PLAYBACK_FRAME_MS
+            desired_ms = float(max(PLAYBACK_FRAME_MS_MIN,
+                                   min(PLAYBACK_FRAME_MS_MAX, frame_ms)))
+
+        if desired_ms < PLAYBACK_TICK_FLOOR_MS:
+            # Below the 20 fps ceiling — bunch frames together per tick.
+            # step = ceil(floor / desired) so the per-frame time stays
+            # ≤ desired (= we never play slower than asked). Interval
+            # then = desired * step, which lands at or just above the
+            # floor.
+            step = max(1, int(math.ceil(PLAYBACK_TICK_FLOOR_MS / desired_ms)))
+            interval_ms = max(PLAYBACK_TICK_FLOOR_MS,
+                              int(round(desired_ms * step)))
+        else:
+            step = 1
+            interval_ms = int(round(desired_ms))
+        return interval_ms, step
+
+    def _on_play_tick(self) -> None:
+        """One step of frame playback.
+
+        Stops at end-of-stack. Auto-pauses if the viewer becomes busy
+        (pipeline run kicked off mid-playback) or the user closed the
+        file. The slider's ``valueChanged`` connection routes the
+        frame change through ``viewer.set_frame`` so the existing
+        sync paths fire exactly once per step.
+        """
+        if (
+            self.viewer.n_frames <= 1
+            or self._pipe_thread is not None
+            or self.session is None
+        ):
+            self.play_button.setChecked(False)
+            return
+        step = max(1, self._play_step)
+        next_frame = self.viewer.current_frame + step
+        if next_frame >= self.viewer.n_frames:
+            # Snap to the last frame so the user always sees the end
+            # of the sequence even when ``step`` would overshoot — then
+            # pause. Click Play again to wrap to frame 0 (the toggle
+            # handler handles the wrap).
+            last = self.viewer.n_frames - 1
+            if self.viewer.current_frame < last:
+                self.viewer.set_frame(last)
+            self.play_button.setChecked(False)
+            return
+        self.viewer.set_frame(next_frame)
+
+    def _pause_playback(self) -> None:
+        """Stop the playback timer if it's running.
+
+        Called from session-swap / file-close / pipeline-start paths
+        so playback doesn't tick into a torn-down viewer or contend
+        with a pipeline write. Safe to call when playback is already
+        stopped.
+        """
+        if self.play_button.isChecked():
+            self.play_button.setChecked(False)
+
+    # -- Background prefetch worker ---------------------------------------
+
+    def _ensure_prefetch_worker(self) -> None:
+        """Spawn the prefetch worker + thread on first use. Idempotent.
+
+        Lazy spawn keeps startup fast for users who only ever view
+        single-frame files (no playback, no prefetch worth running).
+        Once spawned, the worker survives across entry switches —
+        each new entry triggers ``configure()`` rather than a
+        rebuild.
+        """
+        if self._prefetch_worker is not None:
+            return
+        self._prefetch_thread = QThread(self)
+        self._prefetch_worker = PrefetchWorker()
+        self._prefetch_worker.moveToThread(self._prefetch_thread)
+        # Cross-thread wiring. configure / update_state / release run
+        # on the worker's thread via queued connections; prefetched
+        # signal delivers back to the GUI thread.
+        self._prefetchConfigure.connect(
+            self._prefetch_worker.configure, Qt.ConnectionType.QueuedConnection,
+        )
+        self._prefetchUpdate.connect(
+            self._prefetch_worker.update_state, Qt.ConnectionType.QueuedConnection,
+        )
+        self._prefetchRelease.connect(
+            self._prefetch_worker.release, Qt.ConnectionType.QueuedConnection,
+        )
+        self._prefetch_worker.prefetched.connect(
+            self._on_prefetched, Qt.ConnectionType.QueuedConnection,
+        )
+        self._prefetch_thread.start()
+
+    def _configure_prefetch_for_active_entry(self) -> None:
+        """Tell the worker about the active entry's shape + LRU size.
+
+        Called after every successful entry load (in
+        ``_load_entry_into_viewer``) and after the silx-reattach
+        path completes a pipeline run. No-op for single-frame
+        stacks (nothing to prefetch) and for raw sessions
+        (FrameSource isn't used).
+        """
+        if (
+            self.session is None
+            or self.session.kind != "nexus"
+            or self.viewer._frame_source is None
+            or self.viewer.n_frames <= 1
+        ):
+            # Release the worker if we have one — no work on idle.
+            if self._prefetch_worker is not None:
+                self._prefetchRelease.emit()
+            return
+        self._ensure_prefetch_worker()
+        fs = self.viewer._frame_source
+        # Sliding-window size = LRU - 1 so the prefetcher can never
+        # evict frames the play-head still needs to reach.
+        window = max(1, fs.cart_lru_size - 1)
+        entry = self.entry_combo.currentText()
+        if not entry:
+            return
+        self._prefetchConfigure.emit(
+            str(self.session.temp_path), entry, fs.n_frames, window,
+        )
+        # Start in paused state — the worker only ticks during
+        # active playback. The play-button toggle (and any frame
+        # change while playing) will flip ``active=True`` via
+        # _prefetchUpdate.
+        self._prefetchUpdate.emit(self.viewer.current_frame, False, 1)
+
+    @Slot(int, object, object, object, object)
+    def _on_prefetched(
+        self,
+        idx: int,
+        cart: object,
+        polar: object,
+        radius: object,
+        angle: object,
+    ) -> None:
+        """Deposit a prefetched frame into the active FrameSource's LRU.
+
+        Runs on the GUI thread (queued from the worker). The
+        FrameSource's LRUs are touched only here and from the
+        synchronous ``get_cartesian`` / ``get_polar`` paths, both
+        of which live on the GUI thread — so no locking is needed.
+
+        Drops the result silently if the FrameSource has been
+        released (post-pipeline detach), since a stale signal in
+        flight should not warm a closed cache.
+        """
+        fs = self.viewer._frame_source
+        if fs is None or not fs.is_open:
+            return
+        try:
+            fs.warm_cartesian(int(idx), cart)        # type: ignore[arg-type]
+            fs.warm_polar(int(idx), polar, radius, angle)  # type: ignore[arg-type]
+        except Exception:
+            # Defensive — a stale signal during teardown shouldn't
+            # propagate.
+            pass
 
     def _refresh_frame_slider(self) -> None:
         """Match the slider's range + value to the active stack's
@@ -2371,6 +3039,11 @@ class MainWindow(QMainWindow):
         if self.session is None or self._pipe_thread is not None:
             return
 
+        # Stop frame playback if it's running — the pipeline owns the
+        # file r+ for the duration of the run and ticking would either
+        # contend on the silx detach or read post-write data
+        # mid-render.
+        self._pause_playback()
         self.pipeline_panel.set_running(True)
         self.parameter_panel.set_busy(True)
         self.viewer.set_busy(True)
@@ -2795,6 +3468,12 @@ class MainWindow(QMainWindow):
         polar = self.viewer.polar_data()
         if polar is not None:
             self.profile_viewer.set_polar_stack(*polar)
+        # Configure the prefetch worker for the new entry. Single-
+        # frame stacks short-circuit inside the helper; multi-frame
+        # stacks spawn the worker (if not already) and reset its
+        # _done set so the next Play press starts filling from
+        # frame current+1 onward.
+        self._configure_prefetch_for_active_entry()
 
     # -- UI state --
 
@@ -3051,6 +3730,9 @@ class MainWindow(QMainWindow):
             if not self._confirm_discard_changes(s):
                 event.ignore()
                 return
+        # Stop frame playback so the timer doesn't fire one last tick
+        # against a torn-down viewer during shutdown.
+        self._pause_playback()
         # All clear — tear everything down. silx must release its handles
         # before we delete the temp files.
         self._detach_silx_tree()
@@ -3071,6 +3753,22 @@ class MainWindow(QMainWindow):
         if self._conv_thread is not None:
             self._conv_thread.quit()
             self._conv_thread.wait()
+        # Shut the background prefetch worker down cleanly. Release
+        # its h5py handle first (so the worker stops trying to read
+        # frames), then quit + wait the thread so its event loop
+        # exits before we delete its Q objects.
+        if self._prefetch_worker is not None:
+            self._prefetchRelease.emit()
+            # Process the queued release so it lands on the worker's
+            # thread before we quit it; otherwise the worker would
+            # try to read on a destroyed h5py.File during shutdown.
+            QCoreApplication.processEvents()
+            self._prefetch_thread.quit()
+            self._prefetch_thread.wait()
+            self._prefetch_worker.deleteLater()
+            self._prefetch_worker = None
+            self._prefetch_thread.deleteLater()
+            self._prefetch_thread = None
         for s in list(self._sessions):
             s.close()
         self._sessions.clear()

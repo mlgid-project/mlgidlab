@@ -396,6 +396,60 @@ class FrameSource:
         assert self._polar_radius is not None and self._polar_angle is not None
         return self._polar_radius, self._polar_angle
 
+    # -- LRU deposit (used by the background prefetch worker) -------------
+
+    def warm_cartesian(self, i: int, frame: np.ndarray) -> None:
+        """Deposit a pre-read Cartesian frame into the LRU.
+
+        Called only from the main thread, via MainWindow's
+        prefetched-signal slot. The background prefetch worker has
+        its own independent ``h5py.File`` handle and does the disk
+        read on a worker thread; this method just deposits the
+        result so subsequent ``get_cartesian(i)`` calls hit cache.
+
+        No-op when the FrameSource is currently released (the
+        worker's signal might still be in flight after MainWindow
+        detached silx for a pipeline run) or when the index is
+        out of range (entry shape changed between emit and slot).
+        """
+        if self._dataset is None:
+            return
+        if not (0 <= i < self.n_frames):
+            return
+        self._cart_lru[i] = frame
+        self._cart_lru.move_to_end(i)
+        while len(self._cart_lru) > self._cart_lru_max:
+            self._cart_lru.popitem(last=False)
+
+    def warm_polar(
+        self,
+        i: int,
+        polar_frame: np.ndarray,
+        radius: np.ndarray | None = None,
+        angle: np.ndarray | None = None,
+    ) -> None:
+        """Deposit a pre-computed polar frame into the LRU.
+
+        ``radius`` / ``angle`` are stashed on the FrameSource only
+        when our own axes haven't been computed yet — that way the
+        worker's first emit primes ``polar_axes()`` and saves the
+        viewer from a duplicate frame-0 resample when entering
+        polar mode for the first time. Subsequent emits ignore the
+        axis args (they're identical anyway).
+        """
+        if self._dataset is None:
+            return
+        if not (0 <= i < self.n_frames):
+            return
+        self._polar_lru[i] = polar_frame
+        self._polar_lru.move_to_end(i)
+        while len(self._polar_lru) > self._polar_lru_max:
+            self._polar_lru.popitem(last=False)
+        if self._polar_radius is None and radius is not None:
+            self._polar_radius = np.asarray(radius)
+        if self._polar_angle is None and angle is not None:
+            self._polar_angle = np.asarray(angle)
+
 
 class _LazyImageStack:
     """Thin shim presenting a ``(n_frames, n_qz, n_qxy)`` indexable view.
