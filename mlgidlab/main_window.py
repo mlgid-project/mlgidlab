@@ -69,6 +69,7 @@ from mlgidlab.image_viewer import (
     matched_pen_for,
 )
 from mlgidlab.parameter_panel import ParameterPanel
+from mlgidlab.peaks_table_panel import PeaksTablePanel
 from mlgidlab.pipeline import (
     PipelineCommand,
     add_peak_kwargs_for,
@@ -999,6 +1000,7 @@ class MainWindow(QMainWindow):
             self._pipeline_dock,
             self._conversion_dock,
             self._logs_dock,
+            self._peaks_dock,
             self._profile_dock,
         ):
             view_menu.addAction(dock.toggleViewAction())
@@ -1309,9 +1311,14 @@ class MainWindow(QMainWindow):
         self.entry_combo.currentTextChanged.connect(self._on_entry_changed)
         form.addRow("Entry:", self.entry_combo)
 
-        # Frame slider — drives viewer.set_frame; Hidden for single-
-        # frame stacks where it would just take vertical space without
-        # any function.
+        # Frame-navigation controls live on the *image viewer's*
+        # toolbar (alongside the Log-scale checkbox) so they're
+        # reachable from any right-dock tab — not just Display. We
+        # still build them here because MainWindow owns the slot
+        # wiring (slider valueChanged → viewer, play timer, …);
+        # ``viewer.insert_frame_controls`` re-parents them onto the
+        # toolbar in ``_build_docks`` once the toolbar is ready.
+        # Hidden for single-frame stacks where they have no function.
         self.frame_slider = QSlider(Qt.Orientation.Horizontal)
         self.frame_slider.setMinimum(0)
         self.frame_slider.setMaximum(0)
@@ -1320,8 +1327,11 @@ class MainWindow(QMainWindow):
         self.frame_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         self.frame_slider.setTickInterval(1)
         self.frame_slider.valueChanged.connect(self._on_frame_slider_changed)
-        self.frame_label = QLabel("Frame —")
-        self.frame_label.setMinimumWidth(80)
+        # Compact "idx / max" readout. The "Frame" word was dropped to
+        # save toolbar space — its meaning is obvious from context
+        # (next to play / prev / next icons and a slider).
+        self.frame_label = QLabel("—")
+        self.frame_label.setMinimumWidth(48)
         self.frame_label.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
@@ -1343,6 +1353,27 @@ class MainWindow(QMainWindow):
             "Stops at the last frame; click again to pause."
         )
         self.play_button.toggled.connect(self._on_play_toggled)
+        # Previous / next single-step buttons. Step by one frame and
+        # clamp at boundaries (the buttons disable themselves at
+        # frame 0 / last via ``_refresh_frame_nav_enabled``).
+        self.prev_frame_button = QToolButton()
+        self.prev_frame_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowBack)
+        )
+        self.prev_frame_button.setToolTip("Previous frame")
+        self.prev_frame_button.setAutoRepeat(True)
+        self.prev_frame_button.setAutoRepeatDelay(300)
+        self.prev_frame_button.setAutoRepeatInterval(80)
+        self.prev_frame_button.clicked.connect(self._on_prev_frame_clicked)
+        self.next_frame_button = QToolButton()
+        self.next_frame_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowForward)
+        )
+        self.next_frame_button.setToolTip("Next frame")
+        self.next_frame_button.setAutoRepeat(True)
+        self.next_frame_button.setAutoRepeatDelay(300)
+        self.next_frame_button.setAutoRepeatInterval(80)
+        self.next_frame_button.clicked.connect(self._on_next_frame_clicked)
         # Driver for playback. Interval + step are resolved from
         # QSettings (see ``_compute_play_schedule``) on every Play
         # start, so a setting change picks up on the next press
@@ -1355,19 +1386,17 @@ class MainWindow(QMainWindow):
         self._play_timer = QTimer(self)
         self._play_timer.setInterval(DEFAULT_PLAYBACK_FRAME_MS)
         self._play_timer.timeout.connect(self._on_play_tick)
-        frame_row = QWidget()
-        frame_h = QHBoxLayout(frame_row)
-        frame_h.setContentsMargins(0, 0, 0, 0)
-        frame_h.setSpacing(6)
-        frame_h.addWidget(self.play_button)
-        frame_h.addWidget(self.frame_slider, 1)
-        frame_h.addWidget(self.frame_label)
-        # Stash the row's parent label so we can hide both in unison.
-        self._frame_row_widget = frame_row
-        form.addRow("Frame:", frame_row)
         layout.addLayout(form)
-        # Both the slider and its "Frame:" label start hidden — they're
-        # only useful once a multi-frame stack is loaded.
+        # Hand the controls to the image viewer's toolbar. Order
+        # reads left-to-right: prev / play / next / slider / label.
+        self.viewer.insert_frame_controls([
+            self.prev_frame_button,
+            self.play_button,
+            self.next_frame_button,
+            self.frame_slider,
+            self.frame_label,
+        ])
+        # Start hidden — only useful once a multi-frame stack is loaded.
         self._set_frame_slider_visible(False)
 
         layout.addWidget(QLabel("Overlays"))
@@ -1406,8 +1435,17 @@ class MainWindow(QMainWindow):
         matched_master_row = QHBoxLayout()
         matched_master_row.setContentsMargins(0, 0, 0, 0)
         matched_master_row.setSpacing(6)
-        # Empty spacer where the swatch would go — colors live on each row.
-        matched_master_row.addSpacing(_make_pen_swatch(OVERLAY_STYLE["detected"]).width() + 4)
+        # Invisible-pixmap label of the same fixed size as a real swatch
+        # so the matched checkbox lines up vertically with the Detected
+        # / Fitted rows (which prepend a 26×12 swatch label). Earlier
+        # implementation used ``addSpacing`` here, which laid out
+        # differently from ``addWidget(label)`` and shifted the
+        # checkbox a few px to the right.
+        _swatch_w = _make_pen_swatch(OVERLAY_STYLE["detected"]).width()
+        _swatch_h = _make_pen_swatch(OVERLAY_STYLE["detected"]).height()
+        _matched_swatch_spacer = QLabel()
+        _matched_swatch_spacer.setFixedSize(_swatch_w, _swatch_h)
+        matched_master_row.addWidget(_matched_swatch_spacer)
         self._matched_master_check = QCheckBox("Matched peaks")
         self._matched_master_check.setChecked(True)
         self._matched_master_check.toggled.connect(self._on_matched_master_toggled)
@@ -1494,6 +1532,18 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._pipeline_dock)
         self.tabifyDockWidget(self._display_dock, self._pipeline_dock)
 
+        # Peaks dock — sortable per-frame view of detected / fitted /
+        # matched peaks with bidirectional click-sync to the image
+        # viewer's selection. Sits between Pipeline and Conversion so
+        # the final tab order reads Display | Pipeline | Peaks |
+        # Conversion | Logs.
+        self.peaks_table_panel = PeaksTablePanel(self)
+        self._peaks_dock = QDockWidget("Peaks", self)
+        self._peaks_dock.setWidget(self.peaks_table_panel)
+        self._peaks_dock.setObjectName("PeaksDock")
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._peaks_dock)
+        self.tabifyDockWidget(self._pipeline_dock, self._peaks_dock)
+
         # Conversion dock — mode-exclusive sibling of the Pipeline dock.
         # Visible only when the active session is a RawSession; switching
         # between Nexus and Raw sessions hides one and shows the other.
@@ -1507,7 +1557,7 @@ class MainWindow(QMainWindow):
         self._conversion_dock.setWidget(self.conversion_panel)
         self._conversion_dock.setObjectName("ConversionDock")
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._conversion_dock)
-        self.tabifyDockWidget(self._display_dock, self._conversion_dock)
+        self.tabifyDockWidget(self._peaks_dock, self._conversion_dock)
         # Default state matches the default session (none): pipeline dock
         # shown so the user can see what would be available once they
         # open a converted file. ``_apply_session_mode`` handles toggles
@@ -1530,7 +1580,7 @@ class MainWindow(QMainWindow):
         self._logs_dock.setWidget(self._log_view)
         self._logs_dock.setObjectName("LogsDock")
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._logs_dock)
-        self.tabifyDockWidget(self._display_dock, self._logs_dock)
+        self.tabifyDockWidget(self._conversion_dock, self._logs_dock)
 
         # Route both panels' log messages into the shared widget. Both
         # panels' ``append_log`` / ``clear_log`` already emit these
@@ -1576,6 +1626,15 @@ class MainWindow(QMainWindow):
         # Parameter readout — both selection and geometry changes feed the same slot.
         self.viewer.selectionChanged.connect(self.parameter_panel.set_peak)
         self.viewer.peakGeometryChanged.connect(self.parameter_panel.set_peak)
+
+        # Peaks table sync. Image → table: mirror the selection onto
+        # the relevant row (auto-switches tab). Table → image: route
+        # row clicks back through the viewer's selection setter.
+        self.viewer.selectionChanged.connect(self.peaks_table_panel.set_external_selection)
+        self.viewer.frameChanged.connect(self._refresh_peaks_table_on_frame)
+        self.peaks_table_panel.peakSelectedFromTable.connect(
+            self._on_peak_selected_from_table
+        )
 
         # Commit / delete actions on the parameter panel. Add-to-detected and
         # delete reuse the existing PipelineWorker path.
@@ -1922,6 +1981,7 @@ class MainWindow(QMainWindow):
             self.viewer.clear()
             self.viewer.clear_history()
             self.profile_viewer.clear()
+            self.peaks_table_panel.clear()
             self.entry_combo.blockSignals(True)
             self.entry_combo.clear()
             self.entry_combo.blockSignals(False)
@@ -2285,6 +2345,7 @@ class MainWindow(QMainWindow):
                 self.frame_slider.setValue(int(frame))
             finally:
                 self.frame_slider.blockSignals(False)
+        self._refresh_frame_nav_enabled()
         self._update_status_frame()
         # Tell the prefetch worker where the play-head is now. The
         # ``active`` flag tracks the play-button state so a manual
@@ -2549,7 +2610,7 @@ class MainWindow(QMainWindow):
         """Match the slider's range + value to the active stack's
         frame count. Called after every show_stack — covers entry
         switches, file opens, and pipeline-finished reloads.
-        Single-frame stacks hide the row entirely.
+        Single-frame stacks hide the whole nav cluster.
         """
         n = self.viewer.n_frames
         cur = self.viewer.current_frame
@@ -2567,30 +2628,46 @@ class MainWindow(QMainWindow):
             self.frame_slider.blockSignals(False)
         self.frame_label.setText(self._frame_label_text(cur))
         self._set_frame_slider_visible(n > 1)
+        self._refresh_frame_nav_enabled()
 
     def _set_frame_slider_visible(self, visible: bool) -> None:
-        """Show or hide the slider row + its left-column label.
+        """Show or hide the toolbar's frame-navigation cluster.
 
-        QFormLayout doesn't have a single "hide row" call in older
-        PySide6 versions, so we pull the label widget out of the form
-        directly and toggle it alongside the slider widget.
+        With the controls living in the image-viewer toolbar (no
+        form / no row container), each widget is toggled directly.
         """
-        self._frame_row_widget.setVisible(visible)
-        # The left-column "Frame:" label was added by addRow; reach it
-        # via labelForField so it hides in lockstep.
-        form = self._frame_row_widget.parentWidget().layout()
-        try:
-            label = form.labelForField(self._frame_row_widget)
-        except Exception:
-            label = None
-        if label is not None:
-            label.setVisible(visible)
+        for w in (
+            self.prev_frame_button,
+            self.play_button,
+            self.next_frame_button,
+            self.frame_slider,
+            self.frame_label,
+        ):
+            w.setVisible(visible)
+
+    def _refresh_frame_nav_enabled(self) -> None:
+        """Disable prev/next at the boundaries so the user can see
+        they've hit the start / end of the stack."""
+        n = self.viewer.n_frames
+        cur = self.viewer.current_frame
+        self.prev_frame_button.setEnabled(n > 1 and cur > 0)
+        self.next_frame_button.setEnabled(n > 1 and cur < n - 1)
+
+    def _on_prev_frame_clicked(self) -> None:
+        cur = self.viewer.current_frame
+        if cur > 0:
+            self.viewer.set_frame(cur - 1)
+
+    def _on_next_frame_clicked(self) -> None:
+        cur = self.viewer.current_frame
+        if cur < self.viewer.n_frames - 1:
+            self.viewer.set_frame(cur + 1)
 
     def _frame_label_text(self, idx: int) -> str:
         n = self.viewer.n_frames
         if n <= 1:
-            return "Frame —"
-        return f"Frame {int(idx)} / {n - 1}"
+            return "—"
+        return f"{int(idx)} / {n - 1}"
 
     def _safe_selected_h5_nodes(self) -> list:
         """Return ``selectedH5Nodes`` results, swallowing silx model errors.
@@ -3474,8 +3551,55 @@ class MainWindow(QMainWindow):
         # _done set so the next Play press starts filling from
         # frame current+1 onward.
         self._configure_prefetch_for_active_entry()
+        # Repopulate the Peaks dock with the new entry's peaks. The
+        # viewer's frameChanged path also drives this slot, but the
+        # initial load may finish on the *same* frame index as the
+        # previous session — in which case no frameChanged fires and
+        # the panel would otherwise keep stale rows.
+        self._refresh_peaks_table()
 
     # -- UI state --
+
+    def _refresh_peaks_table(self) -> None:
+        """Repopulate the Peaks dock from the viewer's current state.
+
+        Called on entry-load completion, post-pipeline reload (via
+        ``_load_entry_into_viewer``), and on every frame change (via
+        ``_refresh_peaks_table_on_frame``). Empties all three tabs
+        when no session is active.
+        """
+        if self.session is None or self.session.kind != "nexus":
+            self.peaks_table_panel.clear()
+            return
+        frame = self.viewer.current_frame
+        peaks_for_frame = self.viewer._frame_peaks.get(frame) or {}
+        matched = self.viewer.matched_structures(frame)
+        self.peaks_table_panel.set_frame_peaks(
+            frame,
+            peaks_for_frame.get("detected"),
+            peaks_for_frame.get("fitted"),
+            matched,
+        )
+
+    def _refresh_peaks_table_on_frame(self, _frame: int) -> None:
+        """Slot for ``viewer.frameChanged`` — drops the unused frame
+        index since ``_refresh_peaks_table`` re-reads it from the
+        viewer."""
+        self._refresh_peaks_table()
+
+    def _on_peak_selected_from_table(self, sel: SelectedPeak | None) -> None:
+        """Route a table-row click back into the image viewer.
+
+        The panel builds the SelectedPeak with ``frame=0`` since it
+        has no viewer context; stamp the real current_frame here
+        before handing it to ``_set_selected``. The viewer's
+        equality guard short-circuits the round-trip if the
+        selection didn't actually change.
+        """
+        if sel is None:
+            return
+        sel.frame = self.viewer.current_frame
+        self.viewer._set_selected(sel)
 
     def _refresh_matched_panel(self, _frame: int, structures: list) -> None:
         """Rebuild the per-structure rows under the Matched-peaks master.

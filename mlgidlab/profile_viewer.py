@@ -338,7 +338,15 @@ class ProfileViewer(QWidget):
             return
         if not 0 <= self._current_frame < self._polar_stack.shape[0]:
             return
-        img = self._polar_stack[self._current_frame]
+        # Selection-change signals can race the silx detach/reattach
+        # dance (pipeline runs, file close): the FrameSource is briefly
+        # released and the lazy polar stack raises until the host
+        # re-acquires. Bail silently — the next `frameChanged` or
+        # `selectionChanged` after reattach will redraw correctly.
+        try:
+            img = self._polar_stack[self._current_frame]
+        except (RuntimeError, ValueError, OSError, KeyError):
+            return
 
         if self._selected is not None:
             peak = self._selected

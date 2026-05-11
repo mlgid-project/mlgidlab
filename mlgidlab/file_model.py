@@ -62,10 +62,31 @@ class PeakTable:
     radius_width: np.ndarray
     is_ring: np.ndarray
     ids: np.ndarray
+    # mlgidDETECT writes the model confidence into ``score``; mlgidFIT
+    # copies it onto every fitted row. Manual peaks carry zeros since
+    # they have no model provenance. Kept as a parallel array so that
+    # rendering helpers (which iterate by index) can stay agnostic.
+    score: np.ndarray
+    # Peak amplitude (2D-Gaussian peak height). Present on both
+    # detected and fitted rows; manual peaks carry zeros.
+    amplitude: np.ndarray
 
     @classmethod
     def from_dataset(cls, ds: h5py.Dataset) -> PeakTable:
         arr = ds[()]
+        n = int(arr.shape[0])
+        # Tolerate older files written before optional fields
+        # existed — return zeros so downstream code can still index.
+        score = (
+            np.asarray(arr["score"], dtype=float)
+            if "score" in arr.dtype.names
+            else np.zeros(n, dtype=float)
+        )
+        amplitude = (
+            np.asarray(arr["amplitude"], dtype=float)
+            if "amplitude" in arr.dtype.names
+            else np.zeros(n, dtype=float)
+        )
         return cls(
             q_xy=np.asarray(arr["q_xy"], dtype=float),
             q_z=np.asarray(arr["q_z"], dtype=float),
@@ -75,6 +96,8 @@ class PeakTable:
             radius_width=np.asarray(arr["radius_width"], dtype=float),
             is_ring=np.asarray(arr["is_ring"], dtype=bool),
             ids=np.asarray(arr["id"], dtype=int),
+            score=score,
+            amplitude=amplitude,
         )
 
     def __len__(self) -> int:
@@ -747,6 +770,8 @@ def load_matched_peaks(
                     radius_width=fitted_peaks.radius_width[idx],
                     is_ring=fitted_peaks.is_ring[idx],
                     ids=fitted_peaks.ids[idx],
+                    score=fitted_peaks.score[idx],
+                    amplitude=fitted_peaks.amplitude[idx],
                 )
                 out.append(
                     MatchedStructure(

@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -463,8 +463,11 @@ class ConversionPanel(QWidget):
         form.addRow("Mask:", _row(self.mask_path, mask_browse, mask_clear))
 
         # Angle of incidence — single global value; per-frame ai is
-        # deferred per the plan's Outlook section.
-        self.ai_input = QDoubleSpinBox()
+        # deferred per the plan's Outlook section. Uses the auto-
+        # select subclass so clicking the field selects the
+        # "(none)" placeholder and the user can immediately type a
+        # real angle without first deleting the placeholder text.
+        self.ai_input = _AutoSelectDoubleSpinBox()
         self.ai_input.setRange(0.0, 90.0)
         self.ai_input.setDecimals(4)
         self.ai_input.setSingleStep(0.01)
@@ -1042,6 +1045,28 @@ def _range_or_none(
     return (lo_v, hi_v)
 
 
+class _AutoSelectDoubleSpinBox(QDoubleSpinBox):
+    """A QDoubleSpinBox that selects all of its text on focus-in.
+
+    Without this, focusing a spinbox showing ``setSpecialValueText``
+    placeholder ("(none)" / "(unset)") parks the caret inside the
+    placeholder and the user has to manually select + delete the
+    string before they can type a real number. Selecting on focus
+    means the next keystroke replaces the placeholder so the user
+    can just click → type.
+
+    The select-all is wrapped in ``QTimer.singleShot(0, …)`` so it
+    runs *after* Qt's default focus handling — otherwise Qt's own
+    cursor placement runs after our selectAll and wipes it out.
+    """
+
+    def focusInEvent(self, event) -> None:  # type: ignore[override]
+        super().focusInEvent(event)
+        line = self.lineEdit()
+        if line is not None:
+            QTimer.singleShot(0, line.selectAll)
+
+
 def _opt_spin(
     *,
     decimals: int = 2,
@@ -1054,7 +1079,7 @@ def _opt_spin(
     text is shown there so the user can dial down to "(unset)" without
     typing 0.
     """
-    box = QDoubleSpinBox()
+    box = _AutoSelectDoubleSpinBox()
     # Sentinel below 0 acts as "unset"; pygid never sees a negative SDD
     # / wavelength in practice so this is safe.
     box.setMinimum(-1.0)

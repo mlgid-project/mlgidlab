@@ -62,6 +62,7 @@ class ParameterPanel(QGroupBox):
         self._radius_width_label = self._make_value_label()
         self._angle_label = self._make_value_label()
         self._angle_width_label = self._make_value_label()
+        self._score_label = self._make_value_label()
         self._type_label = self._make_value_label()
         self._id_label = self._make_value_label()
         # Color swatch shown next to the ID for matched selections —
@@ -104,6 +105,12 @@ class ParameterPanel(QGroupBox):
         form.addRow("Δ radius:", self._radius_width_label)
         form.addRow("Angle:", self._angle_label)
         form.addRow("Δ angle:", self._angle_width_label)
+        # mlgidDETECT confidence score. Populated from the SelectedPeak
+        # for detected/fitted/matched rows; the row stays hidden for
+        # manual peaks (no model provenance, so showing 0.000 would
+        # be misleading).
+        form.addRow("Score:", self._score_label)
+        self._row_score = form.rowCount() - 1
         self._detected_rows = list(range(
             self._row_detected_header, form.rowCount()
         ))
@@ -207,6 +214,7 @@ class ParameterPanel(QGroupBox):
                 self._radius_width_label,
                 self._angle_label,
                 self._angle_width_label,
+                self._score_label,
                 self._fit_radius_label,
                 self._fit_fwhm_r_label,
                 self._fit_angle_label,
@@ -264,6 +272,18 @@ class ParameterPanel(QGroupBox):
             self._radius_width_label.setText(f"{peak.radius_width:.3f} Å⁻¹")
             self._angle_label.setText(f"{peak.angle:.2f}°")
             self._angle_width_label.setText(f"{peak.angle_width:.2f}°")
+        # Score is meaningful only for model-derived peaks. Manual
+        # peaks have no score; hide the row entirely so the user
+        # doesn't read "0.000" as an actual confidence. Detected /
+        # fitted / matched all carry score; the row is only visible
+        # when the Detected section is on (matched/fitted hide the
+        # whole Detected block).
+        has_score = peak.score is not None and peak.kind != "manual"
+        self._form.setRowVisible(self._row_score, show_detected and has_score)
+        if has_score and show_detected:
+            self._score_label.setText(f"{peak.score:.3f}")
+        else:
+            self._score_label.setText(EMPTY)
         # Detected rows are hidden when ``show_detected`` is False, so
         # we don't blank them — set_fits / next show will refresh.
 

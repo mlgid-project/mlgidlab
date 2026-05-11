@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QRadioButton,
+    QSlider,
     QVBoxLayout,
     QWidget,
 )
@@ -255,6 +256,19 @@ class SelectedPeak:
     structure_label: str | None = None
     structure_color: str | None = None
     manual_ref: ManualPeak | None = None
+    # mlgidDETECT confidence score for the underlying row. Populated for
+    # detected / fitted / matched selections; left as None for manual
+    # peaks (which have no model provenance) so the parameter panel can
+    # skip the row instead of showing a misleading zero.
+    score: float | None = None
+    # When non-None, the selection represents a *matched structure*
+    # rather than a single peak. The list holds every fitted-peak id
+    # that belongs to the structure; the overlay highlight is drawn
+    # around all of them at once. The single peak_id field still
+    # carries a representative id (typically the first one) so the
+    # ParameterPanel can render the structure_label + first-peak
+    # geometry. Always None for detected / fitted / manual selections.
+    multi_peak_ids: list[int] | None = None
 
     @classmethod
     def from_manual(cls, peak: ManualPeak, frame: int) -> SelectedPeak:
@@ -376,6 +390,44 @@ def _action_targets_manual(action: _Action, peak: ManualPeak) -> bool:
     return target is peak
 
 
+def _peaks_subset(table: PeakTable, ids: list[int]) -> PeakTable:
+    """Return a row-subset of ``table`` keyed by ``ids``.
+
+    Used to build a multi-peak selection overlay from a matched
+    structure's full id list. Rows whose id isn't in ``table.ids``
+    are silently skipped (stale matched references — same tolerance
+    applied in ``file_model.list_matched_structures``).
+    """
+    if len(table) == 0 or not ids:
+        empty = np.zeros(0, dtype=float)
+        return PeakTable(
+            q_xy=empty, q_z=empty, angle=empty, radius=empty,
+            angle_width=empty, radius_width=empty,
+            is_ring=np.zeros(0, dtype=bool),
+            ids=np.zeros(0, dtype=int),
+            score=empty, amplitude=empty,
+        )
+    want = set(int(x) for x in ids)
+    idx = np.array(
+        [i for i in range(len(table)) if int(table.ids[i]) in want],
+        dtype=int,
+    )
+    if idx.size == 0:
+        return _peaks_subset(table, [])
+    return PeakTable(
+        q_xy=table.q_xy[idx],
+        q_z=table.q_z[idx],
+        angle=table.angle[idx],
+        radius=table.radius[idx],
+        angle_width=table.angle_width[idx],
+        radius_width=table.radius_width[idx],
+        is_ring=table.is_ring[idx],
+        ids=table.ids[idx],
+        score=table.score[idx],
+        amplitude=table.amplitude[idx],
+    )
+
+
 def _peaks_from_manual(manual: list[ManualPeak]) -> PeakTable:
     """Adapt a list of ManualPeak to the PeakTable shape so the existing
     rendering helpers can draw them without special-casing."""
@@ -386,6 +438,8 @@ def _peaks_from_manual(manual: list[ManualPeak]) -> PeakTable:
             angle_width=empty, radius_width=empty,
             is_ring=np.zeros(0, dtype=bool),
             ids=np.zeros(0, dtype=int),
+            score=empty,
+            amplitude=empty,
         )
     return PeakTable(
         q_xy=np.array([m.radius * np.cos(np.deg2rad(m.angle)) for m in manual]),
@@ -396,6 +450,8 @@ def _peaks_from_manual(manual: list[ManualPeak]) -> PeakTable:
         radius_width=np.array([m.radius_width for m in manual], dtype=float),
         is_ring=np.array([m.is_ring for m in manual], dtype=bool),
         ids=np.array([m.temp_id for m in manual], dtype=int),
+        score=np.zeros(len(manual), dtype=float),
+        amplitude=np.zeros(len(manual), dtype=float),
     )
 
 
@@ -607,6 +663,36 @@ def _polar_table_row_contains(table: PeakTable, i: int, x: float, y: float) -> b
     return r_lo <= x <= r_hi and a_lo <= y <= a_hi
 
 
+def _cart_to_polar(q_xy: float, q_z: float) -> tuple[float, float]:
+    """Map a Cartesian click ``(q_xy, q_z)`` back to ``(radius, angle_deg)``.
+
+    Matches the convention used everywhere else in the pipeline: the
+    Cartesian projections of a polar peak are written as
+    ``q_xy = r * cos(a)``, ``q_z = r * sin(a)`` (see
+    ``file_model.add_fitted_peak_row``), so inverting with
+    ``hypot`` + ``atan2(q_z, q_xy)`` reproduces the original
+    ``(radius, angle)``. The polar containment checks downstream
+    can then run unchanged.
+    """
+    r = float(np.hypot(q_xy, q_z))
+    a = float(np.degrees(np.arctan2(q_z, q_xy)))
+    return r, a
+
+
+def _cart_box_contains(peak: ManualPeak, q_xy: float, q_z: float) -> bool:
+    """Cartesian hit-test for a ManualPeak's polar box."""
+    r, a = _cart_to_polar(q_xy, q_z)
+    return _polar_box_contains(peak, r, a)
+
+
+def _cart_table_row_contains(
+    table: PeakTable, i: int, q_xy: float, q_z: float,
+) -> bool:
+    """Cartesian hit-test for row ``i`` of a PeakTable."""
+    r, a = _cart_to_polar(q_xy, q_z)
+    return _polar_table_row_contains(table, i, r, a)
+
+
 def _clip_angle(
     a_deg: float,
     da_deg: float,
@@ -737,13 +823,16 @@ class GIWAXSImageViewer(QWidget):
         )
         self._log_check.toggled.connect(self._on_log_toggled)
         bar.addWidget(self._log_check)
-        # NB: the "Timeline" toggle (pyqtgraph's bottom timeline strip)
-        # was removed after the lazy-loading switch. We no longer feed
-        # pyqtgraph a 3D stack, so its built-in timeline has no
-        # ``tVals`` and would render an empty strip. Frame navigation
-        # is exclusively driven by the Display-dock slider →
-        # viewer.set_frame chain.
+        # The frame-navigation controls (prev / play / next / slider /
+        # label) used to live in the Display dock's Frame row. They
+        # now sit here in the toolbar so the user can scrub frames
+        # regardless of which right-dock tab is in front. The host
+        # injects them via ``insert_frame_controls`` after the
+        # Display dock builds them — see MainWindow.
         bar.addStretch(1)
+        # Keep a handle on the layout so the host can splice the
+        # frame-navigation widgets in just before the trailing stretch.
+        self._toolbar_layout = bar
         bar_widget = QWidget(self)
         bar_widget.setLayout(bar)
         outer.addWidget(bar_widget)
@@ -1065,6 +1154,45 @@ class GIWAXSImageViewer(QWidget):
         self._frame_peaks[frame] = peaks
         if frame == self.current_frame:
             self._render_overlays(frame)
+
+    def insert_frame_controls(self, widgets: list[QWidget]) -> None:
+        """Splice ``widgets`` into the toolbar just before the
+        trailing stretch.
+
+        The host (MainWindow) owns the frame-navigation widgets
+        (previous, play, next, slider, label) so it can keep their
+        signal wiring intact when re-parenting them. The trailing
+        stretch added in ``__init__`` is **preserved** here — when
+        the slider is hidden (single-frame stack) the stretch is
+        the only expanding item left, which keeps the other toolbar
+        controls clustered to the left instead of being spread out
+        across the image width. When the slider is visible it
+        carries a much larger stretch factor so it dominates and
+        consumes the leftover horizontal space; the trailing
+        stretch only kicks in when the slider's stretch
+        contribution is zero (hidden widget).
+        """
+        bar = self._toolbar_layout
+        # Insert in front of the trailing stretch (always the last
+        # item from __init__). ``insert_at`` is updated after each
+        # call so widgets land in the order given.
+        insert_at = bar.count() - 1
+        if insert_at < 0:
+            insert_at = 0
+        bar.insertSpacing(insert_at, 16)
+        insert_at += 1
+        for w in widgets:
+            if isinstance(w, QSlider):
+                # Slider gets a much larger stretch factor than the
+                # trailing stretch so it eats the leftover width
+                # when visible. When the slider is hidden, the
+                # trailing stretch (factor 1) absorbs the space
+                # alone and the other toolbar items stay packed
+                # against the left edge.
+                bar.insertWidget(insert_at, w, 100)
+            else:
+                bar.insertWidget(insert_at, w)
+            insert_at += 1
 
     def set_overlay_visible(self, kind: str, visible: bool) -> None:
         if kind not in OVERLAY_KINDS:
@@ -1646,6 +1774,8 @@ class GIWAXSImageViewer(QWidget):
                 radius_width=fitted.radius_width[idx],
                 is_ring=fitted.is_ring[idx],
                 ids=fitted.ids[idx],
+                score=fitted.score[idx],
+                amplitude=fitted.amplitude[idx],
             )
 
     def polar_data(
@@ -1922,18 +2052,38 @@ class GIWAXSImageViewer(QWidget):
         manual_table = _peaks_from_manual(manual_list)
         # Selection highlight: a one-row PeakTable from whatever's selected,
         # except suppressed when the ROI is doing the highlighting itself.
+        # Matched-structure selections (multi_peak_ids set) expand to
+        # every peak in the structure — pull the geometry from the frame's
+        # fitted table so the boxes track ROI edits / re-fits.
         sel_table: PeakTable | None = None
         if self._selected is not None and not roi_active:
-            sel_table = _peaks_from_manual([
-                ManualPeak(
-                    radius=self._selected.radius,
-                    angle=self._selected.angle,
-                    radius_width=self._selected.radius_width,
-                    angle_width=self._selected.angle_width,
-                    is_ring=self._selected.is_ring,
-                    temp_id=self._selected.peak_id,
-                )
-            ])
+            if self._selected.multi_peak_ids and fit is not None:
+                sel_table = _peaks_subset(fit, self._selected.multi_peak_ids)
+                # Fallback to the representative peak if every id has
+                # gone stale (e.g. user re-ran fitting since the
+                # selection was set).
+                if len(sel_table) == 0:
+                    sel_table = _peaks_from_manual([
+                        ManualPeak(
+                            radius=self._selected.radius,
+                            angle=self._selected.angle,
+                            radius_width=self._selected.radius_width,
+                            angle_width=self._selected.angle_width,
+                            is_ring=self._selected.is_ring,
+                            temp_id=self._selected.peak_id,
+                        )
+                    ])
+            else:
+                sel_table = _peaks_from_manual([
+                    ManualPeak(
+                        radius=self._selected.radius,
+                        angle=self._selected.angle,
+                        radius_width=self._selected.radius_width,
+                        angle_width=self._selected.angle_width,
+                        is_ring=self._selected.is_ring,
+                        temp_id=self._selected.peak_id,
+                    )
+                ])
 
         # Fitted-preview overlay: only meaningful while a candidate peak
         # (manual or detected) is the active selection — both are subject to
@@ -2228,11 +2378,27 @@ class GIWAXSImageViewer(QWidget):
         )
 
     def _on_select_at(self, pos: QPointF) -> None:
-        if self._mode != MODE_POLAR or self._busy:
+        # Raw mode has no q-space overlays to hit-test. Polar and
+        # Cartesian both run the same hit-test pipeline; the click
+        # coordinates arrive in whatever space the viewbox is currently
+        # showing (polar = (r, a), cartesian = (q_xy, q_z)), and the
+        # mode-specific helpers below normalise to polar before
+        # checking containment.
+        if self._mode not in (MODE_POLAR, MODE_CARTESIAN) or self._busy:
             return
         x, y = float(pos.x()), float(pos.y())
+        cart = self._mode == MODE_CARTESIAN
         frame = self.current_frame
         peaks_for_frame = self._frame_peaks.get(frame) or {}
+
+        def hit_manual(peak: ManualPeak) -> bool:
+            return _cart_box_contains(peak, x, y) if cart else _polar_box_contains(peak, x, y)
+
+        def hit_table(tbl: PeakTable, i: int) -> bool:
+            return (
+                _cart_table_row_contains(tbl, i, x, y) if cart
+                else _polar_table_row_contains(tbl, i, x, y)
+            )
 
         # Priority order: manual > fitted > detected > matched. Matched is
         # last because it's a subset of fitted; the rare case where the user
@@ -2241,7 +2407,7 @@ class GIWAXSImageViewer(QWidget):
         # 1) manual
         if self._visibility.get("manual", True):
             for peak in reversed(self._manual_peaks.get(frame, [])):
-                if _polar_box_contains(peak, x, y):
+                if hit_manual(peak):
                     self._set_selected(SelectedPeak.from_manual(peak, frame))
                     return
 
@@ -2253,7 +2419,7 @@ class GIWAXSImageViewer(QWidget):
             if table is None or len(table) == 0:
                 continue
             for i in reversed(range(len(table))):
-                if _polar_table_row_contains(table, i, x, y):
+                if hit_table(table, i):
                     self._set_selected(SelectedPeak(
                         kind=kind,
                         frame=frame,
@@ -2263,6 +2429,7 @@ class GIWAXSImageViewer(QWidget):
                         radius_width=float(table.radius_width[i]),
                         angle_width=float(table.angle_width[i]),
                         is_ring=bool(table.is_ring[i]),
+                        score=float(table.score[i]),
                     ))
                     return
 
@@ -2276,7 +2443,7 @@ class GIWAXSImageViewer(QWidget):
                 tbl = s.peaks
                 color = matched_pen_for(s_idx)["color"]
                 for i in reversed(range(len(tbl))):
-                    if _polar_table_row_contains(tbl, i, x, y):
+                    if hit_table(tbl, i):
                         self._set_selected(SelectedPeak(
                             kind="matched",
                             frame=frame,
@@ -2289,6 +2456,13 @@ class GIWAXSImageViewer(QWidget):
                             structure_uid=s.unique_id,
                             structure_label=s.label,
                             structure_color=color,
+                            score=float(tbl.score[i]),
+                            # Clicking any peak of the structure
+                            # promotes the whole structure into the
+                            # selection — overlay highlights every
+                            # peak in it, table syncs the structure
+                            # row.
+                            multi_peak_ids=[int(x) for x in tbl.ids],
                         ))
                         return
 
