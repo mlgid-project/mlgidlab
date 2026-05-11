@@ -24,8 +24,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from mlgidlab.file_model import EntryStack, MatchedStructure, PeakTable
-from mlgidlab.polar import stack_to_polar
+from mlgidlab.file_model import (
+    EntryStack,
+    FrameSource,
+    MatchedStructure,
+    PeakTable,
+    _LazyImageStack,
+    _LazyPolarStack,
+)
+from mlgidlab.polar import stack_to_polar  # noqa: F401  (retained as a reference impl)
 
 OVERLAY_KINDS = ("detected", "fitted", "manual")
 MODE_CARTESIAN = "cartesian"
@@ -197,6 +204,12 @@ def _robust_levels(frame: np.ndarray) -> tuple[float, float]:
 
 @dataclass
 class _DisplayParams:
+    """Per-mode display state. ``image_pg`` is the *single 2D frame*
+    for the current frame index — we never feed pyqtgraph a 3D stack
+    anymore (see lazy-loading milestone). The viewer keeps the most
+    recent ``_DisplayParams`` so per-frame scrubs can re-use ``pos`` /
+    ``scale`` / ``levels`` without re-deriving them.
+    """
     image_pg: np.ndarray
     pos: tuple[float, float]
     scale: tuple[float, float]
@@ -840,11 +853,27 @@ class GIWAXSImageViewer(QWidget):
         self._mode = MODE_POLAR
         self._log_scale: bool = False
         self._stack: EntryStack | None = None
+        # The FrameSource backing the active EntryStack. Owns the live
+        # h5py handle + per-frame LRU; released across the silx detach
+        # / reattach dance via release_frame_source / acquire_frame_source.
+        self._frame_source: "FrameSource | None" = None  # type: ignore[name-defined]
+        # The viewer drives frame indexing itself (the Display-dock slider
+        # is the single source of truth). pyqtgraph used to track this via
+        # ImageView.currentIndex, but we stopped feeding it 3D stacks once
+        # large-file support landed — see the lazy-loading milestone.
+        self._frame_index: int = 0
+        # Last applied _DisplayParams so per-frame scrubs reuse pos/scale/
+        # levels without rebuilding them.
+        self._display_params: _DisplayParams | None = None
         # Raw-mode preview state. Held separately from ``_stack`` because raw
         # detector frames have no q-axes — they're rendered in pixel
         # coordinates and carry no overlays.
         self._raw_image_stack: np.ndarray | None = None
-        self._polar_cache: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+        # Polar grid axes derived from the FrameSource. Stored as a
+        # (lazy_polar_stack, radius, angle) tuple so consumers
+        # (profile viewer, cursor readout) get a single-frame index
+        # without precomputing the full polar stack.
+        self._polar_cache: "tuple[_LazyPolarStack, np.ndarray, np.ndarray] | None" = None  # type: ignore[name-defined]
         self._next_manual_id = -1  # negative IDs distinguish manual from detected
         self._selected: SelectedPeak | None = None
         self._roi_item: pg.ROI | None = None
@@ -869,7 +898,12 @@ class GIWAXSImageViewer(QWidget):
         # ring" toggle is on.
         self._fitted_preview_is_ring: bool = False
 
-        self._view.sigTimeChanged.connect(self._on_time_changed)
+        # NB: pyqtgraph's sigTimeChanged is no longer connected — we
+        # stopped feeding ImageView 3D stacks once lazy frame loading
+        # landed (see the lazy-loading milestone in
+        # Documentation/). Frame changes now flow exclusively through
+        # MainWindow → viewer.set_frame, and ``frameChanged`` is emitted
+        # from there.
 
         # Add a "Reset zoom" action to the viewbox right-click menu so the
         # user can undo a manual zoom without leaving the keyboard / mouse.
@@ -882,12 +916,18 @@ class GIWAXSImageViewer(QWidget):
     def show_stack(self, stack: EntryStack, *, preserve_view: bool = False) -> None:
         """Render ``stack`` in the active mode.
 
-        ``preserve_view`` keeps the current viewbox range and time-axis
-        position across the re-render — used after pipeline ops and direct
-        h5py edits where the underlying stack is identical and only the
-        peak overlays changed. Default ``False`` (autorange) for the
-        entry-switch / file-open paths, where the new stack typically has
-        different axes.
+        ``preserve_view`` keeps the current viewbox range and frame
+        index across the re-render — used after pipeline ops and
+        direct h5py edits where the underlying stack is identical and
+        only the peak overlays changed. Default ``False`` (autorange)
+        for the entry-switch / file-open paths, where the new stack
+        typically has different axes.
+
+        ``stack.image_stack`` must be a ``_LazyImageStack`` (i.e. the
+        return value of ``file_model.load_entry``). The viewer extracts
+        its backing ``FrameSource`` and stashes it on
+        ``self._frame_source`` so frame reads can stream from disk
+        without the full stack ever entering RAM.
         """
         # Capture before resetting cached state so the saved range is the
         # one the user is actually looking at right now.
@@ -903,7 +943,35 @@ class GIWAXSImageViewer(QWidget):
                 pass
             saved_frame = self.current_frame
 
+        # Release any prior FrameSource before adopting the new one —
+        # an open h5py handle on the previous temp file would block its
+        # cleanup during session close on Windows.
+        if (
+            self._frame_source is not None
+            and not isinstance(stack.image_stack, _LazyImageStack)
+        ):
+            self._frame_source.release()
+            self._frame_source = None
+        elif (
+            self._frame_source is not None
+            and isinstance(stack.image_stack, _LazyImageStack)
+            and stack.image_stack.source is not self._frame_source
+        ):
+            self._frame_source.release()
+            self._frame_source = None
+
         self._stack = stack
+        if isinstance(stack.image_stack, _LazyImageStack):
+            self._frame_source = stack.image_stack.source
+        else:
+            # Defensive fallback for tests that hand-build an EntryStack
+            # with a raw ndarray. The viewer's hot path always goes
+            # through _frame_source, so reject this case loudly.
+            raise TypeError(
+                "show_stack expects an EntryStack whose image_stack is "
+                "a _LazyImageStack (i.e. produced by load_entry). Got: "
+                f"{type(stack.image_stack).__name__}"
+            )
         # ``_raw_image_stack`` belongs to a prior RawSession; clearing it
         # here ensures _render_active_mode never tries to re-render raw
         # pixel data over a NeXus stack.
@@ -919,20 +987,25 @@ class GIWAXSImageViewer(QWidget):
             )
         self._polar_cache = None
         self._frame_peaks.clear()
+        # Clamp frame index to the new stack's range. Preserved when
+        # the caller asked for it and the prior frame is still valid;
+        # otherwise default to 0 so a fresh entry starts at the first
+        # frame.
+        if preserve_view and saved_frame is not None:
+            self._frame_index = max(
+                0, min(int(saved_frame), self._stack.n_frames - 1)
+            )
+        else:
+            self._frame_index = 0
         self._render_active_mode()
 
-        # _apply_params calls setImage(autoRange=True), which resets the
-        # range and the time index. If the caller asked for preservation,
+        # _render_active_mode calls setImage(autoRange=True), which
+        # resets the viewbox. If the caller asked for preservation,
         # apply the snapshot afterwards so it wins.
         if preserve_view and saved_xrange is not None and saved_yrange is not None:
             self._plot.getViewBox().setRange(
                 xRange=saved_xrange, yRange=saved_yrange, padding=0
             )
-        if preserve_view and saved_frame is not None:
-            try:
-                self._view.setCurrentIndex(int(saved_frame))
-            except Exception:
-                pass
 
     def set_mode_radios_visible(self, visible: bool) -> None:
         """Show / hide the Cartesian / Polar radios in the top toolbar.
@@ -1129,11 +1202,53 @@ class GIWAXSImageViewer(QWidget):
         self._selected = None
         self._roi_drag_before = None
         self._sync_roi()
+        # Release the long-lived h5py read handle before dropping the
+        # stack reference — temp-dir cleanup at session close otherwise
+        # fails on Windows because the file is still open.
+        if self._frame_source is not None:
+            self._frame_source.release()
+            self._frame_source = None
         self._stack = None
         self._raw_image_stack = None
         self._polar_cache = None
+        self._display_params = None
+        self._frame_index = 0
         if had_selection:
             self.selectionChanged.emit(None)
+
+    # -- File-handle coordination with the silx detach/reattach dance --
+
+    def release_frame_source(self) -> None:
+        """Close the FrameSource's h5py handle + clear its LRUs.
+
+        Called by MainWindow._detach_silx_tree before any path that
+        opens the same temp file ``r+`` (pipeline runs, ROI commit
+        write-throughs, Add-to-fitted, clear-peaks, save-as).
+        Idempotent — safe to call when no FrameSource is active.
+        """
+        if self._frame_source is not None:
+            self._frame_source.release()
+
+    def acquire_frame_source(self) -> None:
+        """Reopen the FrameSource's h5py handle after a write completes.
+
+        Pairs with ``release_frame_source`` via the silx reattach path.
+        The polar cache is invalidated because per-frame polar arrays
+        depend on the underlying Cartesian frames — and after a pipeline
+        run those may have been overwritten. The polar grid axes
+        (radius / angle) stay valid since they're functions of q_xy /
+        q_z only, which don't change.
+        """
+        if self._frame_source is not None and not self._frame_source.is_open:
+            self._frame_source.acquire()
+            # Force a refresh of the polar cache wrapper so consumers
+            # holding the previous tuple drop their reference.
+            self._polar_cache = None
+            # Re-render the current frame so the on-screen image
+            # reflects any post-write changes to the underlying data.
+            # _render_active_mode rebuilds the display params + LUT.
+            if self._stack is not None:
+                self._render_active_mode()
 
     # -- Manual peaks --
 
@@ -1355,7 +1470,7 @@ class GIWAXSImageViewer(QWidget):
 
     @property
     def current_frame(self) -> int:
-        return int(self._view.currentIndex)
+        return self._frame_index
 
     @property
     def n_frames(self) -> int:
@@ -1365,17 +1480,31 @@ class GIWAXSImageViewer(QWidget):
         return 0 if self._stack is None else int(self._stack.n_frames)
 
     def set_frame(self, frame: int) -> None:
-        """Programmatic seek. Wraps pyqtgraph's setCurrentIndex with a
-        bounds check so callers (Display-dock slider, scripts) can't
-        drive the timeline out of range.
+        """Seek to ``frame``.
+
+        The single source of truth for frame changes. Reads the new
+        frame from the active source (FrameSource for NeXus, the
+        in-memory raw stack for raw mode), pushes the 2D image to
+        pyqtgraph via ``setImage`` (with the cached pos / scale /
+        levels so the LUT and viewbox stay stable), updates the
+        per-frame overlays, and emits ``frameChanged`` plus
+        ``matchedStructuresChanged`` exactly once.
+
+        No-op when ``frame`` is already current or out of range.
         """
         n = self.n_frames
         if n == 0:
             return
         idx = max(0, min(int(frame), n - 1))
-        if idx == self.current_frame:
+        if idx == self._frame_index:
             return
-        self._view.setCurrentIndex(idx)
+        self._frame_index = idx
+        self._render_frame(idx, auto_range=False)
+        self._render_overlays(idx)
+        self.frameChanged.emit(idx)
+        # The Display dock rebuilds its matched-structure rows from this
+        # signal — different frames can have different solutions.
+        self.matchedStructuresChanged.emit(idx, self.matched_structures(idx))
 
     @property
     def selected_peak(self) -> SelectedPeak | None:
@@ -1530,50 +1659,71 @@ class GIWAXSImageViewer(QWidget):
 
     def polar_data(
         self,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
-        """Return (polar_stack, radius, angle), computing the cache if needed.
+    ) -> "tuple[_LazyPolarStack, np.ndarray, np.ndarray] | None":
+        """Return ``(polar_stack, radius, angle)`` for the active entry.
 
-        Returns None if no stack is currently loaded. Used by the profile
-        viewer to share a single polar transform across panels.
+        ``polar_stack`` is a ``_LazyPolarStack`` — supports
+        ``polar_stack[i]`` (one polar frame) and
+        ``polar_stack[frame, r, a]`` (single-pixel cursor lookup).
+        Per-frame resampling happens on demand inside the
+        ``FrameSource``; nothing is precomputed eagerly.
+
+        Returns None if no stack is currently loaded or the
+        FrameSource is currently released (e.g. mid-pipeline silx
+        detach). Callers should re-call after the reattach.
         """
-        if self._stack is None:
+        if self._stack is None or self._frame_source is None:
+            return None
+        if not self._frame_source.is_open:
             return None
         if self._polar_cache is None:
-            self._polar_cache = stack_to_polar(
-                self._stack.image_stack, self._stack.q_xy, self._stack.q_z
+            radius, angle = self._frame_source.polar_axes()
+            self._polar_cache = (
+                _LazyPolarStack(self._frame_source), radius, angle,
             )
         return self._polar_cache
 
     # -- Rendering --
 
     def _render_active_mode(self) -> None:
+        """Build per-mode axis state + first-frame levels, then render.
+
+        Called on stack swap (entry change, file open), mode toggle
+        (Cartesian ↔ polar), and log/linear toggle. The actual per-
+        frame pixel push happens in ``_render_frame`` which is also
+        the path ``set_frame`` takes on every scrub.
+        """
         if self._mode == MODE_RAW:
             if self._raw_image_stack is None:
                 return
-            self._apply_params(self._build_raw_params())
-            # No overlays in raw mode — nothing to render past _apply_params.
+            self._display_params = self._build_raw_params()
+            self._render_frame(self._frame_index, auto_range=True)
+            # No overlays in raw mode — nothing to render past _render_frame.
             return
-        if self._stack is None:
+        if self._stack is None or self._frame_source is None:
             return
         if self._mode == MODE_POLAR:
-            params = self._build_polar_params()
+            self._display_params = self._build_polar_params()
         else:
-            params = self._build_cartesian_params()
-        self._apply_params(params)
+            self._display_params = self._build_cartesian_params()
+        self._render_frame(self._frame_index, auto_range=True)
         self._render_overlays(self.current_frame)
 
     def _build_raw_params(self) -> _DisplayParams:
-        """Pixel-coordinate display params for a raw detector stack.
+        """Pixel-coordinate axis state for a raw detector stack.
 
-        File order is (frames, H, W); pyqtgraph wants (t, x, y) so we
-        transpose to (frames, W, H). Axes are labeled in pixels — q
+        File order is (frames, H, W). For pyqtgraph we want each frame
+        displayed as (W, H) — see ``_render_frame``'s raw branch for
+        the per-frame transpose. Axes are labelled in pixels; q
         coordinates aren't meaningful before conversion.
         """
         assert self._raw_image_stack is not None
-        img_pg = np.transpose(self._raw_image_stack, (0, 2, 1))
-        levels = _robust_levels(self._raw_image_stack[0])
+        # ``image_pg`` here is just the *first* frame, used for level
+        # computation. Per-frame pushes happen in ``_render_frame``.
+        first = np.asarray(self._raw_image_stack[0]).T  # (W, H)
+        levels = _robust_levels(first)
         return _DisplayParams(
-            image_pg=img_pg,
+            image_pg=first,
             pos=(0.0, 0.0),
             scale=(1.0, 1.0),
             levels=levels,
@@ -1582,22 +1732,19 @@ class GIWAXSImageViewer(QWidget):
         )
 
     def _build_cartesian_params(self) -> _DisplayParams:
-        assert self._stack is not None
-        # File order is (frames, q_z, q_xy); pyqtgraph wants (t, x, y).
-        img_pg = np.transpose(self._stack.image_stack, (0, 2, 1))
-        x0 = float(self._stack.q_xy[0])
-        y0 = float(self._stack.q_z[0])
-        sx = (
-            float(self._stack.q_xy[-1] - self._stack.q_xy[0])
-            / max(len(self._stack.q_xy) - 1, 1)
-        )
-        sy = (
-            float(self._stack.q_z[-1] - self._stack.q_z[0])
-            / max(len(self._stack.q_z) - 1, 1)
-        )
-        levels = _robust_levels(self._stack.image_stack[0])
+        """Cartesian axis state. Reads frame 0 via the FrameSource to
+        compute robust intensity levels; per-frame rendering is lazy.
+        """
+        assert self._stack is not None and self._frame_source is not None
+        q_xy = self._frame_source.q_xy
+        q_z = self._frame_source.q_z
+        x0 = float(q_xy[0]); y0 = float(q_z[0])
+        sx = float(q_xy[-1] - q_xy[0]) / max(len(q_xy) - 1, 1)
+        sy = float(q_z[-1] - q_z[0]) / max(len(q_z) - 1, 1)
+        first = self._frame_source.get_cartesian(0).T  # (n_qxy, n_qz)
+        levels = _robust_levels(first)
         return _DisplayParams(
-            image_pg=img_pg,
+            image_pg=first,
             pos=(x0, y0),
             scale=(sx, sy),
             levels=levels,
@@ -1606,22 +1753,30 @@ class GIWAXSImageViewer(QWidget):
         )
 
     def _build_polar_params(self) -> _DisplayParams:
-        assert self._stack is not None
+        """Polar axis state + lazy polar wrapper.
+
+        The polar grid (``radius`` / ``angle``) is derived once from
+        ``q_xy`` / ``q_z`` and reused across frames; per-frame polar
+        resampling happens on demand in ``FrameSource.get_polar``.
+        """
+        assert self._stack is not None and self._frame_source is not None
+        radius, angle = self._frame_source.polar_axes()
+        # Cache a (lazy_polar_stack, radius, angle) tuple so consumers
+        # (profile viewer, cursor readout) share the same FrameSource-
+        # backed view without re-creating wrappers.
         if self._polar_cache is None:
-            self._polar_cache = stack_to_polar(
-                self._stack.image_stack, self._stack.q_xy, self._stack.q_z
+            self._polar_cache = (
+                _LazyPolarStack(self._frame_source), radius, angle,
             )
-        polar_stack, radius, angle = self._polar_cache  # (frames, n_r, n_ang)
-        # We want radius along x, angle along y. polar_stack is already
-        # (frame, radius, angle) — that maps directly to pyqtgraph's (t, x, y).
-        img_pg = polar_stack
-        x0 = float(radius[0])
-        y0 = float(angle[0])
+        x0 = float(radius[0]); y0 = float(angle[0])
         sx = float(radius[-1] - radius[0]) / max(len(radius) - 1, 1)
         sy = float(angle[-1] - angle[0]) / max(len(angle) - 1, 1)
-        levels = _robust_levels(polar_stack[0])
+        # polar_stack frame layout is (n_radius, n_angle); pyqtgraph
+        # wants (x=radius, y=angle) per frame, which already matches.
+        first = self._frame_source.get_polar(0)
+        levels = _robust_levels(first)
         return _DisplayParams(
-            image_pg=img_pg,
+            image_pg=first,
             pos=(x0, y0),
             scale=(sx, sy),
             levels=levels,
@@ -1629,23 +1784,48 @@ class GIWAXSImageViewer(QWidget):
             y_label=("angle", "deg"),
         )
 
-    def _apply_params(self, p: _DisplayParams) -> None:
+    def _render_frame(self, idx: int, *, auto_range: bool) -> None:
+        """Push the 2D frame at ``idx`` to pyqtgraph.
+
+        Uses the cached ``_display_params`` (built once per stack/mode
+        swap) so per-frame scrubs don't rebuild axes. ``auto_range`` is
+        True only on the initial render after a stack/mode change;
+        every subsequent frame change passes False to preserve the
+        user's zoom/pan.
+        """
+        if self._display_params is None:
+            return
+        p = self._display_params
+        # Fetch the actual 2D frame for ``idx``.
+        if self._mode == MODE_RAW:
+            if self._raw_image_stack is None:
+                return
+            frame = np.asarray(self._raw_image_stack[idx]).T
+        elif self._mode == MODE_POLAR:
+            if self._frame_source is None:
+                return
+            frame = self._frame_source.get_polar(idx)
+        else:  # MODE_CARTESIAN
+            if self._frame_source is None:
+                return
+            frame = self._frame_source.get_cartesian(idx).T
+
         self._plot.setLabel("bottom", p.x_label[0], units=p.x_label[1])
         self._plot.setLabel("left", p.y_label[0], units=p.y_label[1])
-        image, levels = self._maybe_apply_log(p.image_pg, p.levels)
+        image, levels = self._maybe_apply_log(frame, p.levels)
         self._view.setImage(
             image,
-            autoRange=True,
+            autoRange=auto_range,
             autoLevels=False,
             levels=levels,
             pos=p.pos,
             scale=p.scale,
         )
         # pyqtgraph's setImage internally calls roiClicked() which
-        # force-shows the bottom timeline strip whenever the image
-        # has a time axis (line 671 in ImageView.py). Re-apply our
-        # toggle state so the user's choice persists across stack
-        # reloads.
+        # force-shows the bottom timeline strip whenever the image has
+        # a time axis. With single 2D frames there is no time axis so
+        # the strip stays hidden; we still re-apply the user's choice
+        # explicitly so the checkbox state is the source of truth.
         self._set_timeline_visible(self._timeline_check.isChecked())
 
     def _maybe_apply_log(
@@ -1714,13 +1894,10 @@ class GIWAXSImageViewer(QWidget):
         else:
             ui.splitter.setSizes([1, 0])
 
-    def _on_time_changed(self, index: int, _time: float) -> None:
-        idx = int(index)
-        self._render_overlays(idx)
-        self.frameChanged.emit(idx)
-        # The panel rebuilds its matched-structure rows from this signal —
-        # different frames can have a different set of solutions.
-        self.matchedStructuresChanged.emit(idx, self.matched_structures(idx))
+    # NB: _on_time_changed (the old pyqtgraph sigTimeChanged slot) is
+    # removed. Frame changes flow through set_frame; emissions of
+    # frameChanged + matchedStructuresChanged happen there. Left as a
+    # comment so future code reviews see the deliberate removal.
 
     def _render_overlays(self, frame: int) -> None:
         # Raw mode has no peak data to draw — return before touching any

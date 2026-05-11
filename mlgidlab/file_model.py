@@ -6,6 +6,7 @@ No Qt imports — keep this module independently testable.
 from __future__ import annotations
 
 import csv
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
@@ -15,6 +16,16 @@ import numpy as np
 
 ENTRY_PREFIX = "entry_"
 FRAME_KEY_FMT = "frame{:05d}"
+
+# Target RAM ceiling for the per-frame caches owned by FrameSource. Sized
+# at ~1 GB combined across Cartesian + polar so a typical 8 GB-RAM laptop
+# stays headroom-positive while still keeping scrub instant for a small
+# window around the current frame. MIN keeps single-frame scrub from
+# falling off the cache; MAX prevents pathological cases where tiny
+# frames (<1 MB) would otherwise spawn thousands of LRU entries.
+FRAME_LRU_BYTES_TARGET = 1_024 * 1_024 * 1_024
+FRAME_LRU_MIN = 4
+FRAME_LRU_MAX = 64
 
 
 def is_entry_group_name(name: str) -> bool:
@@ -130,12 +141,367 @@ def list_entry_signals(file_path: Path) -> dict[str, str | None]:
 
 
 def load_entry(file_path: Path, entry: str) -> EntryStack:
-    """Load the full image stack and axes for one entry."""
-    with h5py.File(file_path, "r") as f:
-        img = np.asarray(f[f"{entry}/{IMG_REL}"][()])
-        q_xy = np.asarray(f[f"{entry}/{QXY_REL}"][()], dtype=float)
-        q_z = np.asarray(f[f"{entry}/{QZ_REL}"][()], dtype=float)
-    return EntryStack(image_stack=img, q_xy=q_xy, q_z=q_z)
+    """Open one entry as a lazily-readable stack.
+
+    Returns an ``EntryStack`` whose ``image_stack`` is a tiny
+    ``_LazyImageStack`` wrapper rather than a fully materialised numpy
+    array. The wrapper holds a reference to a ``FrameSource`` that owns
+    a long-lived ``h5py.File`` handle; per-frame reads happen on
+    demand via ``FrameSource.get_cartesian(i)``. Axes ``q_xy`` / ``q_z``
+    are still loaded eagerly (small, constant per entry).
+
+    This switches the GUI from "load 100 GB to RAM" to "stream one
+    frame at a time" without changing the public ``EntryStack`` shape.
+    Callers that previously did ``stack.image_stack[i]`` keep working;
+    callers that try to treat ``image_stack`` as a numpy ndarray
+    (``.view()``, ``.copy()``, ``np.asarray(stack.image_stack)``) will
+    fail loudly — by design, so accidental whole-stack reads surface
+    in review rather than silently materialising 100 GB.
+    """
+    source = FrameSource(file_path=Path(file_path), entry=entry)
+    source.acquire()
+    lazy = _LazyImageStack(source)
+    return EntryStack(
+        image_stack=lazy,  # type: ignore[arg-type]  # duck-types as ndarray
+        q_xy=source.q_xy,
+        q_z=source.q_z,
+    )
+
+
+class FrameSource:
+    """Owns one long-lived ``h5py.File`` handle and per-frame LRU caches.
+
+    Backs an entry's image stack without ever pulling the full 3D array
+    into memory. Cartesian frames come straight from the h5py dataset
+    (chunked reads are cheap because pygid writes with ``chunks=True``).
+    Polar frames are computed on demand via
+    ``polar.cartesian_to_polar`` and cached separately. Axes
+    (``q_xy``, ``q_z``, polar radius / angle) are read once on
+    ``acquire()`` and cached as small numpy arrays.
+
+    Lifecycle is coordinated with the silx-detach/reattach dance that
+    wraps every file write: ``release()`` closes the handle and clears
+    the caches; ``acquire()`` reopens. The viewer calls these via
+    ``GIWAXSImageViewer.release_frame_source`` /
+    ``acquire_frame_source`` so the same FrameSource instance can
+    survive across pipeline runs without rebuilding from scratch.
+    """
+
+    def __init__(self, file_path: Path, entry: str) -> None:
+        self._file_path = Path(file_path)
+        self._entry = entry
+
+        # State populated on acquire(); cleared on release().
+        self._file: h5py.File | None = None
+        self._dataset: h5py.Dataset | None = None
+        self._q_xy: np.ndarray | None = None
+        self._q_z: np.ndarray | None = None
+        self._shape: tuple[int, int, int] | None = None
+        self._dtype: np.dtype | None = None
+
+        # LRU caches. Sized on first acquire once the frame shape is known.
+        # OrderedDict gives us move-to-end on hit + popitem(last=False) for
+        # eviction, no external dependency.
+        self._cart_lru: OrderedDict[int, np.ndarray] = OrderedDict()
+        self._polar_lru: OrderedDict[int, np.ndarray] = OrderedDict()
+        self._cart_lru_max: int = FRAME_LRU_MIN
+        self._polar_lru_max: int = max(FRAME_LRU_MIN // 2, 2)
+
+        # Polar grid axes (computed once on first polar request and reused;
+        # they're functions of q_xy / q_z only, constant across frames).
+        self._polar_radius: np.ndarray | None = None
+        self._polar_angle: np.ndarray | None = None
+
+    # -- Lifecycle ----------------------------------------------------------
+
+    @property
+    def is_open(self) -> bool:
+        return self._file is not None
+
+    def acquire(self) -> None:
+        """Open the h5py file and load axes + shape.
+
+        Idempotent: a second acquire on an already-open FrameSource is
+        a no-op. Polar axes survive across release/acquire cycles
+        because they're derived purely from q_xy / q_z, not the file.
+        """
+        if self._file is not None:
+            return
+        self._file = h5py.File(self._file_path, "r")
+        try:
+            self._dataset = self._file[f"{self._entry}/{IMG_REL}"]
+            self._q_xy = np.asarray(
+                self._file[f"{self._entry}/{QXY_REL}"][()], dtype=float
+            )
+            self._q_z = np.asarray(
+                self._file[f"{self._entry}/{QZ_REL}"][()], dtype=float
+            )
+            self._shape = tuple(self._dataset.shape)  # type: ignore[assignment]
+            self._dtype = self._dataset.dtype
+            # Now that we know the frame size, size the Cartesian LRU so
+            # `cart_lru_max * frame_bytes` lands near half the target.
+            frame_bytes = int(self._shape[1]) * int(self._shape[2]) * int(
+                np.dtype(self._dtype).itemsize
+            )
+            if frame_bytes > 0:
+                half = FRAME_LRU_BYTES_TARGET // 2
+                self._cart_lru_max = max(
+                    FRAME_LRU_MIN, min(FRAME_LRU_MAX, half // frame_bytes)
+                )
+                # Polar grid is denser than Cartesian for the typical
+                # (n_radius=1000, n_angle=900) defaults — size the polar
+                # LRU at half the Cartesian count so total stays under
+                # the target.
+                self._polar_lru_max = max(
+                    FRAME_LRU_MIN // 2, self._cart_lru_max // 2
+                )
+        except Exception:
+            # If anything failed mid-acquire, leave the FrameSource in a
+            # clean closed state so a retry doesn't trip on partial state.
+            self._file.close()
+            self._file = None
+            self._dataset = None
+            raise
+
+    def release(self) -> None:
+        """Close the h5py file and drop all per-frame caches.
+
+        Called by ``GIWAXSImageViewer.release_frame_source`` before any
+        write path that needs r+ on the same file (pipeline runs, ROI
+        commit, Add-to-fitted, clear-peaks). After release, calls to
+        ``get_cartesian`` / ``get_polar`` will lazily re-acquire (via
+        the host's reattach pairing); a manual ``acquire()`` is the
+        normal way to bring the source back online.
+        """
+        self._cart_lru.clear()
+        self._polar_lru.clear()
+        if self._file is not None:
+            try:
+                self._file.close()
+            except Exception:
+                pass
+        self._file = None
+        self._dataset = None
+
+    def relocate(self, new_path: Path) -> None:
+        """Point the FrameSource at a new filesystem path.
+
+        Used by Save As: the temp file is renamed to match the new
+        basename, so the FrameSource's stored ``_file_path`` would
+        otherwise become stale and the next ``acquire()`` would fail.
+        Caller is responsible for ordering the rename and the
+        release/acquire calls correctly — typically
+        ``release()`` → rename → ``relocate(new)`` → ``acquire()``.
+        """
+        self._file_path = Path(new_path)
+
+    # -- Shape + axes -------------------------------------------------------
+
+    @property
+    def n_frames(self) -> int:
+        if self._shape is None:
+            return 0
+        return int(self._shape[0])
+
+    @property
+    def q_xy(self) -> np.ndarray:
+        if self._q_xy is None:
+            raise RuntimeError("FrameSource not acquired")
+        return self._q_xy
+
+    @property
+    def q_z(self) -> np.ndarray:
+        if self._q_z is None:
+            raise RuntimeError("FrameSource not acquired")
+        return self._q_z
+
+    @property
+    def frame_shape(self) -> tuple[int, int]:
+        """(n_qz, n_qxy) — the shape of one Cartesian frame on disk."""
+        if self._shape is None:
+            raise RuntimeError("FrameSource not acquired")
+        return int(self._shape[1]), int(self._shape[2])
+
+    @property
+    def dtype(self) -> np.dtype:
+        if self._dtype is None:
+            raise RuntimeError("FrameSource not acquired")
+        return self._dtype
+
+    @property
+    def cart_lru_size(self) -> int:
+        return self._cart_lru_max
+
+    @property
+    def polar_lru_size(self) -> int:
+        return self._polar_lru_max
+
+    # -- Hot path -----------------------------------------------------------
+
+    def get_cartesian(self, i: int) -> np.ndarray:
+        """Read frame ``i`` from disk, returning a numpy 2D array.
+
+        LRU-cached: a recently-viewed frame is returned without a disk
+        round-trip. Caller receives the cached array reference — do not
+        mutate the returned array, the LRU stores it as-is.
+        """
+        if self._dataset is None:
+            raise RuntimeError("FrameSource not acquired")
+        if i in self._cart_lru:
+            self._cart_lru.move_to_end(i)
+            return self._cart_lru[i]
+        frame = np.asarray(self._dataset[i])
+        self._cart_lru[i] = frame
+        while len(self._cart_lru) > self._cart_lru_max:
+            self._cart_lru.popitem(last=False)
+        return frame
+
+    def get_polar(self, i: int) -> np.ndarray:
+        """Polar-resample frame ``i`` on demand.
+
+        The polar grid (radius / angle) is computed once on first call
+        and reused for every subsequent frame, since it's derived from
+        ``q_xy`` / ``q_z`` only. Per-frame polar arrays are LRU-cached
+        independently from the Cartesian cache.
+        """
+        if self._dataset is None:
+            raise RuntimeError("FrameSource not acquired")
+        if i in self._polar_lru:
+            self._polar_lru.move_to_end(i)
+            return self._polar_lru[i]
+        # Local import to avoid a circular dep — polar.py imports
+        # numpy/scipy only, but importing it at module top would make
+        # any test of file_model pull the polar transform too.
+        from mlgidlab.polar import cartesian_to_polar
+
+        cart = self.get_cartesian(i)
+        polar = cartesian_to_polar(cart, self.q_xy, self.q_z)
+        if self._polar_radius is None or self._polar_angle is None:
+            self._polar_radius = polar.radius
+            self._polar_angle = polar.angle
+        self._polar_lru[i] = polar.image
+        while len(self._polar_lru) > self._polar_lru_max:
+            self._polar_lru.popitem(last=False)
+        return polar.image
+
+    def polar_axes(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return ``(radius, angle)`` for the polar grid.
+
+        Triggers a single polar resampling of frame 0 if the axes
+        haven't been computed yet — needed by the viewer's polar
+        axis labels + cursor lookup.
+        """
+        if self._polar_radius is None or self._polar_angle is None:
+            self.get_polar(0)
+        assert self._polar_radius is not None and self._polar_angle is not None
+        return self._polar_radius, self._polar_angle
+
+
+class _LazyImageStack:
+    """Thin shim presenting a ``(n_frames, n_qz, n_qxy)`` indexable view.
+
+    Exposes only the surface mlgidLAB actually uses: ``__getitem__``,
+    ``shape``, ``ndim``, ``dtype``. Deliberately NOT a numpy ndarray
+    subclass and deliberately NOT supporting ``view`` / ``copy`` /
+    ``__array__`` — any caller that tries to treat it as a real array
+    fails loudly, which catches accidental whole-stack reads in review.
+    """
+
+    __slots__ = ("_source",)
+
+    def __init__(self, source: FrameSource) -> None:
+        self._source = source
+
+    @property
+    def source(self) -> FrameSource:
+        return self._source
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        n_qz, n_qxy = self._source.frame_shape
+        return (self._source.n_frames, n_qz, n_qxy)
+
+    @property
+    def ndim(self) -> int:
+        return 3
+
+    @property
+    def dtype(self) -> np.dtype:
+        return self._source.dtype
+
+    def __len__(self) -> int:
+        return self._source.n_frames
+
+    def __getitem__(self, key):
+        """Frame index or (frame, row, col) tuple index.
+
+        - ``stack[i]`` returns the 2D Cartesian frame (n_qz, n_qxy).
+        - ``stack[frame, r, c]`` returns one pixel — used by the
+          cursor-readout's intensity lookup.
+
+        Slices and ellipsis intentionally raise — we want to know
+        about callers that try to grab subsets of the stack so they
+        can be moved onto a FrameSource access pattern.
+        """
+        if isinstance(key, (int, np.integer)):
+            return self._source.get_cartesian(int(key))
+        if isinstance(key, tuple) and len(key) == 3:
+            frame, r, c = key
+            if (
+                isinstance(frame, (int, np.integer))
+                and isinstance(r, (int, np.integer))
+                and isinstance(c, (int, np.integer))
+            ):
+                return self._source.get_cartesian(int(frame))[int(r), int(c)]
+        raise TypeError(
+            f"_LazyImageStack supports stack[i] or stack[frame, r, c] "
+            f"only; got {key!r}."
+        )
+
+
+class _LazyPolarStack:
+    """``(n_frames, n_radius, n_angle)`` indexable view on polar frames.
+
+    Mirrors ``_LazyImageStack`` but routes to ``FrameSource.get_polar``.
+    Supports two indexing forms used by the GUI:
+
+    - ``stack[i]`` — return a polar frame (``profile_viewer.py:341``)
+    - ``stack[frame, r, a]`` — single-pixel lookup used by the cursor
+      readout (``image_viewer._compute_cursor_info``)
+    """
+
+    __slots__ = ("_source",)
+
+    def __init__(self, source: FrameSource) -> None:
+        self._source = source
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        radius, angle = self._source.polar_axes()
+        return (self._source.n_frames, int(radius.size), int(angle.size))
+
+    @property
+    def ndim(self) -> int:
+        return 3
+
+    def __len__(self) -> int:
+        return self._source.n_frames
+
+    def __getitem__(self, key):
+        if isinstance(key, (int, np.integer)):
+            return self._source.get_polar(int(key))
+        if isinstance(key, tuple) and len(key) == 3:
+            frame, r, a = key
+            if (
+                isinstance(frame, (int, np.integer))
+                and isinstance(r, (int, np.integer))
+                and isinstance(a, (int, np.integer))
+            ):
+                return self._source.get_polar(int(frame))[int(r), int(a)]
+        raise TypeError(
+            f"_LazyPolarStack supports stack[i] or stack[frame, r, a] "
+            f"only; got {key!r}."
+        )
 
 
 # Raw-detector dataset enumeration & loading. These are used only by the

@@ -1412,15 +1412,30 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        # Release the viewer's FrameSource handle *before* the rename
+        # so the file isn't open when shutil.copy2 + rename runs (matters
+        # on Windows; harmless on Linux). silx is also detached so the
+        # tree can be rebuilt at the new basename.
+        self._detach_silx_tree()
         try:
             self.session.save_as(Path(path))
         except Exception as exc:
             QMessageBox.critical(self, "Save As failed", str(exc))
+            # Re-attach so the viewer can keep reading; otherwise the
+            # user is left looking at a frozen image with the file
+            # detached but nothing written.
+            self._reattach_silx_tree()
             return
-        # The active session's temp file may have been renamed to match the
-        # new basename; rebuild the tree from all sessions so its label
-        # updates while sibling files stay attached.
-        self._detach_silx_tree()
+        # Save As renamed the temp file to match the new basename. The
+        # FrameSource was created against the old basename and would
+        # otherwise fail to reopen — point it at the new path before
+        # the reattach reacquires.
+        if (
+            self.viewer._frame_source is not None
+            and isinstance(self.session, NexusSession)
+        ):
+            self.viewer._frame_source.relocate(self.session.temp_path)
+        # Rebuild the silx tree from the updated session paths.
         self._reattach_silx_tree()
         self._update_title()
         # The user just wrote a new file at ``path``; surface it in the
@@ -1655,23 +1670,28 @@ class MainWindow(QMainWindow):
     # -- silx tree helpers --
 
     def _detach_silx_tree(self) -> None:
-        """Release silx's read handles on every loaded temp file.
+        """Release silx's read handles + the viewer's FrameSource handle.
 
         Required before any code path opens an HDF5 file ``r+`` (pipeline
-        runs, direct h5py edits) since silx's open handle would otherwise
-        block the writer.
+        runs, direct h5py edits) since open read handles would otherwise
+        block the writer. After the lazy-loading milestone the viewer
+        also holds a long-lived h5py handle through its FrameSource —
+        that handle must be released here in addition to silx's.
         """
         self.tree.findHdf5TreeModel().clear()
         self.data_viewer.setData(None)
+        self.viewer.release_frame_source()
 
     def _reattach_silx_tree(self) -> None:
-        """Re-insert every session's files into the tree in order.
+        """Re-insert every session's files + reopen the viewer's
+        FrameSource handle.
 
         NeXus sessions contribute one file (the temp working copy); raw
         sessions contribute every selected raw input so the user can keep
         browsing all of them while configuring conversion. The custom
         per-file icon set is repushed afterwards because clear() emptied
-        the model.
+        the model. The viewer's FrameSource is reopened so subsequent
+        frame reads can stream from disk again.
         """
         model = self.tree.findHdf5TreeModel()
         for s in self._sessions:
@@ -1681,6 +1701,7 @@ class MainWindow(QMainWindow):
             else:
                 model.insertFile(str(s.temp_path))
         self._refresh_tree_raw_paths()
+        self.viewer.acquire_frame_source()
 
     # -- Entry / viewer wiring --
 
@@ -2764,8 +2785,13 @@ class MainWindow(QMainWindow):
             self.viewer.current_frame,
             self.viewer.matched_structures(self.viewer.current_frame),
         )
-        # Hand the polar transform to the profile viewer (lazy-computed; same
-        # cache the image viewer uses when the user toggles to polar mode).
+        # Hand the polar transform to the profile viewer. After the
+        # lazy-loading milestone ``viewer.polar_data()`` returns a
+        # ``(_LazyPolarStack, radius, angle)`` tuple — frames are
+        # resampled on demand inside the FrameSource so this no longer
+        # forces an eager precompute of the full polar stack. The
+        # profile viewer indexes the wrapper by frame; the cursor
+        # readout uses tuple indexing for single-pixel lookups.
         polar = self.viewer.polar_data()
         if polar is not None:
             self.profile_viewer.set_polar_stack(*polar)
