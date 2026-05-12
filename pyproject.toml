@@ -17,6 +17,12 @@ dependencies = [
     "scipy>=1.10",
     "pyqtgraph>=0.13",
     "qdarkstyle>=3.2",
+    # In-GUI PONI calibration + mask creation: the Conversion dock's
+    # "Create…" buttons embed pyFAI's calibration widget set (the same
+    # workflow as the standalone pyFAI-calib2 CLI). Imported lazily
+    # inside the button handlers so a broken pyFAI install doesn't
+    # block cold startup.
+    "pyFAI>=2024.1",
 ]
 
 [project.optional-dependencies]

@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
@@ -232,6 +233,13 @@ class ConversionPanel(QWidget):
         # File/entry inputs are populated by ``set_raw_inputs`` from
         # MainWindow when a raw session is activated. Empty until then.
         self._raw_inputs: list[tuple[Path, list[RawEntry]]] = []
+        # Resolver wired by MainWindow that returns a 2D numpy array
+        # of the currently displayed raw frame (or None if no raw
+        # session is active). Used to pre-load the in-GUI
+        # calibration dialog so the user doesn't have to re-browse
+        # to the same image they're already looking at. Wired in
+        # ``set_active_raw_frame_resolver``.
+        self._get_active_raw_frame: Callable[[], object] | None = None
         self._build_ui()
 
     # ---------------- Public surface ----------------
@@ -449,18 +457,37 @@ class ConversionPanel(QWidget):
         self.poni_path.setPlaceholderText("Path to pyFAI PONI file (required)")
         poni_browse = QPushButton("Browse…")
         poni_browse.clicked.connect(self._browse_poni)
+        poni_create = QPushButton("Create…")
+        poni_create.setToolTip(
+            "Calibrate a new PONI inside mlgidLAB. Opens pyFAI's "
+            "calibration workflow (experiment → mask → peak picking → "
+            "geometry refinement) and auto-populates this field with "
+            "the saved file."
+        )
+        poni_create.clicked.connect(self._create_poni)
         poni_clear = QPushButton("Clear")
         poni_clear.clicked.connect(lambda: self.poni_path.setText(""))
-        form.addRow("PONI:", _row(self.poni_path, poni_browse, poni_clear))
+        form.addRow("PONI:", _row(
+            self.poni_path, poni_browse, poni_create, poni_clear,
+        ))
         self.poni_path.textChanged.connect(self._refresh_runnable)
 
         self.mask_path = QLineEdit()
         self.mask_path.setPlaceholderText("Optional .npy / .tif / .edf mask")
         mask_browse = QPushButton("Browse…")
         mask_browse.clicked.connect(self._browse_mask)
+        mask_create = QPushButton("Create…")
+        mask_create.setToolTip(
+            "Draw a mask interactively. Opens pyFAI's calibration "
+            "workflow on the Mask task; on save, the path lands in "
+            "this field automatically."
+        )
+        mask_create.clicked.connect(self._create_mask)
         mask_clear = QPushButton("Clear")
         mask_clear.clicked.connect(lambda: self.mask_path.setText(""))
-        form.addRow("Mask:", _row(self.mask_path, mask_browse, mask_clear))
+        form.addRow("Mask:", _row(
+            self.mask_path, mask_browse, mask_create, mask_clear,
+        ))
 
         # Angle of incidence — single global value; per-frame ai is
         # deferred per the plan's Outlook section. Uses the auto-
@@ -519,6 +546,119 @@ class ConversionPanel(QWidget):
         )
         if path:
             self.mask_path.setText(path)
+
+    # ---------------- In-GUI calibration ----------------
+
+    def set_active_raw_frame_resolver(
+        self, fn: Callable[[], object],
+    ) -> None:
+        """Install a callable that returns a 2D ndarray of the raw
+        frame currently on screen, or None.
+
+        Used by the in-GUI calibration dialog to pre-load the
+        user's active raw frame so they don't have to re-browse to
+        the same image. ``fn`` is invoked lazily at the moment the
+        dialog opens — not stored as a reference to the frame, so
+        late-bound semantics (frame slider may have moved) are
+        respected.
+        """
+        self._get_active_raw_frame = fn
+
+    def _open_calibration_dialog(self, start_task: str):
+        """Lazily import + construct the calibration dialog.
+
+        pyFAI's Qt-heavy import chain is deferred until the user
+        actually clicks ``Create…`` — so a broken pyFAI install
+        only surfaces here (with a friendly message) instead of
+        breaking cold startup. Returns the dialog *or* None when
+        the import fails and the user has already seen the error.
+        """
+        try:
+            from mlgidlab.calibration_dialog import CalibrationDialog
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Calibration unavailable",
+                "pyFAI's calibration widgets couldn't load:\n\n"
+                f"{exc}\n\n"
+                "Reinstall mlgidLAB or pyFAI to enable in-GUI "
+                "calibration. You can still browse to an externally "
+                "calibrated PONI / mask via the Browse… buttons.",
+            )
+            return None
+        initial = None
+        if self._get_active_raw_frame is not None:
+            try:
+                initial = self._get_active_raw_frame()
+            except Exception:
+                # The resolver shouldn't raise, but if it does the
+                # dialog can still open without a pre-filled image.
+                initial = None
+        # If the user already has PONI / mask paths in the
+        # Conversion dock, carry them into the dialog so workflows
+        # like "I came here to make a mask, my PONI is fine" don't
+        # require re-picking the existing file. Only forward paths
+        # that point to a real file — empty or stale entries get
+        # silently dropped.
+        def _existing(line_edit) -> str | None:
+            text = line_edit.text().strip()
+            if not text:
+                return None
+            try:
+                return text if Path(text).exists() else None
+            except Exception:
+                return None
+
+        dlg = CalibrationDialog(
+            self,
+            initial_image=initial,
+            initial_poni=_existing(self.poni_path),
+            initial_mask=_existing(self.mask_path),
+            start_task=start_task,
+        )
+        # The dialog's "Add PONI / Mask to conversion" buttons
+        # emit these signals; route them straight into the QLineEdits
+        # so the user can apply the freshly-saved paths without
+        # closing the dialog (and can iterate — produce a second
+        # PONI, click Add again, etc.).
+        dlg.applyPoniRequested.connect(self.poni_path.setText)
+        dlg.applyMaskRequested.connect(self.mask_path.setText)
+        return dlg
+
+    def _create_poni(self) -> None:
+        """Launch the calibration dialog on the Experiment task and,
+        on accept, populate the PONI path field with whatever path
+        the user saved. We start at step 1 (Experiment) rather than
+        jumping to Geometry because the experimental setup
+        (detector, wavelength, calibrant image) feeds every later
+        step — skipping it leaves the geometry refinement working
+        from defaults that are almost never right."""
+        dlg = self._open_calibration_dialog(start_task="experiment")
+        if dlg is None:
+            return
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.saved_poni_path is not None:
+            self.poni_path.setText(str(dlg.saved_poni_path))
+        if dlg.saved_mask_path is not None and not self.mask_path.text().strip():
+            # Convenience: if the user happened to save a mask
+            # while they were in the PONI dialog (the workflows
+            # share the same window), pick it up too — but only
+            # when the mask field is currently empty so we don't
+            # overwrite something they've already chosen.
+            self.mask_path.setText(str(dlg.saved_mask_path))
+
+    def _create_mask(self) -> None:
+        """Launch the calibration dialog on the Mask task and, on
+        accept, populate the mask path field with whatever path
+        the user saved."""
+        dlg = self._open_calibration_dialog(start_task="mask")
+        if dlg is None:
+            return
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.saved_mask_path is not None:
+            self.mask_path.setText(str(dlg.saved_mask_path))
+        if dlg.saved_poni_path is not None and not self.poni_path.text().strip():
+            # Same convenience as ``_create_poni``: if they also
+            # produced a PONI while in this dialog, pick it up
+            # provided the field is empty.
+            self.poni_path.setText(str(dlg.saved_poni_path))
 
     # ---------------- Section: Metadata ----------------
 

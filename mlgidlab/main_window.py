@@ -4,6 +4,8 @@ import json
 import math
 from pathlib import Path
 
+import numpy as np
+
 from PySide6.QtCore import (
     QCoreApplication,
     QSettings,
@@ -511,6 +513,11 @@ class MainWindow(QMainWindow):
         self._progress: QProgressDialog | None = None
         self._pipe_thread: QThread | None = None
         self._pipe_worker: PipelineWorker | None = None
+        # Tools → Export figure window. Built lazily on first open
+        # (see ``_action_export_figure``); kept alive across re-opens
+        # so settings persist. None until the user invokes Tools →
+        # Export figure… for the first time.
+        self._figure_export_window = None  # type: ignore[var-annotated]
         # Queue of PipelineCommands waiting to run sequentially. The
         # "All entries" option in the pipeline panel expands to one
         # command per entry; each finished run dequeues the next so the
@@ -701,13 +708,16 @@ class MainWindow(QMainWindow):
         # plumbing on every viewer event).
         reset_menu.aboutToShow.connect(self._refresh_reset_menu_state)
 
-        # Export the current frame to PNG. Works for either NeXus or
-        # raw mode — pyqtgraph's ImageExporter operates on the active
-        # plot item regardless of which stack supplied the data.
+        # Figure export. Replaces the previous pyqtgraph
+        # ImageExporter-based PNG capture with a non-modal window
+        # built around ``mlgidbase.plot_analysis_results``. Lives at
+        # ``mlgidlab.figure_export_window.FigureExportWindow``;
+        # imported lazily inside the handler so a missing pipeline
+        # dep doesn't break menu construction.
         tools_menu.addSeparator()
-        self.action_export_png = QAction("Export current frame as PNG…", self)
-        self.action_export_png.triggered.connect(self._action_export_png)
-        tools_menu.addAction(self.action_export_png)
+        self.action_export_figure = QAction("Export figure…", self)
+        self.action_export_figure.triggered.connect(self._action_export_figure)
+        tools_menu.addAction(self.action_export_figure)
 
         # CSV export of detected/fitted/matched peaks. NeXus-only.
         self.action_export_csv = QAction("Export peaks as CSV…", self)
@@ -851,38 +861,39 @@ class MainWindow(QMainWindow):
             f"(plus all manual peaks)"
         )
 
-    def _action_export_png(self) -> None:
-        """Export the currently-displayed image (with overlays) to PNG.
+    def _action_export_figure(self) -> None:
+        """Open the non-modal Figure Export window.
 
-        Uses pyqtgraph's ImageExporter on the viewer's PlotItem so the
-        output mirrors what the user sees — colormap, levels, axes,
-        and any visible peak overlays. Available in both NeXus and
-        raw modes.
+        The window is built lazily so cold startup doesn't pay
+        matplotlib / mlgidbase import cost. A single instance per
+        main window is reused across re-opens so the user's
+        settings persist for the GUI session.
         """
-        if self.viewer.n_frames == 0:
+        if self.session is None:
             QMessageBox.information(
-                self, "Nothing to export",
-                "Open a file and load an entry before exporting.",
+                self, "No file open",
+                "Open a NeXus file before exporting a figure.",
             )
             return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export current frame as PNG", "frame.png",
-            "PNG image (*.png);;All files (*)",
-        )
-        if not path:
-            return
-        try:
-            from pyqtgraph.exporters import ImageExporter
-            exporter = ImageExporter(self.viewer._plot)
-            exporter.export(path)
-        except Exception as exc:
-            QMessageBox.critical(
-                self, "Export failed",
-                f"Could not write PNG: {exc}",
+        if not isinstance(self.session, NexusSession):
+            QMessageBox.information(
+                self, "Figure export needs a NeXus file",
+                "The figure exporter renders detected, fitted, and "
+                "matched peak overlays from a processed NeXus file. "
+                "Run the conversion on your raw data first.",
             )
             return
-        # Confirm visually so the user knows where the file landed.
-        self.statusBar().showMessage(f"Wrote {path}", 5000)
+        if self._figure_export_window is None:
+            from mlgidlab.figure_export_window import FigureExportWindow
+            self._figure_export_window = FigureExportWindow(self)
+        else:
+            # Window already exists — refresh its cached mlgidbase
+            # handle in case the user swapped files since it was
+            # last shown.
+            self._figure_export_window.refresh_for_session()
+        self._figure_export_window.show()
+        self._figure_export_window.raise_()
+        self._figure_export_window.activateWindow()
 
     def _action_export_csv(self) -> None:
         """Pop the kind/scope dialog and write peaks to a CSV.
@@ -1553,6 +1564,14 @@ class MainWindow(QMainWindow):
         self.conversion_panel.conversionRunRequested.connect(
             self._on_conversion_run
         )
+        # Let the conversion panel's in-GUI calibration dialog ask
+        # for the currently displayed raw frame so it can pre-load
+        # the user's image without an extra browse step. Returns
+        # None when no raw session is active or the viewer hasn't
+        # been populated yet.
+        self.conversion_panel.set_active_raw_frame_resolver(
+            self._active_raw_frame_for_calibration
+        )
         self._conversion_dock = QDockWidget("Conversion", self)
         self._conversion_dock.setWidget(self.conversion_panel)
         self._conversion_dock.setObjectName("ConversionDock")
@@ -2043,6 +2062,11 @@ class MainWindow(QMainWindow):
         # consistent with the title bar even before that fires.
         self._update_status_entry()
         self._update_status_frame()
+        # If the Figure Export window is open, drop its cached
+        # mlgidbase handle and re-seed its basics pane from the new
+        # session so its next render targets the right file.
+        if self._figure_export_window is not None and self._figure_export_window.isVisible():
+            self._figure_export_window.refresh_for_session()
 
     def _apply_session_mode(self, session: BaseSession | None) -> None:
         """Toggle dock visibility + viewer affordances for the session kind.
@@ -3733,6 +3757,46 @@ class MainWindow(QMainWindow):
         self._sb_file.setText(
             f"{self.session.original_path.name}{marker}"
         )
+
+    def _active_raw_frame_for_calibration(self):
+        """Return a 2D ndarray to seed the pyFAI calibration dialog.
+
+        For multi-frame raw scans (the typical calibrant case —
+        LaB6 / Si / CeO2 measured as a short scan to boost ring
+        statistics) this returns the per-pixel mean across all
+        frames so faint outer rings come out of the noise. For a
+        single-frame stack the lone frame is returned unchanged.
+
+        Returns None when no raw session is active, when the
+        viewer is in NeXus mode, or when the raw stack hasn't been
+        populated yet — the dialog then opens with an empty image
+        slot and the user can browse to a file from inside it.
+        """
+        try:
+            stack = getattr(self.viewer, "_raw_image_stack", None)
+        except Exception:
+            return None
+        if stack is None:
+            return None
+        try:
+            arr = np.asarray(stack)
+            if arr.ndim != 3 or arr.shape[0] == 0:
+                # Defensive: viewer should always hand back a 3D
+                # stack in raw mode, but if something upstream
+                # changes that contract fall back to whatever the
+                # current-frame index points at.
+                idx = int(self.viewer.current_frame)
+                if 0 <= idx < arr.shape[0]:
+                    return arr[idx]
+                return arr[0] if arr.shape[0] else None
+            if arr.shape[0] == 1:
+                return arr[0]
+            # Mean in float64 to keep the average stable for high-
+            # dynamic-range detector data; pyFAI's image model
+            # accepts arbitrary numeric dtypes.
+            return arr.mean(axis=0, dtype=np.float64)
+        except Exception:
+            return None
 
     def _update_status_entry(self) -> None:
         entry = self.entry_combo.currentText() if hasattr(self, "entry_combo") else ""
