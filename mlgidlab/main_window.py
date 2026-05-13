@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +30,7 @@ from PySide6.QtGui import (
     QPixmap,
 )
 from PySide6.QtWidgets import (
+    QApplication,
     QButtonGroup,
     QCheckBox,
     QComboBox,
@@ -40,6 +42,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QFrame,
@@ -575,11 +578,21 @@ class MainWindow(QMainWindow):
         self._build_central()
         self._build_docks()
         # View menu is built after docks because it pulls
-        # toggleViewAction()s from them. Settings is built last so it
-        # sits at the right end of the menu bar — the conventional
-        # rightmost-menu placement that matches user expectations.
+        # toggleViewAction()s from them. Settings is built next.
+        # Help comes last so it sits at the right end of the menu
+        # bar — the conventional rightmost-menu placement.
         self._build_view_menu()
         self._build_settings_menu()
+        self._build_help_menu()
+        # Frame-navigation shortcuts. Installed last so the viewer +
+        # entry combo exist. Window-context QActions; text inputs
+        # (QLineEdit, QSpinBox) consume Left/Right/Home/End for
+        # caret nav before the shortcut fires, so the bindings only
+        # trigger when focus is on a non-text widget (viewer, dock
+        # frame, menu bar). J/K give a Vim-style fallback that
+        # works even when the viewer has unconventional focus
+        # handling.
+        self._install_frame_shortcuts()
         # Status bar depends on the viewer + entry combo existing; build
         # after central + docks.
         self._build_status_bar()
@@ -589,6 +602,11 @@ class MainWindow(QMainWindow):
         # can drag NeXus / raw paths in from a file manager. The drop
         # handler classifies each file by content and dispatches.
         self.setAcceptDrops(True)
+        # Snapshot the default dock arrangement now that everything
+        # has been built and the initial ``_apply_session_mode(None)``
+        # has tabified the right-side stack. View → Reset layout
+        # restores from this snapshot — see ``_reset_layout``.
+        self._default_layout_state = self.saveState()
 
     @property
     def session(self) -> Session | None:
@@ -1028,6 +1046,48 @@ class MainWindow(QMainWindow):
         )
         view_menu.addAction(self.action_toggle_cursor_readout)
 
+        # Reset layout — restores the dock arrangement captured at
+        # cold startup (see ``_capture_default_layout``). Useful when
+        # the user has drag-rearranged things and wants to start
+        # over without restarting the app.
+        view_menu.addSeparator()
+        self.action_reset_layout = QAction("Reset layout", self)
+        self.action_reset_layout.setToolTip(
+            "Restore the default dock arrangement."
+        )
+        self.action_reset_layout.triggered.connect(self._reset_layout)
+        view_menu.addAction(self.action_reset_layout)
+
+    def _reset_layout(self) -> None:
+        """Restore the dock arrangement captured at cold startup.
+
+        Two steps:
+
+        1. ``restoreState`` with the cached snapshot — pops every
+           dock back to its original area, undoes user drags, and
+           re-applies original sizes.
+        2. Re-run ``_apply_session_mode`` on the active session so
+           the mode-specific tabify order (Display | Pipeline |
+           Peaks | Logs for NeXus, Display | Conversion | Peaks |
+           Logs for raw) is reapplied. The snapshot only captures
+           the cold-start layout (no session), so without this
+           second step a raw session reset would leave the user
+           looking at the Pipeline dock instead of Conversion.
+        """
+        state = getattr(self, "_default_layout_state", None)
+        if state is not None:
+            try:
+                self.restoreState(state)
+            except Exception:
+                # restoreState raises on a malformed state blob; we
+                # generated this one ourselves so it shouldn't, but
+                # don't take down the GUI if it does.
+                pass
+        # Reapply the session-mode-specific tab order + show/hide
+        # toggles so Conversion/Pipeline visibility lines up with
+        # the active session.
+        self._apply_session_mode(self._active_session)
+
     def _build_settings_menu(self) -> None:
         """Build the top-level Settings menu.
 
@@ -1078,6 +1138,169 @@ class MainWindow(QMainWindow):
                 self._prefetchUpdate.emit(
                     self.viewer.current_frame, True, step,
                 )
+
+    # ------------------------------------------------------------------
+    # Help menu
+    # ------------------------------------------------------------------
+
+    def _build_help_menu(self) -> None:
+        """Build the rightmost top-level Help menu.
+
+        Two entries:
+        - **About mlgidLAB…** — modal "About" dialog with the
+          version of mlgidLAB + every dependency relevant to a bug
+          report (Python, Qt, mlgidbase, pyFAI, silx, h5py).
+        - **Copy diagnostics** — gathers the same environment info
+          plus active-session state and the last ~50 lines from the
+          Logs dock, and writes it to the clipboard so the user can
+          paste it into an issue.
+        """
+        help_menu = self.menuBar().addMenu("&Help")
+        self.action_about = QAction("&About mlgidLAB…", self)
+        self.action_about.triggered.connect(self._show_about)
+        help_menu.addAction(self.action_about)
+        self.action_copy_diagnostics = QAction("&Copy diagnostics", self)
+        self.action_copy_diagnostics.setToolTip(
+            "Copy environment info + active session details + recent "
+            "log lines to the clipboard. Useful for bug reports."
+        )
+        self.action_copy_diagnostics.triggered.connect(self._copy_diagnostics)
+        help_menu.addAction(self.action_copy_diagnostics)
+
+    def _gather_versions(self) -> dict[str, str]:
+        """Return a name → version-string map covering the modules
+        most likely to matter in a bug report. Each lookup is
+        guarded so a missing/older module reports ``(unavailable)``
+        instead of breaking the diagnostics dump."""
+        import platform
+        import sys
+
+        def _v(modname: str, attr: str = "__version__") -> str:
+            try:
+                mod = __import__(modname)
+                # Some packages spell the version attr differently
+                # (pyFAI uses both ``version`` and ``__version__``
+                # depending on release).
+                if attr == "__version__" and not hasattr(mod, "__version__"):
+                    if hasattr(mod, "version"):
+                        return str(mod.version)
+                return str(getattr(mod, attr))
+            except Exception:
+                return "(unavailable)"
+
+        try:
+            from mlgidlab import __version__ as mlgidlab_version
+        except Exception:
+            mlgidlab_version = "(unavailable)"
+
+        return {
+            "mlgidLAB": mlgidlab_version,
+            "Python": sys.version.split()[0],
+            "OS": f"{platform.system()} {platform.release()}",
+            "PySide6": _v("PySide6"),
+            "Qt": _v("PySide6.QtCore", "__version__"),
+            "numpy": _v("numpy"),
+            "h5py": _v("h5py"),
+            "silx": _v("silx"),
+            "pyFAI": _v("pyFAI"),
+            "pyqtgraph": _v("pyqtgraph"),
+            "matplotlib": _v("matplotlib"),
+            "mlgidbase": _v("mlgidbase"),
+        }
+
+    def _show_about(self) -> None:
+        """Modal About dialog. Pure version info; no external links
+        embedded yet (the project doesn't have a canonical docs URL
+        we'd want to hardcode here)."""
+        versions = self._gather_versions()
+        rows = "".join(
+            f"<tr><td><b>{name}</b></td><td>{ver}</td></tr>"
+            for name, ver in versions.items()
+        )
+        body = (
+            f"<h3>mlgidLAB {versions['mlgidLAB']}</h3>"
+            "<p>Graphical interface for the mlgidBASE GIWAXS "
+            "analysis pipeline.</p>"
+            "<p>Use <b>Help → Copy diagnostics</b> to copy this "
+            "environment plus the recent log lines for bug "
+            "reports.</p>"
+            f"<table>{rows}</table>"
+        )
+        QMessageBox.about(self, "About mlgidLAB", body)
+
+    def _copy_diagnostics(self) -> None:
+        """Build a plain-text diagnostics blob and put it on the
+        clipboard. Sections:
+
+        1. Versions — same map as the About dialog.
+        2. Active session — file path, mode, entry, frame.
+        3. Recent log lines — last 50 lines from the shared Logs
+           dock, in chronological order.
+
+        Nothing is uploaded; it's just text the user can paste.
+        """
+        import datetime
+
+        # Section 1: versions
+        versions = self._gather_versions()
+        ver_lines = [f"  {k}: {v}" for k, v in versions.items()]
+
+        # Section 2: active session
+        session_lines = []
+        sess = self._active_session
+        if sess is None:
+            session_lines.append("  (no file open)")
+        else:
+            try:
+                session_lines.append(f"  kind:         {sess.kind}")
+                session_lines.append(f"  display_path: {sess.display_path}")
+                if hasattr(sess, "temp_path"):
+                    session_lines.append(f"  temp_path:    {sess.temp_path}")
+                if hasattr(sess, "raw_paths"):
+                    for p in sess.raw_paths:
+                        session_lines.append(f"  raw_path:     {p}")
+                entry = (
+                    self.entry_combo.currentText()
+                    if hasattr(self, "entry_combo") else ""
+                )
+                session_lines.append(f"  entry:        {entry!r}")
+                session_lines.append(
+                    f"  frame:        {self.viewer.current_frame} / "
+                    f"{max(0, self.viewer.n_frames - 1)}"
+                )
+                session_lines.append(f"  viewer mode:  {self.viewer._mode}")
+            except Exception as exc:
+                session_lines.append(f"  (error gathering session info: {exc})")
+
+        # Section 3: recent log lines
+        log_lines: list[str] = []
+        if hasattr(self, "_log_view"):
+            try:
+                blob = self._log_view.toPlainText()
+                log_lines = blob.splitlines()[-50:]
+            except Exception:
+                pass
+        if not log_lines:
+            log_lines = ["(no log lines)"]
+
+        diagnostics = (
+            f"mlgidLAB diagnostics — {datetime.datetime.now().isoformat(timespec='seconds')}\n\n"
+            "=== Versions ===\n"
+            + "\n".join(ver_lines)
+            + "\n\n=== Active session ===\n"
+            + "\n".join(session_lines)
+            + "\n\n=== Recent log lines (last 50) ===\n"
+            + "\n".join(log_lines)
+            + "\n"
+        )
+
+        QApplication.clipboard().setText(diagnostics)
+        # Tell the user it landed — status-bar message rather than a
+        # modal because copying is a low-friction action.
+        self.statusBar().showMessage(
+            f"Copied {len(diagnostics)} chars of diagnostics to clipboard",
+            5000,
+        )
 
     def _action_undo(self) -> None:
         # Covers manual add/remove, manual geom edits, and detected/fitted
@@ -1446,16 +1669,19 @@ class MainWindow(QMainWindow):
         matched_master_row = QHBoxLayout()
         matched_master_row.setContentsMargins(0, 0, 0, 0)
         matched_master_row.setSpacing(6)
-        # Invisible-pixmap label of the same fixed size as a real swatch
-        # so the matched checkbox lines up vertically with the Detected
-        # / Fitted rows (which prepend a 26×12 swatch label). Earlier
-        # implementation used ``addSpacing`` here, which laid out
-        # differently from ``addWidget(label)`` and shifted the
-        # checkbox a few px to the right.
-        _swatch_w = _make_pen_swatch(OVERLAY_STYLE["detected"]).width()
-        _swatch_h = _make_pen_swatch(OVERLAY_STYLE["detected"]).height()
+        # Match the Detected/Fitted layout exactly: those rows put a
+        # 26×12 pixmap-bearing QLabel before the checkbox. QLabel
+        # renders with different content margins depending on whether
+        # it carries a pixmap or not, so a setFixedSize-only label
+        # ends up a couple pixels off vertically. Give the matched
+        # spacer a transparent pixmap of the same dimensions so its
+        # sizing semantics line up byte-for-byte with the real
+        # swatches above.
+        _ref_swatch = _make_pen_swatch(OVERLAY_STYLE["detected"])
+        _spacer_pixmap = QPixmap(_ref_swatch.size())
+        _spacer_pixmap.fill(Qt.GlobalColor.transparent)
         _matched_swatch_spacer = QLabel()
-        _matched_swatch_spacer.setFixedSize(_swatch_w, _swatch_h)
+        _matched_swatch_spacer.setPixmap(_spacer_pixmap)
         matched_master_row.addWidget(_matched_swatch_spacer)
         self._matched_master_check = QCheckBox("Matched peaks")
         self._matched_master_check.setChecked(True)
@@ -1471,6 +1697,24 @@ class MainWindow(QMainWindow):
         matched_master_widget.setLayout(matched_master_row)
         layout.addWidget(matched_master_widget)
 
+        # Substring filter for the per-structure rows below. Useful
+        # when matching has been run against a folder of many CIFs
+        # (``cif_organic`` has 32 entries — 32 rows is hard to scan
+        # by eye). Filter is case-insensitive, applied live as the
+        # user types. Indented to align with the structure rows.
+        matched_filter_row = QHBoxLayout()
+        matched_filter_row.setContentsMargins(20, 0, 0, 0)
+        matched_filter_row.setSpacing(6)
+        matched_filter_row.addWidget(QLabel("Filter:"))
+        self._matched_filter_edit = QLineEdit()
+        self._matched_filter_edit.setPlaceholderText("CIF name substring…")
+        self._matched_filter_edit.setClearButtonEnabled(True)
+        self._matched_filter_edit.textChanged.connect(self._apply_matched_filter)
+        matched_filter_row.addWidget(self._matched_filter_edit, 1)
+        matched_filter_widget = QWidget()
+        matched_filter_widget.setLayout(matched_filter_row)
+        layout.addWidget(matched_filter_widget)
+
         # Container for the dynamic per-structure rows. Indented so it reads
         # as a sub-list of the master toggle.
         self._matched_struct_container = QWidget()
@@ -1478,8 +1722,14 @@ class MainWindow(QMainWindow):
         self._matched_struct_layout.setContentsMargins(20, 0, 0, 0)
         self._matched_struct_layout.setSpacing(2)
         layout.addWidget(self._matched_struct_container)
+        # Per-uid row widgets — used by _apply_matched_filter to
+        # show / hide individual rows without rebuilding from data.
+        self._matched_struct_rows: dict[str, QWidget] = {}
         # Lives in its own field so we can find/remove the placeholder row.
         self._matched_empty_label: QLabel | None = None
+        # Shown when a non-empty filter hides every row (distinct
+        # from the "no matched solutions" empty-list label).
+        self._matched_filter_empty_label: QLabel | None = None
         self._refresh_matched_panel(0, [])
         self.viewer.matchedStructuresChanged.connect(self._refresh_matched_panel)
 
@@ -2085,9 +2335,21 @@ class MainWindow(QMainWindow):
         is_raw = session is not None and session.kind == "raw"
         self._pipeline_dock.setVisible(not is_raw)
         self._conversion_dock.setVisible(is_raw)
+        # Re-tabify the right-dock chain per mode so the tab bar
+        # order matches the active workflow:
+        #   Raw mode:   Display | Conversion | Peaks | Logs
+        #   NeXus mode: Display | Pipeline | Peaks | Logs
+        # ``tabifyDockWidget`` repositions an already-tabified dock,
+        # so calling these every mode-switch is cheap and idempotent.
         if is_raw:
+            self.tabifyDockWidget(self._display_dock, self._conversion_dock)
+            self.tabifyDockWidget(self._conversion_dock, self._peaks_dock)
+            self.tabifyDockWidget(self._peaks_dock, self._logs_dock)
             self._conversion_dock.raise_()
         else:
+            self.tabifyDockWidget(self._display_dock, self._pipeline_dock)
+            self.tabifyDockWidget(self._pipeline_dock, self._peaks_dock)
+            self.tabifyDockWidget(self._peaks_dock, self._logs_dock)
             # Keep Display in front by default for NeXus sessions; users
             # who prefer Pipeline up-front can click its tab.
             self._display_dock.raise_()
@@ -2677,15 +2939,115 @@ class MainWindow(QMainWindow):
         self.prev_frame_button.setEnabled(n > 1 and cur > 0)
         self.next_frame_button.setEnabled(n > 1 and cur < n - 1)
 
+    # Minimum gap between successive prev/next frame steps. The OS
+    # keyboard auto-repeat fires at ~30 events/sec (~33 ms apart);
+    # without throttling, set_frame calls pile up faster than the
+    # viewer can render and a held arrow key leaves a backlog that
+    # keeps advancing after the user releases. 80 ms matches the
+    # existing toolbar prev/next button autoRepeatInterval — fast
+    # enough to feel responsive, slow enough to give each frame
+    # room to render.
+    _FRAME_STEP_THROTTLE_S = 0.08
+
+    def _frame_step_throttle_ok(self) -> bool:
+        """Time-throttle: drop step requests that arrive within
+        ``_FRAME_STEP_THROTTLE_S`` of the previous one.
+
+        Single clicks are always >80 ms apart so they're never
+        affected; only OS keyboard auto-repeat (~33 ms cadence) and
+        Qt toolbar auto-repeat get suppressed below the throttle.
+        """
+        now = time.monotonic()
+        last = getattr(self, "_last_frame_step_t", 0.0)
+        if (now - last) < self._FRAME_STEP_THROTTLE_S:
+            return False
+        self._last_frame_step_t = now
+        return True
+
+    def _step_frame(self, direction: int) -> None:
+        """Shared prev/next step path with both a time-throttle and
+        a queue-drain gate.
+
+        Two complementary mechanisms:
+
+        1. ``_frame_step_throttle_ok`` enforces a minimum gap
+           between accepted steps. Protects against fast renders +
+           OS autorepeat (drops the bulk of repeat events).
+
+        2. The ``_frame_step_in_flight`` flag + ``processEvents()``
+           drain protects against **slow** renders, where the
+           synchronous ``set_frame`` call blocks the event loop
+           long enough for the OS to enqueue multiple keypress
+           events. After the render completes we explicitly drain
+           the queue while the flag is still set, so the queued
+           auto-repeats hit the flag, see "busy", and drop. Without
+           this drain, holding a key on a slow stack continues
+           advancing for ~1 s after the user releases.
+        """
+        if getattr(self, "_frame_step_in_flight", False):
+            return
+        if not self._frame_step_throttle_ok():
+            return
+        self._frame_step_in_flight = True
+        try:
+            cur = self.viewer.current_frame
+            target = cur + direction
+            if 0 <= target < self.viewer.n_frames:
+                self.viewer.set_frame(target)
+            # Drain OS auto-repeats that piled up during the
+            # synchronous render. They'll recurse into this method,
+            # see the in-flight flag set, and drop. This is the
+            # one place in the GUI where ``processEvents`` from
+            # inside a slot is required for correctness — see the
+            # docstring above.
+            QApplication.processEvents()
+        finally:
+            self._frame_step_in_flight = False
+
     def _on_prev_frame_clicked(self) -> None:
-        cur = self.viewer.current_frame
-        if cur > 0:
-            self.viewer.set_frame(cur - 1)
+        self._step_frame(-1)
 
     def _on_next_frame_clicked(self) -> None:
-        cur = self.viewer.current_frame
-        if cur < self.viewer.n_frames - 1:
-            self.viewer.set_frame(cur + 1)
+        self._step_frame(+1)
+
+    def _on_first_frame_shortcut(self) -> None:
+        """Jump to frame 0. Bound to Home. Not throttled — these
+        are single-target jumps, not repeated steps."""
+        if self.viewer.n_frames > 1 and self.viewer.current_frame != 0:
+            self.viewer.set_frame(0)
+
+    def _on_last_frame_shortcut(self) -> None:
+        """Jump to the last frame. Bound to End. Not throttled."""
+        n = self.viewer.n_frames
+        last = n - 1
+        if n > 1 and self.viewer.current_frame != last:
+            self.viewer.set_frame(last)
+
+    def _install_frame_shortcuts(self) -> None:
+        """Register window-level keyboard shortcuts for frame navigation.
+
+        Each binding is a hidden ``QAction`` on the main window with
+        ``WindowShortcut`` context. Qt's normal key-event chain means
+        text-input widgets (QLineEdit, QSpinBox, QDoubleSpinBox)
+        consume Left / Right / Home / End for caret navigation before
+        the shortcut fires — so typing in a dock field still works.
+        J/K give a Vim-style fallback that doesn't collide with text
+        input either (most fields are numeric).
+        """
+        bindings = [
+            ("Prev frame", ["Left", "J"], self._on_prev_frame_clicked),
+            ("Next frame", ["Right", "K"], self._on_next_frame_clicked),
+            ("First frame", ["Home"], self._on_first_frame_shortcut),
+            ("Last frame", ["End"], self._on_last_frame_shortcut),
+        ]
+        self._frame_shortcut_actions = []
+        for name, keys, slot in bindings:
+            action = QAction(name, self)
+            action.setShortcuts([QKeySequence(k) for k in keys])
+            action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+            action.triggered.connect(slot)
+            self.addAction(action)
+            self._frame_shortcut_actions.append(action)
 
     def _frame_label_text(self, idx: int) -> str:
         n = self.viewer.n_frames
@@ -3631,6 +3993,10 @@ class MainWindow(QMainWindow):
         Called on every frame change and after a fresh entry load. We blow
         away the old QCheckBox widgets and create new ones — the structure
         list is small (1-N rows) so this is cheap.
+
+        The active filter (see ``_apply_matched_filter``) is re-applied
+        at the end so newly-built rows respect the current search
+        text without the user needing to retype.
         """
         # Clear children of the dynamic container.
         while self._matched_struct_layout.count():
@@ -3639,7 +4005,9 @@ class MainWindow(QMainWindow):
             if w is not None:
                 w.deleteLater()
         self._matched_empty_label = None
+        self._matched_filter_empty_label = None
         self._matched_struct_checkboxes.clear()
+        self._matched_struct_rows.clear()
 
         if not structures:
             self._matched_empty_label = QLabel("<i>No matched solutions for this frame.</i>")
@@ -3669,6 +4037,56 @@ class MainWindow(QMainWindow):
             row_widget.setLayout(row)
             self._matched_struct_layout.addWidget(row_widget)
             self._matched_struct_checkboxes[s.unique_id] = chk
+            self._matched_struct_rows[s.unique_id] = row_widget
+
+        self._apply_matched_filter()
+
+    def _apply_matched_filter(self, *_args) -> None:
+        """Hide per-structure rows whose label doesn't contain the
+        current filter substring (case-insensitive).
+
+        Empty filter shows every row. Non-empty filter that matches
+        nothing replaces the structure rows with a "No matches"
+        hint so the user knows the filter is the reason the list
+        looks empty.
+        """
+        text = ""
+        if hasattr(self, "_matched_filter_edit"):
+            text = self._matched_filter_edit.text().strip().lower()
+
+        # Drop a leftover "no filter matches" hint before recomputing.
+        if self._matched_filter_empty_label is not None:
+            self._matched_filter_empty_label.deleteLater()
+            self._matched_filter_empty_label = None
+
+        any_visible = False
+        hidden_uids: set[str] = set()
+        for uid, row_widget in self._matched_struct_rows.items():
+            chk = self._matched_struct_checkboxes.get(uid)
+            label = chk.text().lower() if chk is not None else ""
+            visible = (text == "") or (text in label)
+            row_widget.setVisible(visible)
+            if visible:
+                any_visible = True
+            else:
+                hidden_uids.add(uid)
+
+        # Forward the hidden-uid set to the viewer so filtered-out
+        # structures also drop their overlay on the image. Independent
+        # of the per-structure checkbox state — see
+        # ``GIWAXSImageViewer.set_matched_filter_hidden``.
+        if hasattr(self, "viewer"):
+            self.viewer.set_matched_filter_hidden(hidden_uids)
+
+        # Only show the "no matches" hint when the user has actually
+        # typed something — empty filter + zero rows is the "no
+        # matched solutions for this frame" case handled elsewhere.
+        if text and self._matched_struct_rows and not any_visible:
+            self._matched_filter_empty_label = QLabel(
+                f"<i>No structures match '{self._matched_filter_edit.text()}'.</i>"
+            )
+            self._matched_filter_empty_label.setWordWrap(True)
+            self._matched_struct_layout.addWidget(self._matched_filter_empty_label)
 
     def _on_matched_master_toggled(self, checked: bool) -> None:
         """Master toggles cascade to every per-structure row.

@@ -212,9 +212,15 @@ def _modified_save_paths(base: str, entry: str, frame_num: int) -> list[Path]:
 # ---------------- the window ----------------
 
 class FigureExportWindow(QMainWindow):
-    """Non-modal export window with debounced live preview."""
+    """Non-modal export window with on-demand preview rendering.
 
-    DEBOUNCE_MS = 200
+    Previously auto-rendered ~200 ms after each settings change. That
+    proved annoying — every spin / dropdown click triggered a 3–6 s
+    mlgidbase render including a silx-tree detach/reattach which
+    interrupts the main window. The current design instead marks the
+    preview "stale" on any change and renders only when the user
+    clicks **Render preview** (or on initial window open).
+    """
 
     def __init__(self, main_window) -> None:
         # QMainWindow with the main window as logical parent gives us
@@ -230,27 +236,27 @@ class FigureExportWindow(QMainWindow):
         self._temp_png_base: Path | None = None
         self._last_rendered_path: Path | None = None
         self._render_in_flight = False
-        # Suspend the auto-render scheduler while we batch-load
-        # defaults from the host so each setter doesn't kick off a
-        # render.
-        self._suspend_render = True
+        # ``True`` once any setting has changed since the last
+        # successful render. Drives the Render button's emphasis and
+        # the status label hint.
+        self._settings_dirty = False
+        # Suspended while the constructor seeds defaults from the
+        # host so each setter's signal doesn't flip the dirty flag
+        # before the user has touched anything.
+        self._suspend_dirty = True
 
         # Per-section widget dicts populated in _build_layer_section.
         # Lets _gather_layer_params iterate generically.
         self._layer_widgets: dict[str, dict[str, QWidget]] = {}
 
-        self._render_timer = QTimer(self)
-        self._render_timer.setSingleShot(True)
-        self._render_timer.setInterval(self.DEBOUNCE_MS)
-        self._render_timer.timeout.connect(self._render)
-
         self._build_ui()
         self._populate_from_main()
 
         self.resize(1100, 760)
-        self._suspend_render = False
+        self._suspend_dirty = False
         # Kick off the first render after the event loop is running.
-        QTimer.singleShot(0, self._schedule_render)
+        # Subsequent renders require an explicit Render-button click.
+        QTimer.singleShot(0, self._render)
 
     # ---------- UI build ----------
 
@@ -307,7 +313,7 @@ class FigureExportWindow(QMainWindow):
         self.cb_fitted = QCheckBox("Fitted")
         self.cb_matched = QCheckBox("Matched")
         for cb in (self.cb_detected, self.cb_fitted, self.cb_matched):
-            cb.toggled.connect(self._schedule_render)
+            cb.toggled.connect(self._mark_stale)
         layer_row = QHBoxLayout()
         layer_row.addWidget(self.cb_detected)
         layer_row.addWidget(self.cb_fitted)
@@ -317,18 +323,18 @@ class FigureExportWindow(QMainWindow):
 
         # Frame / entry — populated from host on open.
         self.cmb_entry = QComboBox()
-        self.cmb_entry.currentTextChanged.connect(lambda _t: self._schedule_render())
+        self.cmb_entry.currentTextChanged.connect(lambda _t: self._mark_stale())
         form.addRow("Entry:", self.cmb_entry)
         self.spin_frame = QSpinBox()
         self.spin_frame.setRange(0, 9999)
-        self.spin_frame.valueChanged.connect(lambda _v: self._schedule_render())
+        self.spin_frame.valueChanged.connect(lambda _v: self._mark_stale())
         form.addRow("Frame:", self.spin_frame)
 
         # Colormap.
         self.cmb_cmap = QComboBox()
         self.cmb_cmap.addItems(_CMAPS)
         self.cmb_cmap.setCurrentText("inferno")
-        self.cmb_cmap.currentTextChanged.connect(lambda _t: self._schedule_render())
+        self.cmb_cmap.currentTextChanged.connect(lambda _t: self._mark_stale())
         form.addRow("Colormap:", self.cmb_cmap)
 
         # Intensity range (clims). LogNorm requires vmin > 0, so we
@@ -337,7 +343,7 @@ class FigureExportWindow(QMainWindow):
         self.spin_clim_min = _spin_double(1e-6, 1e12, 50.0)
         self.spin_clim_max = _spin_double(1e-6, 1e12, 1e4)
         for s in (self.spin_clim_min, self.spin_clim_max):
-            s.valueChanged.connect(lambda _v: self._schedule_render())
+            s.valueChanged.connect(lambda _v: self._mark_stale())
         clim_row = QHBoxLayout()
         clim_row.addWidget(self.spin_clim_min)
         clim_row.addWidget(QLabel("→"))
@@ -359,7 +365,7 @@ class FigureExportWindow(QMainWindow):
             cb.toggled.connect(self._on_auto_toggled)
         for s in (self.spin_xmin, self.spin_xmax, self.spin_ymin, self.spin_ymax):
             s.setEnabled(False)
-            s.valueChanged.connect(lambda _v: self._schedule_render())
+            s.valueChanged.connect(lambda _v: self._mark_stale())
         form.addRow("q_xy min:", self._auto_row(self.spin_xmin, self.cb_xmin_auto))
         form.addRow("q_xy max:", self._auto_row(self.spin_xmax, self.cb_xmax_auto))
         form.addRow("q_z min:", self._auto_row(self.spin_ymin, self.cb_ymin_auto))
@@ -368,12 +374,12 @@ class FigureExportWindow(QMainWindow):
         # DPI + figure size. DPI default 150 for previewing; the user
         # can crank to 600 (tutorial) when ready to save.
         self.spin_dpi = _spin_int(150, lo=50, hi=1200)
-        self.spin_dpi.valueChanged.connect(lambda _v: self._schedule_render())
+        self.spin_dpi.valueChanged.connect(lambda _v: self._mark_stale())
         form.addRow("DPI:", self.spin_dpi)
         self.spin_fig_w = _spin_double(1.0, 30.0, 6.4, decimals=2)
         self.spin_fig_h = _spin_double(1.0, 30.0, 4.8, decimals=2)
         for s in (self.spin_fig_w, self.spin_fig_h):
-            s.valueChanged.connect(lambda _v: self._schedule_render())
+            s.valueChanged.connect(lambda _v: self._mark_stale())
         fig_row = QHBoxLayout()
         fig_row.addWidget(self.spin_fig_w)
         fig_row.addWidget(QLabel("×"))
@@ -405,13 +411,13 @@ class FigureExportWindow(QMainWindow):
         def hook(w: QWidget) -> None:
             # Generic change-notify wire.
             if isinstance(w, QCheckBox):
-                w.toggled.connect(self._schedule_render)
+                w.toggled.connect(self._mark_stale)
             elif isinstance(w, QComboBox):
-                w.currentTextChanged.connect(lambda _t: self._schedule_render())
+                w.currentTextChanged.connect(lambda _t: self._mark_stale())
             elif isinstance(w, QLineEdit):
-                w.editingFinished.connect(self._schedule_render)
+                w.editingFinished.connect(self._mark_stale)
             elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
-                w.valueChanged.connect(lambda _v: self._schedule_render())
+                w.valueChanged.connect(lambda _v: self._mark_stale())
 
         # Order chosen to match the tutorial's docs reading order.
         if "plot_segments" in defaults:
@@ -499,13 +505,13 @@ class FigureExportWindow(QMainWindow):
 
         for w in d.values():
             if isinstance(w, QCheckBox):
-                w.toggled.connect(self._schedule_render)
+                w.toggled.connect(self._mark_stale)
             elif isinstance(w, QComboBox):
-                w.currentTextChanged.connect(lambda _t: self._schedule_render())
+                w.currentTextChanged.connect(lambda _t: self._mark_stale())
             elif isinstance(w, QLineEdit):
-                w.editingFinished.connect(self._schedule_render)
+                w.editingFinished.connect(self._mark_stale)
             elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
-                w.valueChanged.connect(lambda _v: self._schedule_render())
+                w.valueChanged.connect(lambda _v: self._mark_stale())
 
         section.body_layout.addLayout(form)
         return section
@@ -525,9 +531,10 @@ class FigureExportWindow(QMainWindow):
 
         self.btn_save = QPushButton("Save figure")
         self.btn_save.setToolTip(
-            "Write the current preview to disk. When the Matched "
-            "layer is on mlgidbase writes one PNG per solution, "
-            "with '_sol_NNNN' appended to the filename."
+            "Write a PNG using the current settings. Saves to the "
+            "exact path you pick; with the Matched layer on, "
+            "mlgidbase writes one PNG per solution with '_sol_NNNN' "
+            "appended to the filename."
         )
         self.btn_save.clicked.connect(self._on_save)
         form.addRow("", self.btn_save)
@@ -539,6 +546,7 @@ class FigureExportWindow(QMainWindow):
         host = QWidget()
         v = QVBoxLayout(host)
         v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(8)
         self._preview = QLabel("Preview will render here.")
         self._preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._preview.setStyleSheet(
@@ -546,6 +554,27 @@ class FigureExportWindow(QMainWindow):
         )
         self._preview.setMinimumSize(400, 300)
         v.addWidget(self._preview, 1)
+
+        # Render preview button lives below the image — its action
+        # is "redraw the thing above", so the visual association is
+        # tighter here than buried in the settings column. Earlier
+        # placement inside the Save form row caused visual overlap
+        # with the section header on tight layouts.
+        self.btn_render = QPushButton("Render preview")
+        self.btn_render.setToolTip(
+            "Re-draw the image above using the current settings. "
+            "Rendering is on-demand to avoid stuttering on every "
+            "spin / dropdown click (one render ≈ 3–6 s)."
+        )
+        self.btn_render.setMinimumHeight(34)
+        self.btn_render.clicked.connect(self._render)
+        # Centered button row — stretchers on both sides keep it
+        # at its natural width even when the splitter is wide.
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.btn_render)
+        btn_row.addStretch(1)
+        v.addLayout(btn_row)
         return host
 
     # ---------- state seeding ----------
@@ -683,18 +712,38 @@ class FigureExportWindow(QMainWindow):
 
     # ---------- render pipeline ----------
 
-    def _schedule_render(self) -> None:
-        if self._suspend_render:
+    def _mark_stale(self, *_args) -> None:
+        """Flag the preview as out-of-date with the current
+        settings. Called by every widget signal in the settings
+        column. Triggers no render — the user clicks Render
+        preview when they're ready.
+
+        ``*_args`` swallows the various payloads Qt signals carry
+        (toggled→bool, valueChanged→int/float, currentTextChanged→
+        str) so we can connect the same slot to all of them.
+        """
+        if self._suspend_dirty or self._render_in_flight:
             return
-        self._render_timer.start(self.DEBOUNCE_MS)
+        if self._settings_dirty:
+            return
+        self._settings_dirty = True
+        self._status_label.setText(
+            "Settings changed — click Render preview to update."
+        )
+        if hasattr(self, "btn_render"):
+            # Visual cue: bolden the Render button when there's a
+            # pending change. Plain styling once a render lands.
+            self.btn_render.setStyleSheet(
+                "QPushButton { font-weight: bold; }"
+            )
 
     def _render(self) -> None:
         if self._render_in_flight:
-            # Coalesce concurrent triggers — schedule a follow-up.
-            self._render_timer.start(self.DEBOUNCE_MS)
             return
         self._render_in_flight = True
         self.btn_save.setEnabled(False)
+        if hasattr(self, "btn_render"):
+            self.btn_render.setEnabled(False)
         self._status_label.setText("Rendering…")
         QApplication.processEvents()
         # Build kwargs first so a malformed config doesn't trigger a
@@ -721,6 +770,10 @@ class FigureExportWindow(QMainWindow):
         finally:
             self._render_in_flight = False
             self.btn_save.setEnabled(True)
+            if hasattr(self, "btn_render"):
+                self.btn_render.setEnabled(True)
+                self.btn_render.setStyleSheet("")
+            self._settings_dirty = False
 
     def _do_render(self, kwargs: dict, defaults: dict) -> None:
         try:
@@ -842,7 +895,7 @@ class FigureExportWindow(QMainWindow):
             (self.spin_ymax, self.cb_ymax_auto),
         ):
             spin.setEnabled(not cb.isChecked())
-        self._schedule_render()
+        self._mark_stale()
 
     def _browse_save_path(self) -> None:
         start = self.path_edit.text() or str(Path.home() / "figure.png")
@@ -874,12 +927,14 @@ class FigureExportWindow(QMainWindow):
             QMessageBox.critical(self, "Save failed", f"Settings error: {exc}")
             return
         self.btn_save.setEnabled(False)
+        self.btn_render.setEnabled(False)
         try:
             self._run_with_detached_tree(
                 self._do_save, target, kwargs, defaults,
             )
         finally:
             self.btn_save.setEnabled(True)
+            self.btn_render.setEnabled(True)
         if self._save_error is not None:
             QMessageBox.critical(
                 self, "Save failed",
@@ -963,12 +1018,12 @@ class FigureExportWindow(QMainWindow):
             except OSError:
                 pass
         self._last_rendered_path = None
-        self._suspend_render = True
+        self._suspend_dirty = True
         try:
             self._populate_from_main()
         finally:
-            self._suspend_render = False
-        self._schedule_render()
+            self._suspend_dirty = False
+        self._mark_stale()
 
     def closeEvent(self, event) -> None:
         # Clean up the temp PNG we've been overwriting.

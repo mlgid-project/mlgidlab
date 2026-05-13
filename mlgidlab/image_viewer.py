@@ -928,6 +928,12 @@ class GIWAXSImageViewer(QWidget):
         # frame changes back. Defaults to True on first sight.
         self._matched_visibility: dict[tuple[int, str], bool] = {}
         self._matched_master_visible: bool = True
+        # ``unique_id``s currently hidden by the Display-dock search
+        # filter. Independent of ``_matched_visibility`` (which
+        # tracks checkbox state); the filter set overrides checkbox
+        # state but doesn't mutate it, so clearing the filter
+        # restores the previous user selection.
+        self._matched_filter_hidden: set[str] = set()
         self._matched_items: list[tuple[str, _PeakShapeItem]] = []
 
         self._mode = MODE_POLAR
@@ -1271,8 +1277,26 @@ class GIWAXSImageViewer(QWidget):
             if uid == unique_id:
                 item.setVisible(self._is_matched_item_visible(uid))
 
+    def set_matched_filter_hidden(self, hidden_ids) -> None:
+        """Hide overlays for structures filtered out of the
+        Display-dock search.
+
+        Independent of ``set_matched_structure_visible`` (the
+        checkbox-driven path): an empty filter set restores
+        whatever the user's per-structure checkboxes say, while a
+        non-empty set forces those ``unique_id``s off regardless of
+        checkbox state. This lets the user search by CIF substring
+        without losing their checkbox selections when the filter
+        clears.
+        """
+        self._matched_filter_hidden = set(hidden_ids)
+        for uid, item in self._matched_items:
+            item.setVisible(self._is_matched_item_visible(uid))
+
     def _is_matched_item_visible(self, unique_id: str) -> bool:
         if not self._matched_master_visible:
+            return False
+        if unique_id in self._matched_filter_hidden:
             return False
         return self._matched_visibility.get(
             (self.current_frame, unique_id), True
