@@ -59,10 +59,19 @@ A working sample is bundled at `example/BA2PbI4.h5` plus
   (q_xy / q_z)**; for raw files the same canvas shows the detector
   image in pixels.
 - Scrub through frames with the slider, change colormap, adjust
-  intensity levels with the histogram next to the image.
+  intensity levels with the histogram next to the image. The
+  frame slider, prev / next buttons, and Play toggle live on the
+  image viewer's toolbar (so they remain reachable from any
+  right-dock tab).
+- **Frame keyboard shortcuts:** ← / → (and J / K) step prev / next;
+  Home / End jump to first / last. Text-input widgets keep their
+  caret nav for the same keys — the shortcuts only fire when focus
+  isn't on a QSpinBox / QLineEdit.
 - **Log / linear contrast toggle** on the image toolbar — useful for
   GIWAXS data with wide dynamic range. Coordinate axes and overlays
   are unaffected.
+- **View → Reset layout** snaps every dock back to its cold-start
+  position after the user has drag-rearranged things.
 - Inspect any HDF5 dataset directly under the **Data** tab.
 - The **status bar** along the bottom shows the active file (with `*`
   dirty marker), entry, current frame, pipeline state, and a live
@@ -76,6 +85,15 @@ A working sample is bundled at `example/BA2PbI4.h5` plus
   (`det2q_gid`, `det2q`, `det2pol_gid`, `det2pol`).
 - Provide a **PONI** calibration file, an optional **mask**
   (`.npy` / `.tif` / `.edf`), and the **angle of incidence**.
+- **Create… buttons** next to the PONI and Mask fields open the
+  embedded pyFAI calibration dialog so you can produce both files
+  without leaving mlgidLAB. The dialog seeds the experiment image
+  from the active raw scan (per-pixel mean across all frames so
+  faint outer rings come out of the noise) and carries existing
+  PONI / mask paths from the Conversion fields into the dialog so
+  you can refine in place. Two prominent "Add … to conversion"
+  buttons push saved paths back into the QLineEdits without
+  closing the dialog.
 - Edit **sample metadata** (YAML editor) and add **experimental
   metadata** manually or by picking a dataset from the raw HDF5 tree.
 - Choose where the output goes:
@@ -130,6 +148,21 @@ A working sample is bundled at `example/BA2PbI4.h5` plus
   while the master is off promotes it exclusively.
 
 ### Inspect
+- The **Peaks** dock has tabbed sortable tables of every peak on the
+  current frame — one tab each for **Detected**, **Fitted**, and
+  **Matched**. Column headers are click-sortable; sort order
+  persists across frame changes. **Bidirectional click-sync** with
+  the image viewer: clicking a row selects the peak in the viewer
+  and renders the white highlight overlay; clicking a peak in the
+  image switches the dock to that peak's kind tab and scrolls the
+  row into view. Selecting a matched structure highlights every
+  peak that belongs to it at once.
+- The **Display** dock carries overlay toggles (Detected / Fitted /
+  Matched) and, for matched structures, a per-row master cascade
+  plus a **substring filter** above the rows. The filter is
+  case-insensitive and live; filtered-out structures disappear
+  from both the dock list and the image overlay until you clear
+  the filter — without altering the per-structure checkbox state.
 - The **Profiles** dock shows live radial and angular Gaussian fits
   of the selected peak (with linear background); manual peaks get
   a real bounded refit, file-resident peaks render the Gaussian
@@ -145,8 +178,15 @@ A working sample is bundled at `example/BA2PbI4.h5` plus
 - Edits land on a per-session temp copy. The original file is only
   touched when you choose **Save** or **Save As**. Each open file
   tracks its own unsaved-changes flag and prompts on close.
-- **Tools → Export current frame as PNG…** captures the visible
-  image with overlays at full resolution.
+- **Tools → Export figure…** opens a non-modal window built around
+  `mlgidbase.plot_analysis_results`. Settings column (layer
+  toggles, entry / frame, colormap, intensity range, q range, DPI,
+  figure size, plus collapsible per-layer styling for Detected /
+  Fitted / Matched and a `set_plot_defaults` section) drives a
+  matplotlib preview on the right. A **Render preview** button
+  below the image redraws on demand; **Save figure** writes the
+  rendered PNG. With the Matched layer on, mlgidbase writes one
+  PNG per solution (suffix `_sol_NNNN`).
 - **Tools → Export peaks as CSV…** writes detected, fitted, or
   matched peaks for the active frame, the active entry (all
   frames), or all entries. Detected/Fitted dump the full structured
@@ -161,6 +201,15 @@ A working sample is bundled at `example/BA2PbI4.h5` plus
   Active entry (all frames), All entries, or Active frame
   (greyed out unless the file has more than one frame).
 
+### Help
+- **Help → About mlgidLAB…** — modal with a one-line description
+  and a version table covering mlgidLAB, Python, OS, PySide6, Qt,
+  numpy, h5py, silx, pyFAI, pyqtgraph, matplotlib, and mlgidbase.
+- **Help → Copy diagnostics** — writes a plain-text blob to the
+  clipboard with three sections (versions, active session
+  details, last 50 log lines). Status-bar message confirms.
+  Nothing is uploaded; the user pastes into their bug report.
+
 ---
 
 ## UI layout
@@ -168,9 +217,10 @@ A working sample is bundled at `example/BA2PbI4.h5` plus
 ```
 ┌────────────────┬───────────────────────────────────┬──────────────────────┐
 │ File browser   │  Image  │  Data                   │  Display             │
-│ (silx HDF5     │  ┌────────────────────────────┐   │  Pipeline            │
-│  tree)         │  │ pyqtgraph viewer           │   │  Conversion          │
-│                │  │  Cartesian / Polar / Raw   │   │  Logs                │
+│ (silx HDF5     │  ┌────────────────────────────┐   │  Pipeline /          │
+│  tree)         │  │ pyqtgraph viewer           │   │     Conversion       │
+│                │  │  Cartesian / Polar / Raw   │   │  Peaks               │
+│                │  │  frame slider + Play       │   │  Logs                │
 │                │  │  histogram + colormap      │   │  (tabbed)            │
 │                │  └────────────────────────────┘   │                      │
 │                ├───────────────────────────────────┤                      │
@@ -180,20 +230,28 @@ A working sample is bundled at `example/BA2PbI4.h5` plus
 └───────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **Display dock** — entry selector, frame slider, overlay toggles,
-  Selected-peak panel, master/per-structure matched-peaks cascade.
+- **Display dock** — entry selector, overlay toggles, Matched-peaks
+  master + per-structure cascade + substring filter, Selected-peak
+  parameter panel.
 - **Pipeline dock** — Detection / Fitting / Matching plus the
   Run-full-pipeline button (visible in NeXus mode).
 - **Conversion dock** — pygid raw-data conversion (visible in raw
-  mode).
+  mode; tab position swaps with Pipeline per mode).
+- **Peaks dock** — tabbed sortable tables (Detected / Fitted /
+  Matched) with bidirectional click-sync to the image viewer.
 - **Logs dock** — shared by Pipeline and Conversion.
 - **Profiles dock** — radial + angular cross-sections of the
   selected peak.
 
-The **View** menu toggles every dock and the cursor readout; the
-**Edit** menu has Undo / Redo; **Tools** holds bulk operations
-(clear peaks, PNG export, CSV export); **File** holds open / open
-recent / save / save-as.
+The **menu bar** runs **File · Edit · Tools · View · Settings · Help**:
+- **File** — open, open recent, save, save-as, close, exit.
+- **Edit** — undo / redo.
+- **Tools** — clear-peaks submenu, Export figure…, Export peaks
+  as CSV…
+- **View** — per-dock visibility toggles, cursor-readout toggle,
+  Reset layout.
+- **Settings** — Playback settings…
+- **Help** — About mlgidLAB…, Copy diagnostics.
 
 ---
 
@@ -239,32 +297,45 @@ so peaks outside the upper-right quadrant still render.
 
 ```
 mlgidlab/
-  main_window.py     QMainWindow: menus, docks, status bar,
-                     session / pipeline / conversion plumbing,
-                     drag-and-drop + recent-files
-  image_viewer.py    pyqtgraph viewer, ROI, overlays, undo stack,
-                     raw-mode rendering, cursor readout
-  profile_viewer.py  1D radial + angular profile widget with live
-                     Gaussian + linear-background fits
-  parameter_panel.py "Selected peak" readout + commit / delete
-  pipeline_panel.py  Detection / Fitting / Matching launcher,
-                     scrollable, multi-expand, Run-full-pipeline
-  conversion_panel.py pygid raw → NeXus conversion launcher
-  pipeline.py        Lazy mlgidBASE wrappers (no Qt) — per-entry
-                     CIF preprocessing, fitted polar→Cartesian
-                     back-fill, matched dedup
-  conversion.py      Lazy pygid wrappers (no Qt)
-  file_model.py      h5py reads + targeted in-place writes +
-                     raw-entry walker + CSV exporters
-  fit.py             1D Gaussian + linear-background fitting helpers
-  polar.py           Cartesian↔polar transform; handles arbitrary
-                     q-axis orientation
-  session.py         BaseSession + NexusSession (writable temp
-                     copy) + RawSession (read-only batch)
-  workers.py         QThread workers for open / pipeline /
-                     conversion / CIF parse
-  theme.py           qdarkstyle + pyqtgraph color overrides
-example/             Sample NeXus file + matching CIF pickle
+  main_window.py        QMainWindow: menus, docks, status bar,
+                        session / pipeline / conversion plumbing,
+                        drag-and-drop + recent-files, frame
+                        keyboard shortcuts, reset layout, Help menu
+  image_viewer.py       pyqtgraph viewer, ROI, overlays, undo
+                        stack, raw-mode rendering, cursor readout,
+                        matched filter-hidden overlay mask
+  profile_viewer.py     1D radial + angular profile widget with
+                        live Gaussian + linear-background fits
+  parameter_panel.py    "Selected peak" readout + commit / delete
+  pipeline_panel.py     Detection / Fitting / Matching launcher,
+                        scrollable, multi-expand, Run-full-pipeline
+  conversion_panel.py   pygid raw → NeXus conversion launcher with
+                        Create… buttons that open the pyFAI
+                        calibration dialog
+  peaks_table_panel.py  Tabbed sortable per-frame peak tables with
+                        bidirectional click-sync to the viewer
+  calibration_dialog.py Embedded pyFAI calibration + mask creation
+                        modal (Experiment / Mask / Peaks /
+                        Geometry / Integration tasks)
+  figure_export_window.py Non-modal figure-export window driving
+                        mlgidbase.plot_analysis_results with a
+                        live preview pane and on-demand render
+  pipeline.py           Lazy mlgidBASE wrappers (no Qt) — per-
+                        entry CIF preprocessing, fitted polar→
+                        Cartesian back-fill, matched dedup
+  conversion.py         Lazy pygid wrappers (no Qt)
+  file_model.py         h5py reads + targeted in-place writes +
+                        raw-entry walker + CSV exporters
+  fit.py                1D Gaussian + linear-background fitting
+                        helpers
+  polar.py              Cartesian↔polar transform; handles
+                        arbitrary q-axis orientation
+  session.py            BaseSession + NexusSession (writable temp
+                        copy) + RawSession (read-only batch)
+  workers.py            QThread workers for open / pipeline /
+                        conversion / CIF parse / prefetch
+  theme.py              qdarkstyle + pyqtgraph color overrides
+example/                Sample NeXus file + matching CIF pickle
 ```
 
 ### Editing model
@@ -305,20 +376,27 @@ mode). Same pattern as `pipeline.py` for `mlgidbase`.
 
 ### Persistent settings
 
-- `QSettings` org `mlgidLAB`, app `mlgidLAB`. Currently
-  stores the recent-files list as a JSON string under key
-  `recentFiles`.
+- `QSettings` org `mlgidLAB`, app `mlgidLAB`. Stores the
+  recent-files list (`recentFiles`) and the Playback Settings
+  dialog's choice between "Time per frame" and "Total play time"
+  with its associated values.
+- The embedded pyFAI calibration dialog uses a separate QSettings
+  namespace `mlgidLAB / pyFAI-calib` so pyFAI's own preferences
+  (recent calibrants, last-used dirs) don't collide with the main
+  app's settings.
 
 ### Install / extras
 
 | extra        | adds                                  |
 |---           |---                                    |
-| (none)       | view-only mode                        |
+| (none)       | view-only mode + in-GUI pyFAI calib   |
 | `[pipeline]` | `mlgidbase`, `pygid`, `PyYAML`        |
 | `[dev]`      | `pytest`                              |
 
 Runtime base: `PySide6`, `silx[full]`, `h5py`, `numpy`, `scipy`,
-`pyqtgraph`, `qdarkstyle`. See `pyproject.toml` for pinned minimums.
+`pyqtgraph`, `qdarkstyle`, `pyFAI` (used by the in-GUI
+calibration + mask creation dialog and the figure export
+window). See `pyproject.toml` for pinned minimums.
 
 ### Status
 
