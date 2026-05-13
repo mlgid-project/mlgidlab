@@ -8,7 +8,7 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QWidget
+from PySide6.QtWidgets import QCheckBox, QFrame, QHBoxLayout, QVBoxLayout, QWidget
 
 from mlgidlab.fit import GaussianFit, fit_gaussian_on_axis
 from mlgidlab.image_viewer import (
@@ -67,9 +67,33 @@ class ProfileViewer(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
+        # Outer column: small toolbar row on top, two side-by-side
+        # plots below. The toolbar carries the Log-y toggle that
+        # applies to both plots simultaneously.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(4, 4, 4, 4)
+        outer.setSpacing(4)
+
+        toolbar = QHBoxLayout()
+        toolbar.setContentsMargins(0, 0, 0, 0)
+        toolbar.setSpacing(8)
+        self._log_y_check = QCheckBox("Log y")
+        self._log_y_check.setToolTip(
+            "Switch both profile y-axes to log10 scale. Useful for "
+            "GIWAXS data where peak amplitudes span multiple orders "
+            "of magnitude."
+        )
+        self._log_y_check.toggled.connect(self._on_log_y_toggled)
+        toolbar.addWidget(self._log_y_check)
+        toolbar.addStretch(1)
+        outer.addLayout(toolbar)
+
+        # Plot row stays a QHBoxLayout so the radial + angular plots
+        # sit side-by-side as before.
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
+        outer.addLayout(layout, 1)
 
         pen = pg.mkPen(PROFILE_PEN_COLOR, width=PROFILE_PEN_WIDTH)
         region_pen = pg.mkPen(REGION_COLOR, width=1.5)
@@ -200,6 +224,19 @@ class ProfileViewer(QWidget):
         self._skip_angular_fit = skip
         # Re-render so the curve appears / disappears immediately.
         self._recompute_curves()
+
+    def _on_log_y_toggled(self, log: bool) -> None:
+        """Apply the Log-y toggle to both profile plots.
+
+        pyqtgraph's ``setLogMode`` transforms data internally during
+        rendering — no need to remap the cached curve data ourselves
+        and no impact on the linear-space fit math (the fit curve is
+        also auto-log-scaled by pyqtgraph). Non-positive intensities
+        (rare on mean-of-row / mean-of-column profiles) render as
+        -inf and effectively drop from the visible trace.
+        """
+        for plot in (self._radial_plot, self._angular_plot):
+            plot.setLogMode(x=False, y=log)
 
     def last_fit_params(self) -> dict[str, GaussianFit | None]:
         """Most recent radial / angular Gaussian fits, or None if not fitted.

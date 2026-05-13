@@ -1,7 +1,12 @@
-"""Application-wide dark theme.
+"""Application-wide theming.
 
-Uses qdarkstyle for the Qt widget chrome and aligns pyqtgraph's defaults so
-plots blend with the rest of the UI.
+``apply_dark_theme`` is the default — uses qdarkstyle for the Qt widget
+chrome and aligns pyqtgraph's defaults so plots blend with the rest of
+the UI. ``apply_light_theme`` is the inverse: strips the stylesheet and
+uses white/black pyqtgraph defaults so the GUI reads as a standard
+light-mode Qt app.
+
+Switched at runtime by ``MainWindow._set_theme``.
 """
 from __future__ import annotations
 
@@ -24,6 +29,32 @@ def apply_dark_theme(app: QApplication) -> None:
     pg.setConfigOption("foreground", PG_FOREGROUND)
     pg.setConfigOption("antialias", True)
     app.setStyleSheet(qdarkstyle.load_stylesheet(qt_api="pyside6") + _OVERRIDES)
+
+
+# Light-mode pyqtgraph defaults — white background, black axes / text.
+# Matches what pyqtgraph ships out of the box; restated here so the
+# light-theme switcher can revert from the dark configuration.
+PG_LIGHT_BACKGROUND = "w"
+PG_LIGHT_FOREGROUND = "k"
+
+
+def apply_light_theme(app: QApplication) -> None:
+    """Strip the qdarkstyle stylesheet + flip pyqtgraph to white.
+
+    Existing widgets reread the global QApplication stylesheet, so
+    a runtime switch is mostly seamless. pyqtgraph plots use
+    ``pg.setConfigOption`` defaults at construction time — already-
+    constructed plots keep their dark palette until the next
+    ``setImage`` / replot, which most workflows trigger naturally
+    on the next frame change or file open.
+    """
+    pg.setConfigOption("background", PG_LIGHT_BACKGROUND)
+    pg.setConfigOption("foreground", PG_LIGHT_FOREGROUND)
+    pg.setConfigOption("antialias", True)
+    # Empty stylesheet → fall back to Qt's native (light) palette.
+    # Keep ``_OVERRIDES`` since the QComboBox icon-column fix is
+    # theme-agnostic.
+    app.setStyleSheet(_OVERRIDES)
 
 
 # Qt's default QComboBox reserves an icon column (PM_SmallIconSize, ~16 px)

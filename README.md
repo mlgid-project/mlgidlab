@@ -158,16 +158,27 @@ A working sample is bundled at `example/BA2PbI4.h5` plus
   row into view. Selecting a matched structure highlights every
   peak that belongs to it at once.
 - The **Display** dock carries overlay toggles (Detected / Fitted /
-  Matched) and, for matched structures, a per-row master cascade
-  plus a **substring filter** above the rows. The filter is
-  case-insensitive and live; filtered-out structures disappear
-  from both the dock list and the image overlay until you clear
-  the filter — without altering the per-structure checkbox state.
+  Matched) plus per-layer filters:
+  - **Detected**: a min-score slider under the Detected checkbox
+    hides peaks whose model score is below the cutoff. Auto-seeds
+    to the frame's lowest score on every frame change.
+  - **Matched**: a per-row master cascade plus two filters above
+    the rows — a CIF-name substring textbox and a min-probability
+    slider (0.00–1.00). The two AND together; the slider auto-
+    seeds to the frame's lowest probability so the default shows
+    every match.
+
+  All filters are inclusive (`p=1.0` passes when the slider sits at
+  1.0). Filtered-out items disappear from both the dock and the
+  image overlay without altering the per-structure checkbox state;
+  drop the slider/filter to bring them back.
 - The **Profiles** dock shows live radial and angular Gaussian fits
   of the selected peak (with linear background); manual peaks get
   a real bounded refit, file-resident peaks render the Gaussian
   implied by their stored width. The X range pans with the box on
-  ROI drag so the borders stay visible.
+  ROI drag so the borders stay visible. A **Log y** checkbox above
+  the plots switches both y-axes to log10 — useful when peak
+  amplitudes span multiple orders of magnitude.
 - The matched palette uses 10 colours × 4 line styles for
   40 unique pens before any pair repeats — useful when matching
   against folders with many candidate CIFs.
@@ -202,6 +213,9 @@ A working sample is bundled at `example/BA2PbI4.h5` plus
   (greyed out unless the file has more than one frame).
 
 ### Help
+- **Help → Controls & shortcuts…** (F1) — modal reference for
+  every keyboard shortcut, image-viewer mouse interaction, and
+  the manual-peak commit workflow.
 - **Help → About mlgidLAB…** — modal with a one-line description
   and a version table covering mlgidLAB, Python, OS, PySide6, Qt,
   numpy, h5py, silx, pyFAI, pyqtgraph, matplotlib, and mlgidbase.
@@ -219,12 +233,12 @@ A working sample is bundled at `example/BA2PbI4.h5` plus
 │ File browser   │  Image  │  Data                   │  Display             │
 │ (silx HDF5     │  ┌────────────────────────────┐   │  Pipeline /          │
 │  tree)         │  │ pyqtgraph viewer           │   │     Conversion       │
-│                │  │  Cartesian / Polar / Raw   │   │  Peaks               │
-│                │  │  frame slider + Play       │   │  Logs                │
-│                │  │  histogram + colormap      │   │  (tabbed)            │
+│                │  │  Cartesian / Polar / Raw   │   │  Logs                │
+│                │  │  frame slider + Play       │   │  (tabbed)            │
+│                │  │  histogram + colormap      │   │                      │
 │                │  └────────────────────────────┘   │                      │
 │                ├───────────────────────────────────┤                      │
-│                │  Profiles (radial + angular)      │                      │
+│                │  Profiles / Peaks (tabbed)        │                      │
 ├────────────────┴───────────────────────────────────┴──────────────────────┤
 │ Status bar:  file  │  entry  │  frame  │  pipeline state  │  cursor       │
 └───────────────────────────────────────────────────────────────────────────┘
@@ -237,21 +251,25 @@ A working sample is bundled at `example/BA2PbI4.h5` plus
   Run-full-pipeline button (visible in NeXus mode).
 - **Conversion dock** — pygid raw-data conversion (visible in raw
   mode; tab position swaps with Pipeline per mode).
-- **Peaks dock** — tabbed sortable tables (Detected / Fitted /
-  Matched) with bidirectional click-sync to the image viewer.
 - **Logs dock** — shared by Pipeline and Conversion.
-- **Profiles dock** — radial + angular cross-sections of the
-  selected peak.
+- **Profiles + Peaks** — share the bottom dock area as tabs. The
+  **Profiles** tab carries radial + angular cross-sections of the
+  selected peak; the **Peaks** tab is a tabbed sortable table
+  (Detected / Fitted / Matched) with bidirectional click-sync to
+  the image viewer. Profile is raised by default; one click flips
+  to the table.
 
 The **menu bar** runs **File · Edit · Tools · View · Settings · Help**:
 - **File** — open, open recent, save, save-as, close, exit.
-- **Edit** — undo / redo.
+- **Edit** — undo / redo, Find peak by ID… (Ctrl+F).
 - **Tools** — clear-peaks submenu, Export figure…, Export peaks
   as CSV…
 - **View** — per-dock visibility toggles, cursor-readout toggle,
-  Reset layout.
+  Reset layout, Fullscreen image viewer (F11), Theme submenu
+  (Dark / Light, persisted via QSettings).
 - **Settings** — Playback settings…
-- **Help** — About mlgidLAB…, Copy diagnostics.
+- **Help** — Controls & shortcuts… (F1), About mlgidLAB…,
+  Copy diagnostics.
 
 ---
 

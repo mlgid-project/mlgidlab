@@ -19,6 +19,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QAction,
+    QActionGroup,
     QCloseEvent,
     QColor,
     QDragEnterEvent,
@@ -644,6 +645,20 @@ class MainWindow(QMainWindow):
         self.action_redo.triggered.connect(self._action_redo)
         edit_menu.addAction(self.action_redo)
 
+        edit_menu.addSeparator()
+        # Find peak by ID. Opens a modal asking for the kind + numeric
+        # ID, then selects that peak in the viewer (jumping to its
+        # frame if needed) and switches the Peaks dock to the
+        # matching tab via the existing selection-sync wiring.
+        self.action_find_peak = QAction("&Find peak by ID…", self)
+        self.action_find_peak.setShortcut(QKeySequence("Ctrl+F"))
+        self.action_find_peak.setToolTip(
+            "Find a Detected or Fitted peak by its numeric ID and "
+            "select it in the viewer."
+        )
+        self.action_find_peak.triggered.connect(self._action_find_peak)
+        edit_menu.addAction(self.action_find_peak)
+
     def _build_tools_menu(self, bar) -> None:
         """Bulk-edit operations that don't fit the per-peak ROI workflow.
 
@@ -1058,6 +1073,111 @@ class MainWindow(QMainWindow):
         self.action_reset_layout.triggered.connect(self._reset_layout)
         view_menu.addAction(self.action_reset_layout)
 
+        # F11 fullscreen — hides every dock so the image viewer
+        # owns the whole window. Menu bar stays so F11 / View
+        # remains reachable. Checkable so the menu reads its state
+        # back; toggled() drives the same path as the F11 keypress.
+        self.action_fullscreen = QAction("&Fullscreen image viewer", self)
+        self.action_fullscreen.setShortcut(QKeySequence("F11"))
+        self.action_fullscreen.setCheckable(True)
+        self.action_fullscreen.setToolTip(
+            "Maximise the image viewer by hiding every dock. F11 "
+            "toggles back."
+        )
+        self.action_fullscreen.toggled.connect(self._set_fullscreen)
+        view_menu.addAction(self.action_fullscreen)
+
+        # Theme submenu — Dark (default) / Light. Both checkable +
+        # mutually exclusive via QActionGroup so the menu reads as
+        # a radio choice. Selection persists via QSettings; applied
+        # at startup in ``__init__``.
+        view_menu.addSeparator()
+        theme_menu = view_menu.addMenu("&Theme")
+        self.action_theme_dark = QAction("&Dark", self)
+        self.action_theme_dark.setCheckable(True)
+        self.action_theme_light = QAction("&Light", self)
+        self.action_theme_light.setCheckable(True)
+        theme_group = QActionGroup(self)
+        theme_group.setExclusive(True)
+        theme_group.addAction(self.action_theme_dark)
+        theme_group.addAction(self.action_theme_light)
+        theme_menu.addAction(self.action_theme_dark)
+        theme_menu.addAction(self.action_theme_light)
+        self.action_theme_dark.triggered.connect(lambda: self._set_theme("dark"))
+        self.action_theme_light.triggered.connect(lambda: self._set_theme("light"))
+        # Sync the menu's check state with whatever's persisted /
+        # currently active. ``_apply_persisted_theme`` (called once
+        # at startup) writes self._current_theme.
+        current = getattr(self, "_current_theme", "dark")
+        (self.action_theme_dark if current == "dark"
+         else self.action_theme_light).setChecked(True)
+
+    def _set_fullscreen(self, on: bool) -> None:
+        """Enter / leave the image-viewer-only fullscreen mode.
+
+        On enter: snapshot every dock's current visibility, then
+        hide them. On exit: restore the snapshotted states. The
+        menu bar is left alone so the user has a discoverable way
+        out beyond the F11 shortcut.
+        """
+        docks = [
+            self._tree_dock,
+            self._display_dock,
+            self._pipeline_dock,
+            self._conversion_dock,
+            self._logs_dock,
+            self._peaks_dock,
+            self._profile_dock,
+        ]
+        if on:
+            self._dock_visibility_before_fullscreen = {
+                id(d): d.isVisible() for d in docks
+            }
+            for d in docks:
+                d.setVisible(False)
+        else:
+            saved = getattr(self, "_dock_visibility_before_fullscreen", None)
+            if saved is None:
+                # No snapshot (e.g. user toggled the action via the
+                # menu before any fullscreen entry). Fall back to
+                # the mode-driven defaults so the layout doesn't end
+                # up empty.
+                self._apply_session_mode(self._active_session)
+            else:
+                for d in docks:
+                    d.setVisible(bool(saved.get(id(d), True)))
+            self._dock_visibility_before_fullscreen = None
+
+    def _set_theme(self, theme: str) -> None:
+        """Apply ``"dark"`` or ``"light"`` immediately, then persist
+        via QSettings so next launch starts the same way.
+
+        Re-runs ``apply_dark_theme`` / ``apply_light_theme`` against
+        the live QApplication, which swaps the stylesheet and pushes
+        new pyqtgraph defaults. Existing plot items are refreshed
+        opportunistically — pyqtgraph keeps a per-axis color cache
+        that doesn't always pick up the new global on its own, so
+        some widgets may need the next file open to fully re-paint.
+        """
+        if theme not in ("dark", "light"):
+            theme = "dark"
+        from mlgidlab.theme import apply_dark_theme, apply_light_theme
+        from PySide6.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app is not None:
+            if theme == "light":
+                apply_light_theme(app)
+            else:
+                apply_dark_theme(app)
+        self._current_theme = theme
+        # Persist.
+        try:
+            QSettings().setValue(self._THEME_KEY, theme)
+        except Exception:
+            pass
+
+    _THEME_KEY = "theme"
+
     def _reset_layout(self) -> None:
         """Restore the dock arrangement captured at cold startup.
 
@@ -1146,16 +1266,22 @@ class MainWindow(QMainWindow):
     def _build_help_menu(self) -> None:
         """Build the rightmost top-level Help menu.
 
-        Two entries:
-        - **About mlgidLAB…** — modal "About" dialog with the
-          version of mlgidLAB + every dependency relevant to a bug
-          report (Python, Qt, mlgidbase, pyFAI, silx, h5py).
-        - **Copy diagnostics** — gathers the same environment info
-          plus active-session state and the last ~50 lines from the
-          Logs dock, and writes it to the clipboard so the user can
-          paste it into an issue.
+        Three entries:
+        - **Controls & shortcuts…** — modal reference of every
+          keyboard shortcut and image-viewer interaction.
+        - **About mlgidLAB…** — modal "About" dialog with versions.
+        - **Copy diagnostics** — clipboard-friendly env/session/log
+          dump for bug reports.
         """
         help_menu = self.menuBar().addMenu("&Help")
+        self.action_controls = QAction("&Controls && shortcuts…", self)
+        self.action_controls.setShortcut(QKeySequence("F1"))
+        self.action_controls.setToolTip(
+            "Reference for every keyboard shortcut, mouse interaction, "
+            "and the manual-peak workflow."
+        )
+        self.action_controls.triggered.connect(self._show_controls)
+        help_menu.addAction(self.action_controls)
         self.action_about = QAction("&About mlgidLAB…", self)
         self.action_about.triggered.connect(self._show_about)
         help_menu.addAction(self.action_about)
@@ -1166,6 +1292,81 @@ class MainWindow(QMainWindow):
         )
         self.action_copy_diagnostics.triggered.connect(self._copy_diagnostics)
         help_menu.addAction(self.action_copy_diagnostics)
+
+    def _show_controls(self) -> None:
+        """Modal reference for keyboard shortcuts + mouse + workflow.
+
+        Plain QMessageBox.about so we get the title bar, an OK
+        button, and rich-text rendering of the HTML body for free.
+        Three sections — keyboard, image interactions, workflow —
+        each presented as a small HTML table.
+        """
+        kbd_rows = [
+            ("←  /  →", "Previous / next frame"),
+            ("J  /  K", "Previous / next frame (Vim-style)"),
+            ("Home  /  End", "First / last frame"),
+            ("Ctrl+Z  /  Ctrl+Shift+Z (or Ctrl+Y)",
+             "Undo / redo manual + geometry edits"),
+            ("Ctrl+F", "Find peak by ID…"),
+            ("Delete", "Delete the selected peak"),
+            ("Esc", "Dismiss an in-progress manual draw"),
+            ("F1", "Show this Controls reference"),
+        ]
+        mouse_rows = [
+            ("Ctrl+Alt-drag (polar mode)",
+             "Draw a manual peak rectangle"),
+            ("Click a peak overlay",
+             "Select the peak (any kind: manual / detected / fitted / matched)"),
+            ("Drag ROI edges",
+             "Resize the selected manual / detected / fitted peak"),
+            ("LMB double-click on the image",
+             "Reset image zoom to full extent"),
+            ("Mouse wheel on image",
+             "Zoom in / out"),
+            ("Click a row in the Peaks table",
+             "Select the corresponding peak on the image"),
+        ]
+        flow_rows = [
+            ("Manual peak workflow",
+             "Ctrl+Alt-drag to label a candidate. Commit via "
+             "<b>Add to detected</b> (box) or <b>Add to fitted</b> "
+             "(1D Gaussian fit). Click off the box to abandon it "
+             "(Ctrl+Z restores)."),
+            ("Save fitted as ring",
+             "Tick before Add to fitted to widen the angular extent "
+             "to the full sweep — only meaningful for ring peaks."),
+            ("Display dock filter",
+             "Type a CIF substring above the matched-structures "
+             "list to hide non-matching rows + their image overlays."),
+            ("Tools → Export figure…",
+             "Non-modal window that drives "
+             "<code>mlgidbase.plot_analysis_results</code> with a "
+             "live preview. <b>Render preview</b> updates the image; "
+             "<b>Save figure</b> writes the PNG."),
+            ("Tools → Clear peaks → Reset all peaks",
+             "Wipe detected + fitted + matched at three scopes "
+             "(active entry, all entries, active frame). Manual "
+             "peaks dropped from memory."),
+        ]
+
+        def _table(rows: list[tuple[str, str]]) -> str:
+            cells = "".join(
+                f"<tr><td style='padding-right:12px;white-space:nowrap'>"
+                f"<b>{k}</b></td><td>{v}</td></tr>"
+                for k, v in rows
+            )
+            return f"<table>{cells}</table>"
+
+        body = (
+            "<h3>mlgidLAB — Controls &amp; shortcuts</h3>"
+            "<h4 style='margin-top:14px'>Keyboard</h4>"
+            + _table(kbd_rows) +
+            "<h4 style='margin-top:14px'>Mouse / image-viewer interactions</h4>"
+            + _table(mouse_rows) +
+            "<h4 style='margin-top:14px'>Workflow notes</h4>"
+            + _table(flow_rows)
+        )
+        QMessageBox.about(self, "Controls & shortcuts", body)
 
     def _gather_versions(self) -> dict[str, str]:
         """Return a name → version-string map covering the modules
@@ -1312,6 +1513,115 @@ class MainWindow(QMainWindow):
     def _action_redo(self) -> None:
         if hasattr(self, "viewer"):
             self.viewer.redo_last_action()
+
+    def _action_find_peak(self) -> None:
+        """Modal: pick Kind + ID, select the peak in the viewer.
+
+        Searches the current frame first, then scans every other
+        frame in the active entry; on a hit in another frame the
+        viewer jumps to that frame before selecting. Matched peaks
+        are excluded — matched IDs reference fitted peak ids so the
+        Fitted kind covers that case too, and the per-structure
+        selection model would need a separate UI.
+        """
+        if self.session is None:
+            return
+        entry = self.entry_combo.currentText()
+        if not entry:
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Find peak by ID")
+        form = QFormLayout(dlg)
+        kind_combo = QComboBox()
+        kind_combo.addItems(["Detected", "Fitted"])
+        form.addRow("Kind:", kind_combo)
+        id_spin = QSpinBox()
+        id_spin.setRange(0, 999999)
+        # Sensible default: continue from whatever's currently
+        # selected so repeated invocations step through IDs.
+        cur_sel = self.viewer.selected_peak
+        if cur_sel is not None and cur_sel.kind in ("detected", "fitted"):
+            kind_combo.setCurrentText(cur_sel.kind.capitalize())
+            id_spin.setValue(int(cur_sel.peak_id))
+        form.addRow("ID:", id_spin)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        kind = kind_combo.currentText().lower()
+        peak_id = int(id_spin.value())
+        self._find_and_select_peak(entry, kind, peak_id)
+
+    def _find_and_select_peak(self, entry: str, kind: str, peak_id: int) -> None:
+        """Locate (entry, *, kind, peak_id) across all frames and
+        select it. Tries the viewer's in-memory peak tables first
+        (cheap) before falling back to per-frame disk reads."""
+        current_frame = self.viewer.current_frame
+        # In-memory current-frame lookup.
+        peaks_now = self.viewer._frame_peaks.get(current_frame, {})
+        table = peaks_now.get(kind)
+        if table is not None:
+            ids = [int(x) for x in table.ids]
+            if peak_id in ids:
+                self._select_table_row(current_frame, kind, table, ids.index(peak_id))
+                return
+        # Scan other frames via file_model.
+        n_frames = self.viewer.n_frames
+        for frame in range(n_frames):
+            if frame == current_frame:
+                continue
+            try:
+                peaks = file_model.load_peaks(
+                    self.session.temp_path, entry, frame,
+                )
+            except Exception:
+                continue
+            table = peaks.get(kind)
+            if table is None or len(table) == 0:
+                continue
+            ids = [int(x) for x in table.ids]
+            if peak_id in ids:
+                # Jump to that frame, then select.
+                self.viewer.set_frame(frame)
+                # _frame_peaks for the new frame is populated lazily
+                # by _load_entry_into_viewer at open time; re-read
+                # in case the viewer's per-frame cache hasn't been
+                # touched yet for this run.
+                self._select_table_row(frame, kind, table, ids.index(peak_id))
+                return
+        QMessageBox.information(
+            self,
+            "Find peak",
+            f"No {kind} peak with id={peak_id} found in entry {entry!r}.",
+        )
+
+    def _select_table_row(
+        self, frame: int, kind: str, table, idx: int,
+    ) -> None:
+        """Build a ``SelectedPeak`` from row ``idx`` of ``table`` and
+        push it into the viewer. Mirrors the construction inside
+        ``GIWAXSImageViewer._on_select_at`` for detected/fitted hits."""
+        try:
+            score = float(table.score[idx])
+        except Exception:
+            score = None
+        sel = SelectedPeak(
+            kind=kind,
+            frame=frame,
+            peak_id=int(table.ids[idx]),
+            radius=float(table.radius[idx]),
+            angle=float(table.angle[idx]),
+            radius_width=float(table.radius_width[idx]),
+            angle_width=float(table.angle_width[idx]),
+            is_ring=bool(table.is_ring[idx]),
+            score=score,
+        )
+        self.viewer._set_selected(sel)
 
     def _build_file_menu(self, file_menu) -> None:
 
@@ -1663,6 +1973,39 @@ class MainWindow(QMainWindow):
             layout.addWidget(row_widget)
             self._overlay_checks[kind] = chk
 
+            # Per-detected min-score slider. Sits indented under the
+            # Detected checkbox so the affordance is right next to
+            # the layer it controls. Range 0–100 → 0.00–1.00 cutoff
+            # forwarded to ``viewer.set_detected_score_cutoff``.
+            # Initial value is seeded to the minimum score on the
+            # current frame in ``_seed_detected_score_slider`` so
+            # the default shows every detection; the user drags up
+            # to hide weak ones.
+            if kind == "detected":
+                score_row = QHBoxLayout()
+                score_row.setContentsMargins(20, 0, 0, 0)
+                score_row.setSpacing(6)
+                score_row.addWidget(QLabel("Min score:"))
+                self._detected_score_slider = QSlider(Qt.Orientation.Horizontal)
+                self._detected_score_slider.setRange(0, 100)
+                self._detected_score_slider.setValue(0)
+                self._detected_score_slider.setToolTip(
+                    "Hide detected peaks whose model score is below "
+                    "the cutoff. The slider starts at the lowest "
+                    "score on the current frame so nothing is hidden "
+                    "by default."
+                )
+                self._detected_score_slider.valueChanged.connect(
+                    self._on_detected_score_changed
+                )
+                score_row.addWidget(self._detected_score_slider, 1)
+                self._detected_score_value_label = QLabel("0.00")
+                self._detected_score_value_label.setMinimumWidth(36)
+                score_row.addWidget(self._detected_score_value_label)
+                score_row_widget = QWidget()
+                score_row_widget.setLayout(score_row)
+                layout.addWidget(score_row_widget)
+
         # Matched peaks: master toggle + per-structure rows. The per-structure
         # rows are rebuilt on every frame change because different frames can
         # have different matching solutions.
@@ -1715,6 +2058,33 @@ class MainWindow(QMainWindow):
         matched_filter_widget.setLayout(matched_filter_row)
         layout.addWidget(matched_filter_widget)
 
+        # Min-probability slider — hides matched rows whose structure
+        # probability falls below the cutoff. Composes with the
+        # CIF-substring filter above and the per-structure visibility
+        # checkboxes below. Integer slider 0–100 represents a 0.00–1.00
+        # threshold; rendered live next to the slider for readability.
+        prob_row = QHBoxLayout()
+        prob_row.setContentsMargins(20, 0, 0, 0)
+        prob_row.setSpacing(6)
+        prob_row.addWidget(QLabel("Min p:"))
+        self._matched_prob_slider = QSlider(Qt.Orientation.Horizontal)
+        self._matched_prob_slider.setRange(0, 100)
+        self._matched_prob_slider.setValue(0)
+        self._matched_prob_slider.setToolTip(
+            "Hide matched structures whose probability is below the "
+            "cutoff. Composes with the CIF-name filter above."
+        )
+        self._matched_prob_slider.valueChanged.connect(
+            self._on_matched_prob_changed
+        )
+        prob_row.addWidget(self._matched_prob_slider, 1)
+        self._matched_prob_value_label = QLabel("0.00")
+        self._matched_prob_value_label.setMinimumWidth(36)
+        prob_row.addWidget(self._matched_prob_value_label)
+        prob_widget = QWidget()
+        prob_widget.setLayout(prob_row)
+        layout.addWidget(prob_widget)
+
         # Container for the dynamic per-structure rows. Indented so it reads
         # as a sub-list of the master toggle.
         self._matched_struct_container = QWidget()
@@ -1725,6 +2095,10 @@ class MainWindow(QMainWindow):
         # Per-uid row widgets — used by _apply_matched_filter to
         # show / hide individual rows without rebuilding from data.
         self._matched_struct_rows: dict[str, QWidget] = {}
+        # Per-uid structure probability snapshot. Populated in
+        # ``_refresh_matched_panel`` and consumed by the min-p
+        # slider filter in ``_apply_matched_filter``.
+        self._matched_struct_probs: dict[str, float] = {}
         # Lives in its own field so we can find/remove the placeholder row.
         self._matched_empty_label: QLabel | None = None
         # Shown when a non-empty filter hides every row (distinct
@@ -1738,18 +2112,9 @@ class MainWindow(QMainWindow):
         self.parameter_panel = ParameterPanel(self)
         layout.addWidget(self.parameter_panel)
 
-        layout.addSpacing(6)
-        hint = QLabel(
-            "<i>Polar mode: <b>Ctrl+Alt-drag</b> to label, click any peak "
-            "(detected / fitted / matched / manual) to select, drag edges "
-            "to resize manual / detected, <b>Delete</b> to remove. "
-            "Add-to-fitted accepts manual or detected selections — the "
-            "cyan box previews the saved FWHM. "
-            "<b>LMB double-click</b> resets zoom. "
-            "<b>Ctrl+Z</b> / <b>Ctrl+Shift+Z</b> undo / redo.</i>"
-        )
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
+        # Note: the long polar-mode hint that used to live here has
+        # moved to **Help → Controls & shortcuts…** to free up
+        # vertical space in the Display dock.
 
         layout.addStretch(1)
 
@@ -1793,17 +2158,15 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._pipeline_dock)
         self.tabifyDockWidget(self._display_dock, self._pipeline_dock)
 
-        # Peaks dock — sortable per-frame view of detected / fitted /
+        # Peaks panel — sortable per-frame view of detected / fitted /
         # matched peaks with bidirectional click-sync to the image
-        # viewer's selection. Sits between Pipeline and Conversion so
-        # the final tab order reads Display | Pipeline | Peaks |
-        # Conversion | Logs.
+        # viewer's selection. The dock itself is built further down
+        # so it can be tabified with the Profile dock at the bottom
+        # of the window (the two are read together — peak row +
+        # cross-section profile — so sharing a tab area is more
+        # practical than burying Peaks among the right-side
+        # control docks).
         self.peaks_table_panel = PeaksTablePanel(self)
-        self._peaks_dock = QDockWidget("Peaks", self)
-        self._peaks_dock.setWidget(self.peaks_table_panel)
-        self._peaks_dock.setObjectName("PeaksDock")
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._peaks_dock)
-        self.tabifyDockWidget(self._pipeline_dock, self._peaks_dock)
 
         # Conversion dock — mode-exclusive sibling of the Pipeline dock.
         # Visible only when the active session is a RawSession; switching
@@ -1826,7 +2189,12 @@ class MainWindow(QMainWindow):
         self._conversion_dock.setWidget(self.conversion_panel)
         self._conversion_dock.setObjectName("ConversionDock")
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._conversion_dock)
-        self.tabifyDockWidget(self._peaks_dock, self._conversion_dock)
+        # Peaks is no longer on the right side, so the chain is just
+        # Display | Pipeline | Conversion | Logs. Conversion is
+        # tabified with Pipeline (they're mode-exclusive siblings)
+        # so the visible tab triplet is Display | <Pipeline or
+        # Conversion> | Logs.
+        self.tabifyDockWidget(self._pipeline_dock, self._conversion_dock)
         # Default state matches the default session (none): pipeline dock
         # shown so the user can see what would be available once they
         # open a converted file. ``_apply_session_mode`` handles toggles
@@ -1861,15 +2229,37 @@ class MainWindow(QMainWindow):
 
         self._display_dock.raise_()
 
-        # Bottom: profile viewer. Default to ~30% of window height so the
-        # central image stays the main focus.
+        # Bottom: profile viewer + peaks table, tabified together.
+        # Default to ~30% of window height so the central image
+        # stays the main focus. Profile is the first tab (raised)
+        # because the live cross-section is more frequently read
+        # than the peak table; the peak table sits behind it,
+        # one click away.
         self.profile_viewer = ProfileViewer(self)
         self._profile_dock = QDockWidget("Profiles", self)
         self._profile_dock.setWidget(self.profile_viewer)
         self._profile_dock.setObjectName("ProfileDock")
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._profile_dock)
+        self._peaks_dock = QDockWidget("Peaks", self)
+        self._peaks_dock.setWidget(self.peaks_table_panel)
+        self._peaks_dock.setObjectName("PeaksDock")
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._peaks_dock)
+        self.tabifyDockWidget(self._profile_dock, self._peaks_dock)
+        self._profile_dock.raise_()
         self.resizeDocks(
             [self._profile_dock], [max(self.height() // 3, 280)], Qt.Orientation.Vertical
+        )
+        # Default column widths. Both areas are tuned together — the
+        # file browser was previously squeezed to ~100 px (truncated
+        # HDF5 paths), and after Peaks moved to the bottom the right
+        # dock area's natural sizeHint shrank from ~560 to ~240. The
+        # pinned values below split the difference: 280 leaves enough
+        # room for typical file paths and 350 gives the Display dock's
+        # form rows headroom without dominating the central image.
+        self.resizeDocks(
+            [self._tree_dock, self._display_dock],
+            [260, 350],
+            Qt.Orientation.Horizontal,
         )
         self.viewer.frameChanged.connect(self.profile_viewer.set_frame)
         # Bidirectional Display-dock slider sync: viewer pushes frame
@@ -2337,24 +2727,28 @@ class MainWindow(QMainWindow):
         self._conversion_dock.setVisible(is_raw)
         # Re-tabify the right-dock chain per mode so the tab bar
         # order matches the active workflow:
-        #   Raw mode:   Display | Conversion | Peaks | Logs
-        #   NeXus mode: Display | Pipeline | Peaks | Logs
-        # ``tabifyDockWidget`` repositions an already-tabified dock,
-        # so calling these every mode-switch is cheap and idempotent.
+        #   Raw mode:   Display | Conversion | Logs
+        #   NeXus mode: Display | Pipeline | Logs
+        # Peaks is on the bottom (tabified with Profiles) and isn't
+        # part of the right-side chain. ``tabifyDockWidget``
+        # repositions an already-tabified dock, so calling these
+        # every mode-switch is cheap and idempotent.
         if is_raw:
             self.tabifyDockWidget(self._display_dock, self._conversion_dock)
-            self.tabifyDockWidget(self._conversion_dock, self._peaks_dock)
-            self.tabifyDockWidget(self._peaks_dock, self._logs_dock)
+            self.tabifyDockWidget(self._conversion_dock, self._logs_dock)
             self._conversion_dock.raise_()
         else:
             self.tabifyDockWidget(self._display_dock, self._pipeline_dock)
-            self.tabifyDockWidget(self._pipeline_dock, self._peaks_dock)
-            self.tabifyDockWidget(self._peaks_dock, self._logs_dock)
+            self.tabifyDockWidget(self._pipeline_dock, self._logs_dock)
             # Keep Display in front by default for NeXus sessions; users
             # who prefer Pipeline up-front can click its tab.
             self._display_dock.raise_()
-        # Hide NeXus-mode-only widgets in raw mode.
+        # Hide NeXus-mode-only widgets in raw mode. Peaks is hidden
+        # alongside Profiles since both depend on peak tables that
+        # only exist after conversion.
         self._profile_dock.setVisible(not is_raw)
+        if hasattr(self, "_peaks_dock"):
+            self._peaks_dock.setVisible(not is_raw)
         if hasattr(self, "parameter_panel"):
             self.parameter_panel.setVisible(not is_raw)
         # Cartesian / Polar radios — meaningless before conversion.
@@ -2641,6 +3035,11 @@ class MainWindow(QMainWindow):
             active = self.play_button.isChecked()
             step = self._play_step if active else 1
             self._prefetchUpdate.emit(int(frame), active, step)
+        # Reset the Detected min-score slider to the new frame's
+        # min score. Matched is reseeded via _refresh_matched_panel,
+        # which fires from the viewer's matchedStructuresChanged
+        # signal on the same frame change.
+        self._seed_detected_score_slider()
 
     def _on_play_toggled(self, checked: bool) -> None:
         """Start / stop the frame-playback timer.
@@ -4008,6 +4407,7 @@ class MainWindow(QMainWindow):
         self._matched_filter_empty_label = None
         self._matched_struct_checkboxes.clear()
         self._matched_struct_rows.clear()
+        self._matched_struct_probs.clear()
 
         if not structures:
             self._matched_empty_label = QLabel("<i>No matched solutions for this frame.</i>")
@@ -4038,21 +4438,111 @@ class MainWindow(QMainWindow):
             self._matched_struct_layout.addWidget(row_widget)
             self._matched_struct_checkboxes[s.unique_id] = chk
             self._matched_struct_rows[s.unique_id] = row_widget
+            try:
+                self._matched_struct_probs[s.unique_id] = float(s.probability)
+            except Exception:
+                self._matched_struct_probs[s.unique_id] = 0.0
 
+        # Reset the min-probability slider so each frame's first
+        # render shows every structure; the user can drag up to
+        # filter weak matches.
+        self._seed_matched_prob_slider(structures)
         self._apply_matched_filter()
 
-    def _apply_matched_filter(self, *_args) -> None:
-        """Hide per-structure rows whose label doesn't contain the
-        current filter substring (case-insensitive).
+    def _on_matched_prob_changed(self, value: int) -> None:
+        """Slider 0–100 → readable 0.00–1.00 in the side label, then
+        re-apply the composite filter."""
+        if hasattr(self, "_matched_prob_value_label"):
+            self._matched_prob_value_label.setText(f"{value / 100.0:.2f}")
+        self._apply_matched_filter()
 
-        Empty filter shows every row. Non-empty filter that matches
-        nothing replaces the structure rows with a "No matches"
-        hint so the user knows the filter is the reason the list
-        looks empty.
+    def _on_detected_score_changed(self, value: int) -> None:
+        """Slider 0–100 → 0.00–1.00 cutoff forwarded to the viewer.
+
+        Updates the side-label readout, then asks the viewer to
+        re-render the detected overlay with the new threshold. The
+        filter is applied in ``GIWAXSImageViewer._render_overlays``
+        via a row-subset of the detected ``PeakTable``.
+        """
+        if hasattr(self, "_detected_score_value_label"):
+            self._detected_score_value_label.setText(f"{value / 100.0:.2f}")
+        if hasattr(self, "viewer"):
+            self.viewer.set_detected_score_cutoff(value / 100.0)
+
+    def _seed_detected_score_slider(self) -> None:
+        """Reset the Detected min-score slider to the lowest score
+        on the current frame so the default shows every detection.
+
+        Called on every frame change and after entry load. Uses
+        ``blockSignals`` so the seed doesn't trigger a redundant
+        viewer re-render (we're already rendering this frame).
+        """
+        if not hasattr(self, "_detected_score_slider"):
+            return
+        frame = self.viewer.current_frame
+        peaks = self.viewer._frame_peaks.get(frame, {})
+        det = peaks.get("detected")
+        try:
+            if det is not None and len(det) > 0:
+                scores = np.asarray(det.score, dtype=float)
+                if scores.size and np.all(np.isfinite(scores)):
+                    lo = float(scores.min())
+                else:
+                    lo = 0.0
+            else:
+                lo = 0.0
+        except Exception:
+            lo = 0.0
+        lo = max(0.0, min(1.0, lo))
+        slider_val = int(round(lo * 100))
+        self._detected_score_slider.blockSignals(True)
+        try:
+            self._detected_score_slider.setValue(slider_val)
+        finally:
+            self._detected_score_slider.blockSignals(False)
+        self._detected_score_value_label.setText(f"{slider_val / 100.0:.2f}")
+        # Also apply the new cutoff to the viewer so its render
+        # state matches the slider after the silent setValue.
+        if hasattr(self, "viewer"):
+            self.viewer.set_detected_score_cutoff(slider_val / 100.0)
+
+    def _seed_matched_prob_slider(self, structures: list) -> None:
+        """Reset the matched min-probability slider to the lowest
+        probability on the current frame so the default shows every
+        structure. Mirrors ``_seed_detected_score_slider``."""
+        if not hasattr(self, "_matched_prob_slider"):
+            return
+        try:
+            probs = [float(s.probability) for s in structures]
+        except Exception:
+            probs = []
+        lo = min(probs) if probs else 0.0
+        lo = max(0.0, min(1.0, lo))
+        slider_val = int(round(lo * 100))
+        self._matched_prob_slider.blockSignals(True)
+        try:
+            self._matched_prob_slider.setValue(slider_val)
+        finally:
+            self._matched_prob_slider.blockSignals(False)
+        self._matched_prob_value_label.setText(f"{slider_val / 100.0:.2f}")
+
+    def _apply_matched_filter(self, *_args) -> None:
+        """Hide per-structure rows that fail either:
+        (a) the substring filter — label must contain
+        ``_matched_filter_edit``'s text (case-insensitive), or
+        (b) the min-probability slider — structure probability
+        must be ≥ ``_matched_prob_slider`` value / 100.
+
+        Empty substring + zero cutoff = show everything. When all
+        rows are hidden by the active filter a "No matches" hint
+        replaces them so the empty pane doesn't look like a bug.
         """
         text = ""
         if hasattr(self, "_matched_filter_edit"):
             text = self._matched_filter_edit.text().strip().lower()
+        prob_cutoff = 0.0
+        if hasattr(self, "_matched_prob_slider"):
+            prob_cutoff = self._matched_prob_slider.value() / 100.0
 
         # Drop a leftover "no filter matches" hint before recomputing.
         if self._matched_filter_empty_label is not None:
@@ -4064,7 +4554,13 @@ class MainWindow(QMainWindow):
         for uid, row_widget in self._matched_struct_rows.items():
             chk = self._matched_struct_checkboxes.get(uid)
             label = chk.text().lower() if chk is not None else ""
-            visible = (text == "") or (text in label)
+            substring_ok = (text == "") or (text in label)
+            prob = self._matched_struct_probs.get(uid, 0.0)
+            # Epsilon = half the slider's natural step (0.01 → 0.005)
+            # so a structure with p=1.00 passes when the slider is at
+            # 1.00, regardless of FP roundoff in the stored value.
+            prob_ok = prob >= prob_cutoff - 0.005
+            visible = substring_ok and prob_ok
             row_widget.setVisible(visible)
             if visible:
                 any_visible = True
@@ -4078,12 +4574,20 @@ class MainWindow(QMainWindow):
         if hasattr(self, "viewer"):
             self.viewer.set_matched_filter_hidden(hidden_uids)
 
-        # Only show the "no matches" hint when the user has actually
-        # typed something — empty filter + zero rows is the "no
-        # matched solutions for this frame" case handled elsewhere.
-        if text and self._matched_struct_rows and not any_visible:
+        # Only show the "no matches" hint when an active filter has
+        # zeroed the list — pure "no matched solutions for this
+        # frame" is handled by ``_matched_empty_label`` separately.
+        filter_active = bool(text) or prob_cutoff > 0.0
+        if filter_active and self._matched_struct_rows and not any_visible:
+            reasons = []
+            if text:
+                reasons.append(
+                    f"CIF substring '{self._matched_filter_edit.text()}'"
+                )
+            if prob_cutoff > 0.0:
+                reasons.append(f"p ≥ {prob_cutoff:.2f}")
             self._matched_filter_empty_label = QLabel(
-                f"<i>No structures match '{self._matched_filter_edit.text()}'.</i>"
+                f"<i>No structures match {' and '.join(reasons)}.</i>"
             )
             self._matched_filter_empty_label.setWordWrap(True)
             self._matched_struct_layout.addWidget(self._matched_filter_empty_label)

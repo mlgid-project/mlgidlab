@@ -934,6 +934,11 @@ class GIWAXSImageViewer(QWidget):
         # state but doesn't mutate it, so clearing the filter
         # restores the previous user selection.
         self._matched_filter_hidden: set[str] = set()
+        # Minimum detection score to render on the Detected overlay.
+        # Driven by the Display dock's Min-score slider. 0.0 (the
+        # default) lets every detected peak through; raising it
+        # hides weak detections without mutating the file.
+        self._detected_score_cutoff: float = 0.0
         self._matched_items: list[tuple[str, _PeakShapeItem]] = []
 
         self._mode = MODE_POLAR
@@ -1083,11 +1088,13 @@ class GIWAXSImageViewer(QWidget):
             )
         else:
             self._frame_index = 0
-        self._render_active_mode()
-
-        # _render_active_mode calls setImage(autoRange=True), which
-        # resets the viewbox. If the caller asked for preservation,
-        # apply the snapshot afterwards so it wins.
+        # Skip the setImage autoRange entirely when we're preserving
+        # the user's zoom — otherwise the viewbox flashes to the
+        # full extent before the post-render setRange snaps it back,
+        # which is visually jarring (and breaks if Qt schedules the
+        # autoRange via a deferred signal that fires after setRange).
+        # The post-render setRange below is the belt to this braces.
+        self._render_active_mode(auto_range=not preserve_view)
         if preserve_view and saved_xrange is not None and saved_yrange is not None:
             self._plot.getViewBox().setRange(
                 xRange=saved_xrange, yRange=saved_yrange, padding=0
@@ -1277,6 +1284,18 @@ class GIWAXSImageViewer(QWidget):
             if uid == unique_id:
                 item.setVisible(self._is_matched_item_visible(uid))
 
+    def set_detected_score_cutoff(self, value: float) -> None:
+        """Hide detected-overlay rows whose score is below ``value``.
+
+        Re-renders overlays for the current frame so the change
+        takes effect immediately. The cutoff is applied with a
+        small float-epsilon so a slider at exactly the maximum
+        score still shows that row (otherwise FP roundoff on stored
+        scores can make ``score >= cutoff`` spuriously False).
+        """
+        self._detected_score_cutoff = float(value)
+        self._render_overlays(self.current_frame)
+
     def set_matched_filter_hidden(self, hidden_ids) -> None:
         """Hide overlays for structures filtered out of the
         Display-dock search.
@@ -1381,6 +1400,15 @@ class GIWAXSImageViewer(QWidget):
         run those may have been overwritten. The polar grid axes
         (radius / angle) stay valid since they're functions of q_xy /
         q_z only, which don't change.
+
+        Re-render runs with ``auto_range=False`` so the user's zoom
+        survives the detach/reattach dance. This is the only call
+        site for ``acquire_frame_source`` and it's always paired
+        with ``release_frame_source`` for an op that the user
+        triggered while looking at a specific area (pipeline ops,
+        Add-to-fitted, clear-peaks…). Resetting the viewbox there
+        is precisely the "zoom jumps to full extent after every
+        commit" bug.
         """
         if self._frame_source is not None and not self._frame_source.is_open:
             self._frame_source.acquire()
@@ -1389,9 +1417,10 @@ class GIWAXSImageViewer(QWidget):
             self._polar_cache = None
             # Re-render the current frame so the on-screen image
             # reflects any post-write changes to the underlying data.
-            # _render_active_mode rebuilds the display params + LUT.
+            # _render_active_mode rebuilds the display params + LUT
+            # but skips setImage's autoRange so the zoom survives.
             if self._stack is not None:
-                self._render_active_mode()
+                self._render_active_mode(auto_range=False)
 
     # -- Manual peaks --
 
@@ -1830,19 +1859,25 @@ class GIWAXSImageViewer(QWidget):
 
     # -- Rendering --
 
-    def _render_active_mode(self) -> None:
+    def _render_active_mode(self, *, auto_range: bool = True) -> None:
         """Build per-mode axis state + first-frame levels, then render.
 
         Called on stack swap (entry change, file open), mode toggle
         (Cartesian ↔ polar), and log/linear toggle. The actual per-
         frame pixel push happens in ``_render_frame`` which is also
         the path ``set_frame`` takes on every scrub.
+
+        ``auto_range`` defaults to True so cold-open / mode-swap
+        renders fit the new image into the viewbox. Callers that
+        preserve the user's prior zoom (``show_stack(preserve_view=True)``,
+        the log-scale toggle) pass ``False`` so ``setImage`` never
+        clobbers the viewbox in the first place.
         """
         if self._mode == MODE_RAW:
             if self._raw_image_stack is None:
                 return
             self._display_params = self._build_raw_params()
-            self._render_frame(self._frame_index, auto_range=True)
+            self._render_frame(self._frame_index, auto_range=auto_range)
             # No overlays in raw mode — nothing to render past _render_frame.
             return
         if self._stack is None or self._frame_source is None:
@@ -1851,7 +1886,7 @@ class GIWAXSImageViewer(QWidget):
             self._display_params = self._build_polar_params()
         else:
             self._display_params = self._build_cartesian_params()
-        self._render_frame(self._frame_index, auto_range=True)
+        self._render_frame(self._frame_index, auto_range=auto_range)
         self._render_overlays(self.current_frame)
 
     def _build_raw_params(self) -> _DisplayParams:
@@ -2062,6 +2097,24 @@ class GIWAXSImageViewer(QWidget):
         peaks = self._frame_peaks.get(frame, {})
         det = peaks.get("detected")
         fit = peaks.get("fitted")
+
+        # Apply the Display-dock min-score filter to the detected
+        # overlay. Epsilon is half the slider's natural resolution
+        # (0.01 per step → 0.005 tolerance) so a peak whose score
+        # the slider was just seeded from is guaranteed to pass,
+        # regardless of FP roundoff in the underlying value.
+        if det is not None and self._detected_score_cutoff > 0.0 and len(det) > 0:
+            try:
+                cutoff = self._detected_score_cutoff - 0.005
+                mask = np.asarray(det.score) >= cutoff
+                if mask.sum() < len(det):
+                    keep_ids = [int(det.ids[i]) for i in np.where(mask)[0]]
+                    det = _peaks_subset(det, keep_ids)
+            except Exception:
+                # If the table doesn't have a usable score column
+                # (older files), silently skip the filter rather
+                # than break the overlay.
+                pass
 
         manual_list = list(self._manual_peaks.get(frame, []))
         # When an ROI is active the selected peak is shown via the ROI handles —
@@ -2495,7 +2548,23 @@ class GIWAXSImageViewer(QWidget):
             self._set_selected(None)
 
     def _set_selected(self, sel: SelectedPeak | None) -> None:
-        """Update the selection and sync the ROI + emit selectionChanged once."""
+        """Update the selection and sync the ROI + emit selectionChanged once.
+
+        Side effect: if we're transitioning **away** from a
+        manual-peak selection to anything else (a different peak, or
+        nothing), drop the previous manual peak via
+        ``remove_manual_peak``. This makes manual boxes truly
+        transient — clicking off them abandons the draw. A
+        ``ManualRemoveAction`` is pushed so ``Ctrl+Z`` brings the box
+        back. The new-box draw path already removes the old peak via
+        ``ManualReplaceAction`` *before* this method runs, so no
+        double-remove happens there.
+
+        Programmatic deselects from ``clear_selection`` bypass this
+        method (they set ``self._selected = None`` directly), which
+        preserves the manual peak across pipeline resets and other
+        non-user-driven selection clears.
+        """
         if sel is None and self._selected is None:
             return
         if (
@@ -2507,6 +2576,24 @@ class GIWAXSImageViewer(QWidget):
             and sel.structure_uid == self._selected.structure_uid
         ):
             return
+        prev = self._selected
+        transitioning_away_from_manual = (
+            prev is not None
+            and prev.kind == "manual"
+            and prev.manual_ref is not None
+            and (sel is None or sel.manual_ref is not prev.manual_ref)
+        )
+        if transitioning_away_from_manual:
+            bucket = self._manual_peaks.get(prev.frame, [])
+            if prev.manual_ref in bucket:
+                # ``remove_manual_peak`` clears ``self._selected`` to
+                # None internally and emits ``selectionChanged(None)``
+                # since the removed peak was the active selection. We
+                # then re-apply the actual new ``sel`` below, which
+                # emits ``selectionChanged(sel)`` a second time. The
+                # transient None emit is harmless — listeners that
+                # store state will end up with the right value.
+                self.remove_manual_peak(prev.frame, prev.manual_ref)
         self._selected = sel
         self._sync_roi()
         self._render_overlays(self.current_frame)

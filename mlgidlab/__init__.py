@@ -19,8 +19,9 @@ __version__ = "0.0.1"
 
 
 def main() -> int:
+    from PySide6.QtCore import QSettings
     from mlgidlab.main_window import MainWindow
-    from mlgidlab.theme import apply_dark_theme
+    from mlgidlab.theme import apply_dark_theme, apply_light_theme
 
     app = QApplication(sys.argv)
     # Set both org + app names so QSettings has a stable key path on
@@ -28,7 +29,23 @@ def main() -> int:
     # persisted preferences over time).
     app.setOrganizationName("mlgidLAB")
     app.setApplicationName("mlgidLAB")
-    apply_dark_theme(app)
+    # Honor the persisted theme choice (View → Theme). Defaults to
+    # dark; the menu sync inside MainWindow reads the same key.
+    theme = str(QSettings().value("theme", "dark")).lower()
+    if theme == "light":
+        apply_light_theme(app)
+    else:
+        apply_dark_theme(app)
     window = MainWindow()
+    # Tell MainWindow which theme is now live so its View → Theme
+    # menu shows the right checked entry on first open.
+    window._current_theme = theme if theme in ("dark", "light") else "dark"
+    # Re-sync menu checkmark (the menu was built before _current_theme
+    # was set on this path; the default check goes to Dark, so update
+    # if necessary).
+    if window._current_theme == "light":
+        window.action_theme_light.setChecked(True)
+    else:
+        window.action_theme_dark.setChecked(True)
     window.show()
     return app.exec()
