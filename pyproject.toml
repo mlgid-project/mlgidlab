@@ -47,6 +47,9 @@ mlgidlab = "mlgidlab:main"
 testpaths = ["tests"]
 # Quiet, fail-fast-ish defaults for the smoke harness.
 addopts = "-q -ra"
+markers = [
+    "gui: constructs a MainWindow/QWidget — needs the offscreen QApplication",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
