@@ -30,7 +30,44 @@ os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 _CONFIG_ROOT = tempfile.mkdtemp(prefix="mlgidlab-test-config-")
 os.environ["XDG_CONFIG_HOME"] = _CONFIG_ROOT
 
+import sys  # noqa: E402
+
 import pytest  # noqa: E402
+
+# Real pytest exit status, captured at session end and used by
+# pytest_unconfigure to hard-exit before the crashy native teardown.
+_PYTEST_EXIT_STATUS = 0
+
+
+def pytest_sessionfinish(session, exitstatus):
+    global _PYTEST_EXIT_STATUS
+    _PYTEST_EXIT_STATUS = int(exitstatus)
+
+
+def pytest_unconfigure(config):
+    """Skip the crashy native interpreter teardown.
+
+    On headless CI the PySide6 + silx(OpenGL) + h5py C++ stack tears
+    down its static singletons in an order that SIGSEGVs at interpreter
+    exit *after* a clean run: pytest prints ``N passed`` and returns 0,
+    then the process dies with exit code 139. It reproduces on every
+    Python (3.11-3.14) and never locally (a real GL/display masks it),
+    so it is not a test failure and faulthandler cannot catch it (it is
+    gone by then).
+
+    ``pytest_unconfigure`` is the final hook, run *after* the terminal
+    reporter has printed the summary, so no output is lost. We flush and
+    ``os._exit`` with pytest's real status (captured in
+    ``pytest_sessionfinish``): a genuine failure still exits non-zero
+    (CI stays honest), only the post-success native teardown is
+    bypassed. ``os._exit`` skips Python atexit/cleanup, which is safe
+    for a short-lived test process (no coverage plugin in the dev
+    deps).
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(_PYTEST_EXIT_STATUS)
+
 
 # The peak structured dtype, kept as a plain list of (name, fmt) tuples
 # so numpy stays out of module scope (the env lockdown above must apply
