@@ -1,0 +1,98 @@
+"""Smoke harness — workstream A, increment 2: session lifecycle.
+
+Drives the most-used path with a synthetic NeXus file and no heavy
+backend: open -> populate entries -> step frames -> save -> close.
+Verified against source that none of this touches mlgidbase/pygid
+(those are imported lazily only in ``pipeline.py`` when a pipeline
+command runs), so the suite stays decoupled from the heavy stack.
+
+The open is driven through ``_set_active_session`` directly rather
+than ``_open_paths``: the latter queues a ``CopyWorker`` thread and
+spawns a modal ``QProgressDialog``, which would hang an offscreen
+run. ``_set_active_session`` is the fully synchronous orchestrator it
+ultimately feeds (``_populate_entries`` ->
+``_load_entry_into_viewer`` -> ``viewer.show_stack``), so calling it
+exercises the same load logic deterministically.
+"""
+
+from __future__ import annotations
+
+from mlgidlab.session import NexusSession
+
+
+def _open(window, path) -> NexusSession:
+    """Open ``path`` synchronously and make it the active session."""
+    session = NexusSession.open(path)
+    window._set_active_session(session)
+    return session
+
+
+def test_open_populates_entries_and_viewer(main_window, synthetic_nexus):
+    """Opening a valid NeXus file fills the entry combo and loads the
+    first entry's stack into the viewer."""
+    session = _open(main_window, synthetic_nexus)
+
+    assert main_window.session is session
+    assert main_window.entry_combo.count() == 1
+    # _load_entry_into_viewer -> viewer.show_stack ran synchronously.
+    assert main_window.viewer.n_frames == 3
+    assert main_window.viewer.current_frame == 0
+
+
+def test_frame_navigation(main_window, synthetic_nexus):
+    """Direct set_frame and the throttled _step_frame shortcut path
+    both move the frame and respect bounds."""
+    _open(main_window, synthetic_nexus)
+
+    main_window.viewer.set_frame(2)
+    assert main_window.viewer.current_frame == 2
+
+    # _step_frame carries an 80 ms time-throttle (_FRAME_STEP_THROTTLE_S)
+    # so OS key-autorepeat can't flood it. The first call always passes
+    # (_last_frame_step_t defaults to 0.0). Reset the stamp before the
+    # second synthetic step so it isn't dropped as a "too soon" repeat.
+    main_window._step_frame(-1)
+    assert main_window.viewer.current_frame == 1
+
+    main_window._last_frame_step_t = 0.0
+    main_window.viewer.set_frame(2)
+    main_window._step_frame(+1)  # at the last frame: bounded no-op
+    assert main_window.viewer.current_frame == 2
+
+
+def test_save_writes_back_and_clears_dirty(main_window, synthetic_nexus):
+    """Save copies the temp working file back over the original and
+    clears the dirty flag, with no confirm dialog (confirm=False).
+
+    Observability is deliberate:
+
+    * ``NexusSession.save`` uses ``shutil.copy2``, which preserves the
+      source mtime, so mtime round-trips unchanged and is *not* a
+      valid "save happened" signal.
+    * The viewer's FrameSource holds ``temp_path`` open read-only and
+      h5py forbids reopening the same file ``r+`` in-process (the very
+      silx/h5py coupling the detach dance exists for, workstream C's
+      target); a smoke test must not poke that.
+
+    The original file is *not* held open (the viewer only touches the
+    per-session ``temp_path`` copy). So: stamp the original
+    out-of-band, save, and prove the un-stamped working copy
+    overwrote it -- which demonstrates the temp -> original copy ran.
+    """
+    import h5py
+
+    session = _open(main_window, synthetic_nexus)
+
+    with h5py.File(synthetic_nexus, "r+") as f:
+        f["entry_0000/data"].attrs["stale_marker"] = "pre_save"
+    session.mark_dirty()
+    assert session.dirty is True
+
+    ok = main_window._save(confirm=False, session=session)
+
+    assert ok is True
+    assert session.dirty is False
+    # Save copied the working copy (which never had the marker) over
+    # the original, so the out-of-band marker is gone.
+    with h5py.File(synthetic_nexus, "r") as f:
+        assert "stale_marker" not in f["entry_0000/data"].attrs

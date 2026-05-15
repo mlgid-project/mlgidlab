@@ -9,6 +9,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import logging
+logger = logging.getLogger(__name__)
+
 @dataclass
 class PipelineCommand:
     """A single mlgidbase method call."""
@@ -108,6 +111,7 @@ def execute(file_path: Path, command: PipelineCommand) -> Any:
                     logging.getLogger("mlgidBASE"),
                 )
             except Exception:
+                logger.debug("suppressed exception in execute", exc_info=True)
                 pass
     method = getattr(analysis, command.op_name)
     result = method(**kwargs)
@@ -575,4 +579,5 @@ def _exp_params_from_nexus(
             en=en,
         )
     except Exception:
+        logger.debug("suppressed exception in _exp_params_from_nexus", exc_info=True)
         return ExpParameters(**defaults)

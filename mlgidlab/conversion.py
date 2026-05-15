@@ -30,6 +30,9 @@ from mlgidlab.conversion_panel import (
     RawScan,
 )
 
+import logging
+logger = logging.getLogger(__name__)
+
 
 def is_pygid_available() -> bool:
     try:
@@ -383,5 +386,6 @@ def _build_exp_metadata(pygid_mod: Any, kv: dict[str, str]) -> Any:
         # Older pygid versions might not expose extend_fields as a
         # writable attribute; that's fine, the field still gets written
         # once per output.
+        logger.debug("suppressed exception in _build_exp_metadata", exc_info=True)
         pass
     return obj

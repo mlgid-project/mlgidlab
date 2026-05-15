@@ -11,6 +11,9 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.optimize import curve_fit
 
+import logging
+logger = logging.getLogger(__name__)
+
 # Default window for the fit, expressed as a multiplier of the box width on
 # each side of the box centre. Wider window gives the fit more context for
 # background estimation but costs more CPU.
@@ -171,6 +174,7 @@ def fit_gaussian_on_axis(
     try:
         slope_init, intercept_init = np.polyfit(bg_x, bg_y, 1)
     except Exception:
+        logger.debug("suppressed exception in fit_gaussian_on_axis", exc_info=True)
         slope_init, intercept_init = 0.0, float(np.nanmean(y))
 
     bg_at_center = float(slope_init) * center_init + float(intercept_init)
@@ -211,6 +215,7 @@ def fit_gaussian_on_axis(
             )
         amplitude, center, sigma, slope, intercept = (float(v) for v in popt)
     except Exception:
+        logger.debug("suppressed exception in fit_gaussian_on_axis", exc_info=True)
         return None
 
     # Reject obviously-degenerate fits.
