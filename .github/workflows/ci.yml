@@ -25,8 +25,12 @@ jobs:
       fail-fast: false
       matrix:
         # 3.11 is the requires-python floor; 3.12 is the dev/runtime
-        # environment the suite was validated against.
-        python-version: ["3.11", "3.12"]
+        # environment the suite was validated against; 3.13 and 3.14
+        # are forward-compat. fail-fast is false, so if a newer Python
+        # fails only because an upstream dep (PySide6 / pyFAI / silx /
+        # scipy / h5py) has no wheel for it yet, the older jobs still
+        # report.
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
 
     steps:
       - uses: actions/checkout@v4
