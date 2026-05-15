@@ -45,6 +45,9 @@ from PySide6.QtWidgets import (
 
 from mlgidlab.file_model import RawEntry
 
+import logging
+logger = logging.getLogger(__name__)
+
 
 # Conversion-type identifiers — kept as plain strings so ``ConversionConfig``
 # stays pickleable and can pass through Qt signals without custom marshalling.
@@ -592,6 +595,7 @@ class ConversionPanel(QWidget):
             except Exception:
                 # The resolver shouldn't raise, but if it does the
                 # dialog can still open without a pre-filled image.
+                logger.debug("suppressed exception in ConversionPanel._open_calibration_dialog", exc_info=True)
                 initial = None
         # If the user already has PONI / mask paths in the
         # Conversion dock, carry them into the dialog so workflows
@@ -606,6 +610,7 @@ class ConversionPanel(QWidget):
             try:
                 return text if Path(text).exists() else None
             except Exception:
+                logger.debug("suppressed exception in ConversionPanel._open_calibration_dialog._existing", exc_info=True)
                 return None
 
         dlg = CalibrationDialog(
@@ -1341,6 +1346,7 @@ class _Hdf5MetaPicker(QDialog):
             import h5py
             return isinstance(node.h5py_object, h5py.Dataset)
         except Exception:
+            logger.debug("suppressed exception in _Hdf5MetaPicker._is_dataset", exc_info=True)
             return False
 
     def _on_accept(self) -> None:
@@ -1353,6 +1359,7 @@ class _Hdf5MetaPicker(QDialog):
             file_name = Path(node.h5py_object.file.filename).name
             data = node.h5py_object[()]
         except Exception as exc:
+            logger.debug("suppressed exception in _Hdf5MetaPicker._on_accept", exc_info=True)
             self._result = (str(node.local_name or "value"),
                             f"<read error: {exc}>", "")
             self.accept()

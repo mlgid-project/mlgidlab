@@ -14,6 +14,9 @@ from typing import Iterator
 import h5py
 import numpy as np
 
+import logging
+logger = logging.getLogger(__name__)
+
 ENTRY_PREFIX = "entry_"
 FRAME_KEY_FMT = "frame{:05d}"
 
@@ -302,6 +305,7 @@ class FrameSource:
             try:
                 self._file.close()
             except Exception:
+                logger.debug("suppressed exception in FrameSource.release", exc_info=True)
                 pass
         self._file = None
         self._dataset = None

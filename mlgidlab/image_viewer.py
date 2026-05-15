@@ -35,6 +35,9 @@ from mlgidlab.file_model import (
 )
 from mlgidlab.polar import stack_to_polar  # noqa: F401  (retained as a reference impl)
 
+import logging
+logger = logging.getLogger(__name__)
+
 OVERLAY_KINDS = ("detected", "fitted", "manual")
 MODE_CARTESIAN = "cartesian"
 MODE_POLAR = "polar"
@@ -1031,6 +1034,7 @@ class GIWAXSImageViewer(QWidget):
                 saved_xrange = (float(xr[0]), float(xr[1]))
                 saved_yrange = (float(yr[0]), float(yr[1]))
             except Exception:
+                logger.debug("suppressed exception in GIWAXSImageViewer.show_stack", exc_info=True)
                 pass
             saved_frame = self.current_frame
 
@@ -1145,6 +1149,7 @@ class GIWAXSImageViewer(QWidget):
         try:
             self._plot.getViewBox().autoRange()
         except Exception:
+            logger.debug("suppressed exception in GIWAXSImageViewer.reset_zoom", exc_info=True)
             pass
 
     def _install_reset_zoom_action(self) -> None:
@@ -2057,6 +2062,7 @@ class GIWAXSImageViewer(QWidget):
             xr, yr = self._plot.getViewBox().viewRange()
             saved = ((float(xr[0]), float(xr[1])), (float(yr[0]), float(yr[1])))
         except Exception:
+            logger.debug("suppressed exception in GIWAXSImageViewer._on_log_toggled", exc_info=True)
             saved = None
         self._render_active_mode()
         if saved is not None:
@@ -2065,6 +2071,7 @@ class GIWAXSImageViewer(QWidget):
                     xRange=saved[0], yRange=saved[1], padding=0
                 )
             except Exception:
+                logger.debug("suppressed exception in GIWAXSImageViewer._on_log_toggled", exc_info=True)
                 pass
 
     def _hide_pyqtgraph_timeline(self) -> None:
@@ -2114,6 +2121,7 @@ class GIWAXSImageViewer(QWidget):
                 # If the table doesn't have a usable score column
                 # (older files), silently skip the filter rather
                 # than break the overlay.
+                logger.debug("suppressed exception in GIWAXSImageViewer._render_overlays", exc_info=True)
                 pass
 
         manual_list = list(self._manual_peaks.get(frame, []))
@@ -2285,6 +2293,7 @@ class GIWAXSImageViewer(QWidget):
             try:
                 cmap = pg.colormap.get(name, source=source) if source else pg.colormap.get(name)
             except Exception:
+                logger.debug("suppressed exception in GIWAXSImageViewer._apply_cmap", exc_info=True)
                 cmap = None
             if cmap is not None:
                 break

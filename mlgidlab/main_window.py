@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -92,6 +93,9 @@ from mlgidlab.workers import (
     PipelineWorker,
     PrefetchWorker,
 )
+
+import logging
+logger = logging.getLogger(__name__)
 
 APP_NAME = "mlgidLAB"
 NEXUS_FILTER = "HDF5 / NeXus (*.h5 *.hdf5 *.nxs);;All files (*)"
@@ -780,18 +784,16 @@ class MainWindow(QMainWindow):
         elif kind == "matched":
             kinds_to_clear.append("fitted")
 
-        self._detach_silx_tree()
-        try:
-            removed_total = 0
-            for k in kinds_to_clear:
-                removed_total += file_model.clear_peaks(
-                    self.session.temp_path, entry, k
-                )
-        except Exception as exc:
-            QMessageBox.critical(self, "Clear failed", str(exc))
-            self._reattach_silx_tree()
-            return
-        self._reattach_silx_tree()
+        with self._detached_silx_tree():
+            try:
+                removed_total = 0
+                for k in kinds_to_clear:
+                    removed_total += file_model.clear_peaks(
+                        self.session.temp_path, entry, k
+                    )
+            except Exception as exc:
+                QMessageBox.critical(self, "Clear failed", str(exc))
+                return
 
         self.session.mark_dirty()
         self._update_title()
@@ -867,19 +869,17 @@ class MainWindow(QMainWindow):
         # regardless of scope.
         self.viewer.clear_all_manual_peaks()
 
-        self._detach_silx_tree()
-        try:
-            removed_total = 0
-            for entry, frame in targets:
-                for kind in ("detected", "fitted", "matched"):
-                    removed_total += file_model.clear_peaks(
-                        self.session.temp_path, entry, kind, frame=frame
-                    )
-        except Exception as exc:
-            QMessageBox.critical(self, "Reset failed", str(exc))
-            self._reattach_silx_tree()
-            return
-        self._reattach_silx_tree()
+        with self._detached_silx_tree():
+            try:
+                removed_total = 0
+                for entry, frame in targets:
+                    for kind in ("detected", "fitted", "matched"):
+                        removed_total += file_model.clear_peaks(
+                            self.session.temp_path, entry, kind, frame=frame
+                        )
+            except Exception as exc:
+                QMessageBox.critical(self, "Reset failed", str(exc))
+                return
 
         self.session.mark_dirty()
         self._update_title()
@@ -983,21 +983,19 @@ class MainWindow(QMainWindow):
 
         # silx may hold a read handle on the temp file; detach so h5py
         # can open it without contention.
-        self._detach_silx_tree()
-        try:
-            if kind == "matched":
-                n = file_model.export_matched_csv(
-                    self.session.temp_path, targets, Path(path)
-                )
-            else:
-                n = file_model.export_peaks_csv(
-                    self.session.temp_path, targets, kind, Path(path)
-                )
-        except Exception as exc:
-            QMessageBox.critical(self, "Export failed", str(exc))
-            self._reattach_silx_tree()
-            return
-        self._reattach_silx_tree()
+        with self._detached_silx_tree():
+            try:
+                if kind == "matched":
+                    n = file_model.export_matched_csv(
+                        self.session.temp_path, targets, Path(path)
+                    )
+                else:
+                    n = file_model.export_peaks_csv(
+                        self.session.temp_path, targets, kind, Path(path)
+                    )
+            except Exception as exc:
+                QMessageBox.critical(self, "Export failed", str(exc))
+                return
 
         self.statusBar().showMessage(
             f"Wrote {n} {kind} peak rows ({scope}) to {path}", 6000
@@ -1174,6 +1172,7 @@ class MainWindow(QMainWindow):
         try:
             QSettings().setValue(self._THEME_KEY, theme)
         except Exception:
+            logger.debug("suppressed exception in MainWindow._set_theme", exc_info=True)
             pass
 
     _THEME_KEY = "theme"
@@ -1202,6 +1201,7 @@ class MainWindow(QMainWindow):
                 # restoreState raises on a malformed state blob; we
                 # generated this one ourselves so it shouldn't, but
                 # don't take down the GUI if it does.
+                logger.debug("suppressed exception in MainWindow._reset_layout", exc_info=True)
                 pass
         # Reapply the session-mode-specific tab order + show/hide
         # toggles so Conversion/Pipeline visibility lines up with
@@ -1387,11 +1387,13 @@ class MainWindow(QMainWindow):
                         return str(mod.version)
                 return str(getattr(mod, attr))
             except Exception:
+                logger.debug("suppressed exception in MainWindow._gather_versions._v", exc_info=True)
                 return "(unavailable)"
 
         try:
             from mlgidlab import __version__ as mlgidlab_version
         except Exception:
+            logger.debug("suppressed exception in MainWindow._gather_versions", exc_info=True)
             mlgidlab_version = "(unavailable)"
 
         return {
@@ -1471,6 +1473,7 @@ class MainWindow(QMainWindow):
                 )
                 session_lines.append(f"  viewer mode:  {self.viewer._mode}")
             except Exception as exc:
+                logger.debug("suppressed exception in MainWindow._copy_diagnostics", exc_info=True)
                 session_lines.append(f"  (error gathering session info: {exc})")
 
         # Section 3: recent log lines
@@ -1480,6 +1483,7 @@ class MainWindow(QMainWindow):
                 blob = self._log_view.toPlainText()
                 log_lines = blob.splitlines()[-50:]
             except Exception:
+                logger.debug("suppressed exception in MainWindow._copy_diagnostics", exc_info=True)
                 pass
         if not log_lines:
             log_lines = ["(no log lines)"]
@@ -1580,6 +1584,7 @@ class MainWindow(QMainWindow):
                     self.session.temp_path, entry, frame,
                 )
             except Exception:
+                logger.debug("suppressed exception in MainWindow._find_and_select_peak", exc_info=True)
                 continue
             table = peaks.get(kind)
             if table is None or len(table) == 0:
@@ -1609,6 +1614,7 @@ class MainWindow(QMainWindow):
         try:
             score = float(table.score[idx])
         except Exception:
+            logger.debug("suppressed exception in MainWindow._select_table_row", exc_info=True)
             score = None
         sel = SelectedPeak(
             kind=kind,
@@ -1693,6 +1699,7 @@ class MainWindow(QMainWindow):
         try:
             data = json.loads(blob)
         except Exception:
+            logger.debug("suppressed exception in MainWindow._load_recent_files", exc_info=True)
             return []
         if not isinstance(data, list):
             return []
@@ -2353,11 +2360,13 @@ class MainWindow(QMainWindow):
             if file_model.list_entries(path):
                 return "nexus"
         except Exception:
+            logger.debug("suppressed exception in MainWindow._classify_h5_path", exc_info=True)
             pass
         try:
             if file_model.list_raw_entries(path):
                 return "raw"
         except Exception:
+            logger.debug("suppressed exception in MainWindow._classify_h5_path", exc_info=True)
             pass
         return None
 
@@ -2501,27 +2510,24 @@ class MainWindow(QMainWindow):
         # so the file isn't open when shutil.copy2 + rename runs (matters
         # on Windows; harmless on Linux). silx is also detached so the
         # tree can be rebuilt at the new basename.
-        self._detach_silx_tree()
-        try:
-            self.session.save_as(Path(path))
-        except Exception as exc:
-            QMessageBox.critical(self, "Save As failed", str(exc))
-            # Re-attach so the viewer can keep reading; otherwise the
-            # user is left looking at a frozen image with the file
-            # detached but nothing written.
-            self._reattach_silx_tree()
-            return
-        # Save As renamed the temp file to match the new basename. The
-        # FrameSource was created against the old basename and would
-        # otherwise fail to reopen — point it at the new path before
-        # the reattach reacquires.
-        if (
-            self.viewer._frame_source is not None
-            and isinstance(self.session, NexusSession)
-        ):
-            self.viewer._frame_source.relocate(self.session.temp_path)
-        # Rebuild the silx tree from the updated session paths.
-        self._reattach_silx_tree()
+        with self._detached_silx_tree():
+            try:
+                self.session.save_as(Path(path))
+            except Exception as exc:
+                QMessageBox.critical(self, "Save As failed", str(exc))
+                # The context manager still reattaches on this early
+                # return, so the viewer keeps reading rather than being
+                # stranded with the file detached and nothing written.
+                return
+            # Save As renamed the temp file to match the new basename.
+            # The FrameSource was created against the old basename and
+            # would otherwise fail to reopen — point it at the new path
+            # before the context manager's reattach reacquires it.
+            if (
+                self.viewer._frame_source is not None
+                and isinstance(self.session, NexusSession)
+            ):
+                self.viewer._frame_source.relocate(self.session.temp_path)
         self._update_title()
         # The user just wrote a new file at ``path``; surface it in the
         # recent menu so it's reopenable from the next session.
@@ -2592,6 +2598,7 @@ class MainWindow(QMainWindow):
             try:
                 patched = file_model.normalize_for_pygid(session.temp_path)
             except Exception:
+                logger.debug("suppressed exception in MainWindow._on_open_finished", exc_info=True)
                 patched = {"angle": [], "frames": []}
             if patched["angle"]:
                 self.pipeline_panel.append_log(
@@ -2633,20 +2640,20 @@ class MainWindow(QMainWindow):
         # silx exposes no "remove single file" API on Hdf5TreeModel, so we
         # rebuild the tree from the remaining sessions. Cheap — sessions
         # are typically <5 and the model just re-opens HDF5 files.
-        self._detach_silx_tree()
-        if was_active:
-            # Active state is tied to viewer/entry_combo content — drop it
-            # before swapping so we don't leak the old session's overlays.
-            self.viewer.clear()
-            self.viewer.clear_history()
-            self.profile_viewer.clear()
-            self.peaks_table_panel.clear()
-            self.entry_combo.blockSignals(True)
-            self.entry_combo.clear()
-            self.entry_combo.blockSignals(False)
-            self._active_session = None
-        session.close()
-        self._reattach_silx_tree()
+        with self._detached_silx_tree():
+            if was_active:
+                # Active state is tied to viewer/entry_combo content — drop
+                # it before swapping so we don't leak the old session's
+                # overlays.
+                self.viewer.clear()
+                self.viewer.clear_history()
+                self.profile_viewer.clear()
+                self.peaks_table_panel.clear()
+                self.entry_combo.blockSignals(True)
+                self.entry_combo.clear()
+                self.entry_combo.blockSignals(False)
+                self._active_session = None
+            session.close()
         # Closed session may have been raw — rebuild the tree's raw set.
         self._refresh_tree_raw_paths()
         if was_active:
@@ -2806,10 +2813,12 @@ class MainWindow(QMainWindow):
             # silx's clear() can blow up when an Hdf5Item references a
             # closed h5py file. Swallow it; the reattach rebuilds the
             # whole tree from the live session list.
+            logger.debug("suppressed exception in MainWindow._detach_silx_tree", exc_info=True)
             pass
         try:
             self.data_viewer.setData(None)
         except Exception:
+            logger.debug("suppressed exception in MainWindow._detach_silx_tree", exc_info=True)
             pass
         self.viewer.release_frame_source()
         # Tell the background prefetch worker to drop its own h5py
@@ -2847,9 +2856,38 @@ class MainWindow(QMainWindow):
             except Exception:
                 # One bad session shouldn't strand the rest. The user
                 # will see the missing entry; rebuild at next detach.
+                logger.debug("suppressed exception in MainWindow._reattach_silx_tree", exc_info=True)
                 pass
         self._refresh_tree_raw_paths()
         self.viewer.acquire_frame_source()
+
+    @contextmanager
+    def _detached_silx_tree(self):
+        """Scoped silx detach/reattach for a *synchronous* critical
+        section that needs the HDF5 file free of read handles.
+
+        Detaches on entry and guarantees re-attachment on exit via
+        ``finally`` — whether the block falls off the end, ``return``s
+        early, or raises. This replaces the hand-paired
+        ``_detach_silx_tree()`` / ``_reattach_silx_tree()`` calls whose
+        reattach had to be duplicated on the happy path *and* every
+        except/early-return branch (easy to forget one half).
+
+        Deliberately NOT used at three sites, which keep explicit
+        calls because the scoped semantics don't fit:
+
+        * the pipeline run: detach spans a worker thread and the
+          reattach happens later in ``_on_pipeline_finished``;
+        * ``_safe_selected_h5_nodes``: a 2-line tear-down + rebuild
+          recovery, not a "do work while detached" scope;
+        * ``closeEvent``: a one-way detach on teardown — reattaching
+          would be wrong.
+        """
+        self._detach_silx_tree()
+        try:
+            yield
+        finally:
+            self._reattach_silx_tree()
 
     # -- Entry / viewer wiring --
 
@@ -2964,6 +3002,7 @@ class MainWindow(QMainWindow):
         try:
             signals = file_model.list_entry_signals(self.session.temp_path)
         except Exception:
+            logger.debug("suppressed exception in MainWindow._warn_no_q_entries", exc_info=True)
             signals = {}
         if not signals:
             # Truly empty — file genuinely has no entry_* groups.
@@ -3289,6 +3328,7 @@ class MainWindow(QMainWindow):
         except Exception:
             # Defensive — a stale signal during teardown shouldn't
             # propagate.
+            logger.debug("suppressed exception in MainWindow._on_prefetched", exc_info=True)
             pass
 
     def _refresh_frame_slider(self) -> None:
@@ -3541,6 +3581,7 @@ class MainWindow(QMainWindow):
             try:
                 p = getter(node)
             except Exception:
+                logger.debug("suppressed exception in MainWindow._node_entry_name", exc_info=True)
                 continue
             if p:
                 parts = str(p).lstrip("/").split("/")
@@ -3599,6 +3640,7 @@ class MainWindow(QMainWindow):
             try:
                 p = getter(node)
             except Exception:
+                logger.debug("suppressed exception in MainWindow._node_filename", exc_info=True)
                 continue
             if p:
                 return Path(p)
@@ -4161,26 +4203,23 @@ class MainWindow(QMainWindow):
             # matters most for downstream matching.
             angle_width_to_save = float(2.0 * afit.fwhm)
 
-        self._detach_silx_tree()
-        try:
-            new_id = file_model.add_fitted_peak_row(
-                self.session.temp_path, entry, frame,
-                radius=float(rfit.center),
-                radius_width=float(rfit.fwhm),
-                angle=angle_to_save,
-                angle_width=angle_width_to_save,
-                amplitude=float(rfit.amplitude),
-                is_ring=save_as_ring,
-            )
-        except KeyError as exc:
-            QMessageBox.warning(self, "Add to fitted", str(exc))
-            self._reattach_silx_tree()
-            return
-        except Exception as exc:
-            QMessageBox.critical(self, "Add to fitted", str(exc))
-            self._reattach_silx_tree()
-            return
-        self._reattach_silx_tree()
+        with self._detached_silx_tree():
+            try:
+                new_id = file_model.add_fitted_peak_row(
+                    self.session.temp_path, entry, frame,
+                    radius=float(rfit.center),
+                    radius_width=float(rfit.fwhm),
+                    angle=angle_to_save,
+                    angle_width=angle_width_to_save,
+                    amplitude=float(rfit.amplitude),
+                    is_ring=save_as_ring,
+                )
+            except KeyError as exc:
+                QMessageBox.warning(self, "Add to fitted", str(exc))
+                return
+            except Exception as exc:
+                QMessageBox.critical(self, "Add to fitted", str(exc))
+                return
 
         # Selection is left alone so the user can keep editing or commit
         # again; the cyan fitted overlay simply appears alongside the
@@ -4257,26 +4296,24 @@ class MainWindow(QMainWindow):
         entry = self.entry_combo.currentText()
         if not entry:
             return
-        self._detach_silx_tree()
-        try:
-            file_model.update_peak_row(
-                self.session.temp_path, entry, frame, kind, peak_id, **polar
-            )
-        except KeyError:
-            QMessageBox.warning(
-                self, "Edit failed",
-                f"Peak id={peak_id} no longer exists in the file. "
-                "Undo history has been cleared.",
-            )
-            self.viewer.clear_history()
-        except Exception as exc:
-            QMessageBox.critical(self, "Edit failed", str(exc))
-            self.viewer.clear_history()
-        else:
-            self.session.mark_dirty()
-            self._update_title()
-        finally:
-            self._reattach_silx_tree()
+        with self._detached_silx_tree():
+            try:
+                file_model.update_peak_row(
+                    self.session.temp_path, entry, frame, kind, peak_id, **polar
+                )
+            except KeyError:
+                QMessageBox.warning(
+                    self, "Edit failed",
+                    f"Peak id={peak_id} no longer exists in the file. "
+                    "Undo history has been cleared.",
+                )
+                self.viewer.clear_history()
+            except Exception as exc:
+                QMessageBox.critical(self, "Edit failed", str(exc))
+                self.viewer.clear_history()
+            else:
+                self.session.mark_dirty()
+                self._update_title()
 
     def _load_entry_into_viewer(
         self, entry: str, *, preserve_view: bool = False
@@ -4304,6 +4341,7 @@ class MainWindow(QMainWindow):
             try:
                 peaks = file_model.load_peaks(self.session.temp_path, entry, frame)
             except Exception:
+                logger.debug("suppressed exception in MainWindow._load_entry_into_viewer", exc_info=True)
                 peaks = {kind: None for kind in OVERLAY_KINDS}
             self.viewer.set_peaks(frame, peaks)
             # Matched solutions reference fitted_peaks indices — pass them in
@@ -4313,6 +4351,7 @@ class MainWindow(QMainWindow):
                     self.session.temp_path, entry, frame, peaks.get("fitted")
                 )
             except Exception:
+                logger.debug("suppressed exception in MainWindow._load_entry_into_viewer", exc_info=True)
                 matched = []
             self.viewer.set_matched_structures(frame, matched)
         # Initial panel state for whichever frame the viewer is showing now.
@@ -4441,6 +4480,7 @@ class MainWindow(QMainWindow):
             try:
                 self._matched_struct_probs[s.unique_id] = float(s.probability)
             except Exception:
+                logger.debug("suppressed exception in MainWindow._refresh_matched_panel", exc_info=True)
                 self._matched_struct_probs[s.unique_id] = 0.0
 
         # Reset the min-probability slider so each frame's first
@@ -4492,6 +4532,7 @@ class MainWindow(QMainWindow):
             else:
                 lo = 0.0
         except Exception:
+            logger.debug("suppressed exception in MainWindow._seed_detected_score_slider", exc_info=True)
             lo = 0.0
         lo = max(0.0, min(1.0, lo))
         slider_val = int(round(lo * 100))
@@ -4515,6 +4556,7 @@ class MainWindow(QMainWindow):
         try:
             probs = [float(s.probability) for s in structures]
         except Exception:
+            logger.debug("suppressed exception in MainWindow._seed_matched_prob_slider", exc_info=True)
             probs = []
         lo = min(probs) if probs else 0.0
         lo = max(0.0, min(1.0, lo))
@@ -4697,6 +4739,7 @@ class MainWindow(QMainWindow):
         try:
             stack = getattr(self.viewer, "_raw_image_stack", None)
         except Exception:
+            logger.debug("suppressed exception in MainWindow._active_raw_frame_for_calibration", exc_info=True)
             return None
         if stack is None:
             return None
@@ -4718,6 +4761,7 @@ class MainWindow(QMainWindow):
             # accepts arbitrary numeric dtypes.
             return arr.mean(axis=0, dtype=np.float64)
         except Exception:
+            logger.debug("suppressed exception in MainWindow._active_raw_frame_for_calibration", exc_info=True)
             return None
 
     def _update_status_entry(self) -> None:
@@ -4844,7 +4888,8 @@ class MainWindow(QMainWindow):
         # against a torn-down viewer during shutdown.
         self._pause_playback()
         # All clear — tear everything down. silx must release its handles
-        # before we delete the temp files.
+        # before we delete the temp files. One-way detach: the app is
+        # closing, so there is no reattach (hence not _detached_silx_tree).
         self._detach_silx_tree()
         self.viewer.clear()
         self.profile_viewer.clear()

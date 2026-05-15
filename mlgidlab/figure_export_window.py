@@ -43,6 +43,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import logging
+logger = logging.getLogger(__name__)
+
 
 # Module-level: mlgidbase import status (populated lazily on first
 # render so a missing pipeline dep doesn't break window construction).
@@ -592,6 +595,7 @@ class FigureExportWindow(QMainWindow):
         try:
             self.setWindowTitle(f"Export figure — {Path(session.display_path).name}")
         except Exception:
+            logger.debug("suppressed exception in FigureExportWindow._populate_from_main", exc_info=True)
             self.setWindowTitle("Export figure")
 
         main_combo = getattr(self._main, "entry_combo", None)
@@ -608,11 +612,13 @@ class FigureExportWindow(QMainWindow):
             try:
                 n = max(0, int(viewer.n_frames) - 1)
             except Exception:
+                logger.debug("suppressed exception in FigureExportWindow._populate_from_main", exc_info=True)
                 n = 9999
             self.spin_frame.setMaximum(max(n, 0))
             try:
                 self.spin_frame.setValue(int(viewer.current_frame))
             except Exception:
+                logger.debug("suppressed exception in FigureExportWindow._populate_from_main", exc_info=True)
                 pass
             dp = getattr(viewer, "_display_params", None)
             if dp is not None and getattr(dp, "levels", None):
@@ -626,6 +632,7 @@ class FigureExportWindow(QMainWindow):
                         self.spin_clim_min.setValue(lo)
                         self.spin_clim_max.setValue(hi)
                 except Exception:
+                    logger.debug("suppressed exception in FigureExportWindow._populate_from_main", exc_info=True)
                     pass
 
     # ---------- param gathering ----------
@@ -752,6 +759,7 @@ class FigureExportWindow(QMainWindow):
             kwargs = self._gather_call_kwargs()
             defaults = self._gather_defaults()
         except Exception as exc:
+            logger.debug("suppressed exception in FigureExportWindow._render", exc_info=True)
             self._status_label.setText(f"Settings error: {exc}")
             self._render_in_flight = False
             self.btn_save.setEnabled(True)
@@ -779,6 +787,7 @@ class FigureExportWindow(QMainWindow):
         try:
             from mlgidbase import mlgidBASE  # type: ignore
         except Exception as exc:
+            logger.debug("suppressed exception in FigureExportWindow._do_render", exc_info=True)
             self._status_label.setText(f"mlgidbase unavailable: {exc}")
             return
         session = getattr(self._main, "session", None)
@@ -789,6 +798,7 @@ class FigureExportWindow(QMainWindow):
             analysis = mlgidBASE(filename=str(Path(session.temp_path)))
             self._analysis_path = Path(session.temp_path)
         except Exception as exc:
+            logger.debug("suppressed exception in FigureExportWindow._do_render", exc_info=True)
             self._status_label.setText(f"Couldn't open file: {exc}")
             return
         try:
@@ -839,6 +849,7 @@ class FigureExportWindow(QMainWindow):
             else:
                 self._status_label.setText("Render produced no file.")
         except Exception as exc:
+            logger.debug("suppressed exception in FigureExportWindow._do_render", exc_info=True)
             self._status_label.setText(f"Render failed: {exc}")
 
     def _run_with_detached_tree(self, fn, *args, **kwargs) -> None:
@@ -859,6 +870,7 @@ class FigureExportWindow(QMainWindow):
             try:
                 detach()
             except Exception:
+                logger.debug("suppressed exception in FigureExportWindow._run_with_detached_tree", exc_info=True)
                 pass
         try:
             fn(*args, **kwargs)
@@ -867,6 +879,7 @@ class FigureExportWindow(QMainWindow):
                 try:
                     reattach()
                 except Exception:
+                    logger.debug("suppressed exception in FigureExportWindow._run_with_detached_tree", exc_info=True)
                     pass
 
     def _show_preview(self, path: Path) -> None:
@@ -954,6 +967,7 @@ class FigureExportWindow(QMainWindow):
                 try:
                     shutil.move(str(actual), target)
                 except Exception:
+                    logger.debug("suppressed exception in FigureExportWindow._on_save", exc_info=True)
                     self.statusBar().showMessage(f"Wrote {actual}", 6000)
                     return
             self.statusBar().showMessage(f"Wrote {target}", 5000)
@@ -1000,6 +1014,7 @@ class FigureExportWindow(QMainWindow):
                 target, entry, frame_num,
             )
         except Exception as exc:
+            logger.debug("suppressed exception in FigureExportWindow._do_save", exc_info=True)
             self._save_error = str(exc)
 
     # ---------- lifecycle ----------

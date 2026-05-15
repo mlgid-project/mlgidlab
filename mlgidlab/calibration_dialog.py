@@ -55,6 +55,9 @@ from pyFAI.gui.tasks.IntegrationTask import IntegrationTask
 from pyFAI.gui.tasks.MaskTask import MaskTask
 from pyFAI.gui.tasks.PeakPickingTask import PeakPickingTask
 
+import logging
+logger = logging.getLogger(__name__)
+
 
 # Task identifiers keyed by stable string IDs so callers don't have
 # to import pyFAI to choose a starting tab. Ordered the same way
@@ -188,6 +191,7 @@ class CalibrationDialog(QDialog):
         except Exception:
             # Older pyFAI versions don't expose this; harmless if
             # it's not there.
+            logger.debug("suppressed exception in CalibrationDialog._setup_pyfai_context", exc_info=True)
             pass
 
         settings = QSettings(
@@ -356,6 +360,7 @@ class CalibrationDialog(QDialog):
             except Exception:
                 # If a future pyFAI rev drops the signal, fail open —
                 # the side list is still navigable.
+                logger.debug("suppressed exception in CalibrationDialog._wire_signals", exc_info=True)
                 pass
         # The final task has nothing to advance to; hide its Next
         # button so the user isn't left clicking a dead control.
@@ -363,6 +368,7 @@ class CalibrationDialog(QDialog):
         try:
             last_task.setNextStepVisible(False)
         except Exception:
+            logger.debug("suppressed exception in CalibrationDialog._wire_signals", exc_info=True)
             pass
         # Observe poniFile changes so we can capture the path the
         # user just wrote, without disconnecting pyFAI's own save
@@ -376,6 +382,7 @@ class CalibrationDialog(QDialog):
             # the worst that happens is the host doesn't auto-fill
             # the PONI path field (user can still type it). Don't
             # break the rest of the dialog.
+            logger.debug("suppressed exception in CalibrationDialog._wire_signals", exc_info=True)
             pass
         # Mask model: pyFAI uses ``ImageFromFilenameModel`` for the
         # mask, which fires ``filenameChanged`` when a file path is
@@ -398,6 +405,7 @@ class CalibrationDialog(QDialog):
             # holds.
             self._refresh_apply_mask_state()
         except Exception:
+            logger.debug("suppressed exception in CalibrationDialog._wire_signals", exc_info=True)
             pass
 
     def _advance_task(self) -> None:
@@ -540,6 +548,7 @@ class CalibrationDialog(QDialog):
                 self.saved_poni_path = Path(value)
                 self._btn_apply_poni.setEnabled(True)
         except Exception:
+            logger.debug("suppressed exception in CalibrationDialog._on_poni_model_changed", exc_info=True)
             return
 
     def _on_apply_poni(self) -> None:
@@ -587,6 +596,7 @@ class CalibrationDialog(QDialog):
                 self.saved_mask_path = Path(filename)
                 self._btn_apply_mask.setEnabled(True)
         except Exception:
+            logger.debug("suppressed exception in CalibrationDialog._on_mask_filename_changed", exc_info=True)
             return
 
     def _refresh_apply_mask_state(self) -> None:
@@ -613,6 +623,7 @@ class CalibrationDialog(QDialog):
                 # the user can click and be funnelled into Save.
                 self._btn_apply_mask.setEnabled(True)
         except Exception:
+            logger.debug("suppressed exception in CalibrationDialog._refresh_apply_mask_state", exc_info=True)
             pass
 
     def _on_save_mask(self) -> None:

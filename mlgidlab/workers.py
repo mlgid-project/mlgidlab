@@ -15,6 +15,8 @@ from mlgidlab.pipeline import (
 )
 from mlgidlab.session import Session
 
+logger = logging.getLogger(__name__)
+
 
 def _trigger_pipeline_imports() -> None:
     """Force ``mlgidbase`` (and its transitive ``pygid`` import) to load.
@@ -37,6 +39,7 @@ def _trigger_pipeline_imports() -> None:
     try:
         import mlgidbase  # noqa: F401
     except Exception:
+        logger.debug("suppressed exception in _trigger_pipeline_imports", exc_info=True)
         pass
 
 
@@ -50,6 +53,7 @@ def _trigger_conversion_imports() -> None:
     try:
         import pygid  # noqa: F401
     except Exception:
+        logger.debug("suppressed exception in _trigger_conversion_imports", exc_info=True)
         pass
 
 
@@ -84,6 +88,7 @@ class CifParseWorker(QObject):
             )
             self.finished.emit(result, None)
         except Exception as exc:
+            logger.debug("suppressed exception in CifParseWorker.run", exc_info=True)
             self.finished.emit(None, exc)
 
 
@@ -101,6 +106,7 @@ class CopyWorker(QObject):
             session = Session.open(self._original_path)
             self.finished.emit(session, None)
         except Exception as exc:
+            logger.debug("suppressed exception in CopyWorker.run", exc_info=True)
             self.finished.emit(None, exc)
 
 
@@ -115,6 +121,7 @@ class _SignalLogHandler(logging.Handler):
         try:
             self._sink.emit(self.format(record))
         except Exception:
+            logger.debug("suppressed exception in _SignalLogHandler.emit", exc_info=True)
             pass
 
 
@@ -172,6 +179,7 @@ class ConversionWorker(QObject):
             self.progress.emit(total, total)
             self.finished.emit(outputs, None)
         except Exception as exc:
+            logger.debug("suppressed exception in ConversionWorker.run", exc_info=True)
             import traceback
             self.log.emit(traceback.format_exc())
             self.finished.emit(None, exc)
@@ -223,6 +231,7 @@ class PipelineWorker(QObject):
             # ("invalid index to scalar variable" doesn't tell anyone
             # which dataset / function tripped). The traceback lands in
             # the panel log alongside the mlgidbase log lines.
+            logger.debug("suppressed exception in PipelineWorker.run", exc_info=True)
             import traceback
             self.log.emit(traceback.format_exc())
             self.finished.emit(None, exc)
@@ -329,6 +338,7 @@ class PrefetchWorker(QObject):
             # state. The host will reconfigure on the next entry
             # load; quietly dropping a bad configure beats raising
             # across a queued connection.
+            logger.debug("suppressed exception in PrefetchWorker.configure", exc_info=True)
             self._release_file()
             return
         if self._timer is None:
@@ -379,6 +389,7 @@ class PrefetchWorker(QObject):
             try:
                 self._file.close()
             except Exception:
+                logger.debug("suppressed exception in PrefetchWorker._release_file", exc_info=True)
                 pass
         self._file = None
         self._dataset = None
@@ -417,6 +428,7 @@ class PrefetchWorker(QObject):
                 # File closed under us (silx-dance race), dataset
                 # moved, polar resample failed. Bail quietly — the
                 # host will reconfigure when the dance settles.
+                logger.debug("suppressed exception in PrefetchWorker._tick", exc_info=True)
                 return
             self.prefetched.emit(i, cart, pol.image, pol.radius, pol.angle)
             self._done.add(i)
