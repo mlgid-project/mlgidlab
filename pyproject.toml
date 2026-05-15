@@ -26,7 +26,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+# pytest-qt drives the GUI smoke harness; tests run headless via
+# QT_QPA_PLATFORM=offscreen set in tests/conftest.py (no xvfb needed).
+dev = ["pytest>=8.0", "pytest-qt>=4.4"]
 # Pipeline backend (heavy: pulls torch + the mlgid analysis stack).
 # Install when you actually want to run detection/fitting/matching from the GUI.
 # pygid is required for the raw → NeXus conversion path; it's transitively
@@ -40,6 +42,11 @@ pipeline = [
 
 [project.gui-scripts]
 mlgidlab = "mlgidlab:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Quiet, fail-fast-ish defaults for the smoke harness.
+addopts = "-q -ra"
 
 [tool.setuptools.packages.find]
 where = ["."]
