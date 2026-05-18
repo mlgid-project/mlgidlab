@@ -19,7 +19,8 @@ __version__ = "0.0.1"
 
 
 def main() -> int:
-    from PySide6.QtCore import QSettings
+    from PySide6.QtCore import QSettings, QTimer
+    from pathlib import Path
     from mlgidlab.main_window import MainWindow
     from mlgidlab.theme import apply_dark_theme, apply_light_theme
 
@@ -48,4 +49,12 @@ def main() -> int:
     else:
         window.action_theme_dark.setChecked(True)
     window.show()
+    # argv[0] is the program; treat any extra args as files to open.
+    paths = [Path(a) for a in sys.argv[1:] if Path(a).exists()]
+    if paths:
+        # Defer into the event loop: _open_paths spawns the async
+        # CopyWorker and touches widgets, which is only safe once
+        # exec() is running. A 0 ms single-shot timer runs the
+        # callback on the first loop iteration, after exec() starts.
+        QTimer.singleShot(0, lambda: window._open_paths(paths))
     return app.exec()
