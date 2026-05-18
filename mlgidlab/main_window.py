@@ -672,7 +672,7 @@ class MainWindow(QMainWindow):
         full roadmap.
         """
         tools_menu = bar.addMenu("&Tools")
-        # The four clear-* actions all do the same kind of thing (wipe one
+        # The three clear-* actions all do the same kind of thing (wipe one
         # peak family) so they live under a single hover-expanding
         # "Clear peaks" submenu rather than cluttering the Tools root.
         clear_menu = tools_menu.addMenu("&Clear peaks")
@@ -683,18 +683,19 @@ class MainWindow(QMainWindow):
         )
         clear_menu.addAction(self.action_clear_detected)
 
-        self.action_clear_fitted = QAction("Fitted", self)
+        # "Fitted and Matched": clearing fitted necessarily invalidates
+        # matched, because matched solutions reference fitted ids and an
+        # orphaned matched_* group would render against missing rows.
+        # The cascade is one-way (fitted -> matched).
+        self.action_clear_fitted = QAction("Fitted and Matched", self)
         self.action_clear_fitted.triggered.connect(
             lambda: self._action_clear_file_peaks("fitted")
         )
         clear_menu.addAction(self.action_clear_fitted)
 
-        # "Matched and fitted" rather than just "Matched" because the
-        # action cascades — clearing matched here also wipes fitted on
-        # the same scope, since matched solutions reference fitted ids
-        # and an orphaned matched_* group would render against missing
-        # peak rows.
-        self.action_clear_matched = QAction("Matched and fitted", self)
+        # "Matched" clears only the matched_* solutions; detected and
+        # fitted are left intact (re-match without re-fitting).
+        self.action_clear_matched = QAction("Matched", self)
         self.action_clear_matched.triggered.connect(
             lambda: self._action_clear_file_peaks("matched")
         )
@@ -764,12 +765,12 @@ class MainWindow(QMainWindow):
     def _action_clear_file_peaks(self, kind: str) -> None:
         """Empty every ``<kind>_peaks`` dataset for the active entry.
 
-        Cascade rules:
+        Cascade rule (one-way):
         - clearing ``fitted`` also clears ``matched`` (matched rows
           reference fitted ids; orphaned matched_* groups can't render).
-        - the menu's ``matched`` action is labelled "Matched and fitted"
-          and likewise wipes both — see Tools-menu wiring above for the
-          rename rationale.
+        - clearing ``matched`` clears matched only; detected and fitted
+          are left intact (re-match without re-fitting). See the
+          Tools-menu wiring above.
         """
         if self.session is None or self._pipe_thread is not None:
             return
@@ -781,8 +782,6 @@ class MainWindow(QMainWindow):
         kinds_to_clear = [kind]
         if kind == "fitted":
             kinds_to_clear.append("matched")
-        elif kind == "matched":
-            kinds_to_clear.append("fitted")
 
         with self._detached_silx_tree():
             try:
@@ -802,7 +801,8 @@ class MainWindow(QMainWindow):
         self.viewer.clear_selection()
         self._load_entry_into_viewer(entry, preserve_view=True)
         self.pipeline_panel.append_log(
-            f"Cleared {kind} peaks ({removed_total} rows total) on {entry}"
+            f"Cleared {' + '.join(kinds_to_clear)} peaks "
+            f"({removed_total} rows total) on {entry}"
         )
 
     def _refresh_reset_menu_state(self) -> None:
@@ -1012,11 +1012,9 @@ class MainWindow(QMainWindow):
                          "every row of fitted_peaks AND every matched_* "
                          "solution for the active entry "
                          "(matched references fitted, so it has to go too)"),
-            "matched":  ("matched and fitted peaks",
-                         "every matched_* solution AND every row of "
-                         "fitted_peaks for the active entry "
-                         "(matched references fitted, so the cascade goes "
-                         "both ways here — see the Tools menu)"),
+            "matched":  ("matched peaks",
+                         "every matched_* solution for the active entry "
+                         "(detected and fitted peaks are left intact)"),
         }
         title, body = descriptions.get(kind, (kind, kind))
         reply = QMessageBox.question(

@@ -205,8 +205,9 @@ A working sample is bundled at `example/BA2PbI4.h5` plus
   Matched emits one row per solution with a `peak_list` cell
   carrying the fitted-peak indices the solution references.
 - **Tools → Clear peaks** wipes one layer for the active entry:
-  Detected, Fitted, or "Matched and fitted" (matched references
-  fitted, so both go together).
+  Detected; Fitted and Matched (clearing fitted also clears matched,
+  since matched references fitted by id); or Matched only (removes the
+  matched solutions, leaving detected and fitted intact).
 - **Tools → Clear peaks → Reset all peaks** wipes detected +
   fitted + matched (and all manual peaks) at three scopes —
   Active entry (all frames), All entries, or Active frame
