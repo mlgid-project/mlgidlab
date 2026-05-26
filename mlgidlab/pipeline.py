@@ -49,10 +49,18 @@ def add_peak_kwargs_for(peak) -> dict:
 
 
 def execute(file_path: Path, command: PipelineCommand) -> Any:
-    """Run one pipeline command on a NeXus file. Lazily imports mlgidbase."""
-    import logging
+    """Run one pipeline command on a NeXus file. Lazily imports mlgidbase.
 
-    from mlgidbase import mlgidBASE  # noqa: N814
+    Import order matters: the ``from mlgidbase import mlgidBASE`` line
+    is intentionally deferred to **after** the file-shape pre-flights
+    below so the headless CI suite (which does not ship the private
+    ``mlgidbase`` / ``pygidsim`` backends) can still exercise those
+    pre-flights against synthetic NeXus files. The pre-flights raise
+    actionable ``RuntimeError``s the tests assert on; pulling
+    ``mlgidbase`` earlier would short-circuit with
+    ``ModuleNotFoundError`` before any of them runs.
+    """
+    import logging
 
     # Pre-flight: refuse to invoke mlgidBASE when the file has a
     # top-level group pygid can't handle. ``pygid.NexusFile`` iterates
@@ -121,6 +129,10 @@ def execute(file_path: Path, command: PipelineCommand) -> Any:
                 file_path, exc,
             )
 
+    # Import lazily — see the function docstring. Every pre-flight
+    # above must be able to run on a CI box that lacks the private
+    # ``mlgidbase`` backend.
+    from mlgidbase import mlgidBASE  # noqa: N814
     analysis = mlgidBASE(filename=str(file_path))
     kwargs = dict(command.kwargs)
     # Run-matching takes a ``cif_prepr`` value that mlgidBASE accepts as

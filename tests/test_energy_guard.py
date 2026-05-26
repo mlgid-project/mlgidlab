@@ -12,6 +12,11 @@ Two failure modes the audit calls out:
 Either way, the matching path must fail loud before mlgidmatch
 builds a CIF pattern against a wrong wavelength and returns
 plausible-but-bogus solutions.
+
+Skipped wholesale on CI: ``_exp_params_from_nexus`` imports
+``pygidsim.experiment.ExpParameters`` at the function top, and
+CI does not ship the private ``pygidsim`` backend. Local dev
+envs with the full mlgid stack still run all five cases.
 """
 from __future__ import annotations
 
@@ -21,10 +26,9 @@ import h5py
 import numpy as np
 import pytest
 
-# Lazy import — pipeline imports pygidsim which we want to discover
-# only if the env has it. The other tests in this dir already touch
-# pipeline.execute so the import is known to work here.
-from mlgidlab.pipeline import _EnergyOutOfRangeError, _exp_params_from_nexus
+pytest.importorskip("pygidsim")  # CI lacks the private backend; skip module.
+
+from mlgidlab.pipeline import _EnergyOutOfRangeError, _exp_params_from_nexus  # noqa: E402
 
 
 def _make_nexus_with_wavelength(path: Path, wavelength_m: float) -> Path:

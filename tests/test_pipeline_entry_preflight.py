@@ -49,8 +49,14 @@ def test_execute_skips_validation_when_no_entry(synthetic_nexus, monkeypatch):
     """A command with no ``entry`` key in kwargs should NOT trigger
     the pre-flight (mlgidbase iterates all entries on its own).
     Monkeypatch mlgidBASE so we only check the pre-flight gate, not
-    the heavy mlgidbase invocation that follows."""
-    import mlgidbase
+    the heavy mlgidbase invocation that follows.
+
+    Skipped on CI: this test specifically needs the ``mlgidbase``
+    module to be importable so it can monkeypatch the ``mlgidBASE``
+    symbol. The two preceding tests don't need the import (they
+    raise from the pre-flight before ``execute`` reaches the lazy
+    mlgidbase import) and run unconditionally."""
+    mlgidbase = pytest.importorskip("mlgidbase")
     construct_calls = []
     original = mlgidbase.mlgidBASE
 
