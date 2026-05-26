@@ -136,6 +136,37 @@ def list_entries(file_path: Path) -> list[str]:
             if signal == "img_gid_q"]
 
 
+def count_frames(file_path: Path, entry: str) -> int:
+    """Return the number of frames in ``entry`` without loading any data.
+
+    Reads only the shape header of ``<entry>/data/img_gid_q`` (or whatever
+    the entry's signal points at) via h5py — sub-millisecond on local
+    storage. Returns ``0`` on any error: missing entry, missing /data,
+    missing signal, dataset isn't 3-D, or any other shape mismatch. Used
+    by ``PipelineWorker`` to size the multi-frame progress bar before
+    invoking mlgidBASE.
+    """
+    try:
+        with h5py.File(file_path, "r") as f:
+            if entry not in f:
+                return 0
+            data = f[entry].get("data")
+            if not isinstance(data, h5py.Group):
+                return 0
+            signal = data.attrs.get("signal")
+            if isinstance(signal, bytes):
+                signal = signal.decode("utf-8", errors="replace")
+            if not isinstance(signal, str) or signal not in data:
+                return 0
+            ds = data[signal]
+            if ds.ndim < 1:
+                return 0
+            return int(ds.shape[0])
+    except Exception:
+        logger.debug("suppressed exception in count_frames", exc_info=True)
+        return 0
+
+
 def list_entry_signals(file_path: Path) -> dict[str, str | None]:
     """Return ``{entry_name: signal_or_None}`` for every entry_* group.
 
@@ -878,14 +909,16 @@ def add_fitted_peak_row(
         # Build the new row by name to stay schema-resilient if the dtype
         # ever gains/loses a field.
         new_row = np.zeros(1, dtype=arr.dtype)
+        from mlgidlab.polar import polar_to_qxyz
+        q_xy_val, q_z_val = polar_to_qxyz(radius, angle)
         fields = {
             "amplitude": amplitude,
             "angle": angle,
             "angle_width": angle_width,
             "radius": radius,
             "radius_width": radius_width,
-            "q_z": radius * np.sin(np.deg2rad(angle)),
-            "q_xy": radius * np.cos(np.deg2rad(angle)),
+            "q_z": q_z_val,
+            "q_xy": q_xy_val,
             "theta": theta,
             "score": score,
             "A": A,
@@ -1300,6 +1333,6 @@ def update_peak_row(
         arr["radius_width"][idx] = radius_width
         arr["angle"][idx] = angle
         arr["angle_width"][idx] = angle_width
-        arr["q_xy"][idx] = radius * np.cos(np.deg2rad(angle))
-        arr["q_z"][idx] = radius * np.sin(np.deg2rad(angle))
+        from mlgidlab.polar import polar_to_qxyz
+        arr["q_xy"][idx], arr["q_z"][idx] = polar_to_qxyz(radius, angle)
         ds[...] = arr

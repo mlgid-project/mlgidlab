@@ -18,6 +18,33 @@ class PolarImage:
     angle: np.ndarray   # (n_angle,) degrees
 
 
+def polar_to_qxyz(radius, angle_deg):
+    """Map polar ``(radius, angle_deg)`` to Cartesian ``(q_xy, q_z)``.
+
+    Canonical reference: pygid GIWAXS polar-grid layout at
+    ``project_repos/pygid/pygid/coordmaps.py:1005-1036``, which defines
+
+        Q_xy = Q_pol * cos(deg2rad(ang_pol))
+        Q_z  = Q_pol * sin(deg2rad(ang_pol))
+
+    with ``Q_pol`` the q magnitude and ``ang_pol`` in degrees,
+    measured from +q_xy toward +q_z. Every persisted
+    polar↔Cartesian conversion in this codebase MUST go through this
+    helper. Do NOT align to ``coordmaps.py:331``
+    (``phi = 180 - atan2(...) * 180/pi``); that is the lab-frame
+    azimuth, a different quantity in a different frame, and using
+    it here would silently invert / shift every polar peak.
+
+    Inputs accept scalars or numpy arrays (broadcasting follows numpy
+    rules). Returns ``(q_xy, q_z)`` with the input's broadcast shape.
+    Closes physics-audit finding F-01 (single source of truth for
+    seven previously-duplicated inline sites) and F-03 (convention
+    pinned to upstream by name, not just by prose comment).
+    """
+    a = np.deg2rad(angle_deg)
+    return radius * np.cos(a), radius * np.sin(a)
+
+
 def _polar_extent(
     q_xy: np.ndarray, q_z: np.ndarray
 ) -> tuple[float, float, float]:

@@ -527,11 +527,21 @@ class MainWindow(QMainWindow):
         # so settings persist. None until the user invokes Tools →
         # Export figure… for the first time.
         self._figure_export_window = None  # type: ignore[var-annotated]
-        # Queue of PipelineCommands waiting to run sequentially. The
-        # "All entries" option in the pipeline panel expands to one
-        # command per entry; each finished run dequeues the next so the
-        # user gets per-entry log lines and per-entry error recovery.
-        self._pipeline_queue: list[PipelineCommand] = []
+        # Queue of (file_path, PipelineCommand) tuples waiting to run
+        # sequentially. The file_path is **snapshotted at enqueue time**
+        # so a mid-queue active-session switch (user clicks the other
+        # loaded file in the tree, etc.) can't cause later commands to
+        # dispatch against the wrong file. The "All entries" option in
+        # the pipeline panel expands one runRequested into one command
+        # per entry — all sharing the path captured at expansion time.
+        self._pipeline_queue: list[tuple[Path, PipelineCommand]] = []
+        # Entry-level progress tracking — the depth of the current
+        # "All entries" expansion plus the 1-indexed position we are
+        # at. Reset to (0, 0) when the queue drains; an "Active entry"
+        # run sets total=1 (no entry bar shown). Surfaced to the panel
+        # via ``on_queue_progress`` and folded into the status-bar tail.
+        self._entry_queue_total: int = 0
+        self._entry_queue_pos: int = 0
         # CIF-parse worker thread. CifPattern construction is slow for
         # raw CIFs so we run it off the GUI thread; only one parse runs
         # at a time (the panel's button stays disabled while it's in
@@ -4020,15 +4030,20 @@ class MainWindow(QMainWindow):
 
         ``add_peak`` and ``delete_peak`` always carry a specific
         ``entry`` already; only the run_* ops are subject to expansion.
+
+        The file path is snapshotted at this entry point and travels
+        with every enqueued tuple, so a mid-queue active-session
+        switch can't dispatch later commands at a different file.
         """
         if self.session is None:
             return
+        file_path = self.session.temp_path
         if (
             command.op_name in ("run_detection", "run_fitting", "run_matching")
             and "entry" not in command.kwargs
         ):
             try:
-                entries = file_model.list_entries(self.session.temp_path)
+                entries = file_model.list_entries(file_path)
             except Exception as exc:
                 QMessageBox.warning(
                     self, "Pipeline", f"Could not list entries: {exc}"
@@ -4037,32 +4052,45 @@ class MainWindow(QMainWindow):
             if not entries:
                 # No q-entries to run on — fall through and let mlgidbase
                 # raise its usual "no entries" message in the log.
-                self._enqueue_pipeline(command)
+                self._entry_queue_total = 1
+                self._entry_queue_pos = 0
+                self._enqueue_pipeline(file_path, command)
                 return
+            # Multi-entry expansion: stash the queue depth + reset the
+            # position counter so the entry progress bar starts at 0/N
+            # and the first ``_on_pipeline_run`` advances to 1/N.
+            self._entry_queue_total = len(entries)
+            self._entry_queue_pos = 0
             for entry in entries:
                 self._enqueue_pipeline(
+                    file_path,
                     PipelineCommand(
                         command.op_name,
                         {**command.kwargs, "entry": entry},
-                    )
+                    ),
                 )
         else:
-            self._enqueue_pipeline(command)
+            # Single-entry command (user picked one explicitly, or
+            # add_peak / delete_peak with their fixed entry). Counter
+            # collapses to 1 so the panel keeps the entry bar hidden.
+            self._entry_queue_total = 1
+            self._entry_queue_pos = 0
+            self._enqueue_pipeline(file_path, command)
 
-    def _enqueue_pipeline(self, command: PipelineCommand) -> None:
-        """Queue ``command`` and start it if no run is in flight."""
-        self._pipeline_queue.append(command)
+    def _enqueue_pipeline(self, file_path: Path, command: PipelineCommand) -> None:
+        """Queue ``(file_path, command)`` and start it if no run is in flight."""
+        self._pipeline_queue.append((file_path, command))
         if self._pipe_thread is None:
             self._run_next_pipeline_command()
 
     def _run_next_pipeline_command(self) -> None:
-        """Pop the next queued command and start it, if any."""
+        """Pop the next queued (path, command) tuple and start it, if any."""
         if self._pipe_thread is not None or not self._pipeline_queue:
             return
-        command = self._pipeline_queue.pop(0)
-        self._on_pipeline_run(command)
+        file_path, command = self._pipeline_queue.pop(0)
+        self._on_pipeline_run(file_path, command)
 
-    def _on_pipeline_run(self, command: PipelineCommand) -> None:
+    def _on_pipeline_run(self, file_path: Path, command: PipelineCommand) -> None:
         if self.session is None or self._pipe_thread is not None:
             return
 
@@ -4098,10 +4126,41 @@ class MainWindow(QMainWindow):
         # can open the active one r+. Sibling files are reattached on finish.
         self._detach_silx_tree()
 
+        # Stash the active command so the status-bar progress mirror
+        # (``_on_pipeline_frame_progress``) can rebuild the status text
+        # without needing to plumb the command through every emit.
+        self._pipe_command = command
+        self._pipe_progress_tail = ""
+
+        # Advance the entry-level queue position and drive the panel's
+        # second progress row. Single-entry runs (total == 1) keep the
+        # entry bar hidden via the panel's own guard.
+        if self._entry_queue_total >= 1:
+            self._entry_queue_pos += 1
+        entry_for_progress = command.kwargs.get("entry") or ""
+        self.pipeline_panel.on_queue_progress(
+            self._entry_queue_pos,
+            self._entry_queue_total,
+            entry_for_progress,
+            command.op_name,
+        )
+
         self._pipe_thread = QThread(self)
-        self._pipe_worker = PipelineWorker(self.session.temp_path, command)
+        # Use the file_path snapshotted at enqueue time, NOT
+        # ``self.session.temp_path`` — they can disagree if the user
+        # switched the active session between clicking Run and the
+        # queue actually dispatching this command. Surfaced as a
+        # pre-flight failure in pipeline.execute that named the wrong
+        # file's entries.
+        self._pipe_worker = PipelineWorker(file_path, command)
         self._pipe_worker.moveToThread(self._pipe_thread)
         self._pipe_worker.log.connect(self.pipeline_panel.append_log)
+        self._pipe_worker.frameProgress.connect(self.pipeline_panel.on_frame_progress)
+        # Mirror the frame counter into the status-bar tail so the user
+        # gets a glanceable counter without needing the pipeline panel
+        # in view. Stored on ``self`` so ``_update_status_pipeline``
+        # can fold it into the status string.
+        self._pipe_worker.frameProgress.connect(self._on_pipeline_frame_progress)
         self._pipe_worker.finished.connect(self._on_pipeline_finished)
         self._pipe_thread.started.connect(self._pipe_worker.run)
         self._pipe_thread.start()
@@ -4233,7 +4292,12 @@ class MainWindow(QMainWindow):
             return
 
         # Queue drained — final cleanup. Reattach silx, refresh the
-        # viewer for the active entry, lift busy gating.
+        # viewer for the active entry, lift busy gating. Reset the
+        # entry-queue counters so the next run starts from a clean
+        # slate (the panel's set_running(False) below also hides both
+        # progress rows).
+        self._entry_queue_total = 0
+        self._entry_queue_pos = 0
         self.pipeline_panel.set_running(False)
         self.parameter_panel.set_busy(False)
         self.viewer.set_busy(False)
@@ -4264,7 +4328,9 @@ class MainWindow(QMainWindow):
         # Manual peak is left in place after the run so it can also be
         # committed to fitted_peaks or further tweaked. See the comment in
         # _on_pipeline_finished for the rationale.
-        self._on_pipeline_run(PipelineCommand("add_peak", kwargs))
+        if self.session is None:
+            return
+        self._on_pipeline_run(self.session.temp_path, PipelineCommand("add_peak", kwargs))
 
     def _on_add_to_fitted(self) -> None:
         """Append a row to fitted_peaks using the profile viewer's 1D fits.
@@ -4402,7 +4468,9 @@ class MainWindow(QMainWindow):
                 "peak_id": int(sel.peak_id),
             },
         )
-        self._on_pipeline_run(cmd)
+        if self.session is None:
+            return
+        self._on_pipeline_run(self.session.temp_path, cmd)
 
     def _on_peak_row_write_requested(
         self, frame: int, kind: str, peak_id: int, polar: dict
@@ -4910,15 +4978,53 @@ class MainWindow(QMainWindow):
     def _update_status_pipeline(self, command=None, *, running: bool) -> None:
         if not running:
             self._sb_pipeline.setText("idle")
+            # Drop any progress tail from the previous run so a stale
+            # "3/12 frames" counter doesn't haunt the status bar after
+            # an op finishes.
+            self._pipe_progress_tail = ""
             return
         if command is None:
             self._sb_pipeline.setText("running…")
             return
         op = command.op_name if hasattr(command, "op_name") else str(command)
         entry = command.kwargs.get("entry") if hasattr(command, "kwargs") else None
-        self._sb_pipeline.setText(
-            f"running: {op} on {entry}" if entry else f"running: {op}"
-        )
+        # Fold in the entry-queue position and the most recent
+        # ``frameProgress`` tail when each is known. Multi-entry runs
+        # get "· entry K/N"; multi-frame runs get "· K/N frames";
+        # single-of-both contributes nothing.
+        head = f"running: {op} on {entry}" if entry else f"running: {op}"
+        entry_tail = ""
+        if getattr(self, "_entry_queue_total", 0) > 1:
+            entry_tail = (
+                f" · entry {self._entry_queue_pos}/{self._entry_queue_total}"
+            )
+        frame_tail = getattr(self, "_pipe_progress_tail", "")
+        self._sb_pipeline.setText(head + entry_tail + frame_tail)
+
+    def _on_pipeline_frame_progress(
+        self, done: int, total: int, op_name: str, entry: str
+    ) -> None:
+        """Mirror ``PipelineWorker.frameProgress`` into the status bar.
+
+        Single-frame and indeterminate runs (``total <= 1``) clear the
+        tail so the existing "running: op on entry" remains unadorned.
+        Skips the status-bar repaint when the tail string is unchanged
+        from the last emit — a fast pipeline can fire many
+        ``frameProgress`` signals per second and an unchanged
+        ``setText`` still schedules a paint event.
+        """
+        if total <= 1:
+            new_tail = ""
+        else:
+            new_tail = f" · {done}/{total} frames"
+        if getattr(self, "_pipe_progress_tail", "") == new_tail:
+            return
+        self._pipe_progress_tail = new_tail
+        # Re-render the status line so the new tail is visible
+        # immediately. Reuse the existing op + entry from the in-flight
+        # command rather than rebuilding here.
+        cmd = getattr(self, "_pipe_command", None)
+        self._update_status_pipeline(cmd, running=True)
 
     def _on_status_cursor_moved(self, info) -> None:
         if not self._status_cursor_visible:

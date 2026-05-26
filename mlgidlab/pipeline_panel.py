@@ -28,9 +28,11 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QProgressBar,
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QToolButton,
     QVBoxLayout,
@@ -48,6 +50,15 @@ ENTRY_ALL = "All entries"
 
 FRAME_ACTIVE = "Active frame"
 FRAME_ALL = "All frames"
+
+# Human-readable titles for the mlgidBASE method names emitted via
+# ``PipelineWorker.frameProgress`` — used by the progress label and
+# the status-bar tail. Falls through to the raw op name when unmapped.
+_OP_TITLES: dict[str, str] = {
+    "run_detection": "Detection",
+    "run_fitting": "Fitting",
+    "run_matching": "Matching",
+}
 
 
 def _make_form(parent: QWidget | None = None) -> QFormLayout:
@@ -196,6 +207,105 @@ class PipelinePanel(QWidget):
             self.btn_run_all.setEnabled(False)
         else:
             self._update_match_enabled()
+        # Hide both progress rows when a run ends. Either bar will
+        # reappear on the next ``on_frame_progress`` /
+        # ``on_queue_progress`` call if the upcoming run is
+        # multi-frame / multi-entry; single-everything runs leave them
+        # hidden. Clear the paint-state memoisation so the next run
+        # always repaints (even if its first emit happens to match
+        # the last emit of the previous run).
+        if not running and hasattr(self, "_progress_bar"):
+            self._progress_bar.hide()
+            self._progress_label.hide()
+            self._frame_progress_last_state = None
+            self._frame_progress_last_visible = False
+        if not running and hasattr(self, "_entry_progress_bar"):
+            self._entry_progress_bar.hide()
+            self._entry_progress_label.hide()
+            self._entry_progress_last_state = None
+            self._entry_progress_last_visible = False
+
+    def on_queue_progress(
+        self, current: int, total: int, entry: str, op_name: str
+    ) -> None:
+        """Update the entry-level progress row.
+
+        Driven by the host whenever a queued "All entries" run starts a
+        new entry. ``current`` is 1-indexed (the entry just starting),
+        ``total`` is the number of entries in the run. Hidden when
+        ``total <= 1`` so single-entry runs do not get a meaningless
+        1/1 bar. Label reads e.g. ``Detection · entry 3/8 · entry_DBTTF``.
+
+        Memoises the last paint state and skips redundant widget
+        writes so back-to-back identical updates do not trigger paint
+        events.
+        """
+        if not hasattr(self, "_entry_progress_bar"):
+            return
+        if total <= 1:
+            if getattr(self, "_entry_progress_last_visible", True):
+                self._entry_progress_bar.hide()
+                self._entry_progress_label.hide()
+                self._entry_progress_last_visible = False
+            return
+        new_state = (int(current), int(total), str(entry), str(op_name))
+        if getattr(self, "_entry_progress_last_state", None) == new_state:
+            return
+        self._entry_progress_last_state = new_state
+        title = _OP_TITLES.get(op_name, op_name)
+        entry_part = f" · {entry}" if entry else ""
+        # setRange is cheap when the range is unchanged but still
+        # forwards through QProgressBar; only call it when total moves.
+        if self._entry_progress_bar.maximum() != total:
+            self._entry_progress_bar.setRange(0, total)
+        self._entry_progress_bar.setValue(current)
+        self._entry_progress_label.setText(
+            f"{title} · entry {current}/{total}{entry_part}"
+        )
+        if not getattr(self, "_entry_progress_last_visible", False):
+            self._entry_progress_label.show()
+            self._entry_progress_bar.show()
+            self._entry_progress_last_visible = True
+
+    def on_frame_progress(
+        self, done: int, total: int, op_name: str, entry: str
+    ) -> None:
+        """Update the multi-frame progress row.
+
+        Hides both widgets when ``total <= 1`` so single-frame runs
+        contribute no UI noise. Otherwise paints a determinate bar
+        and a one-line label, e.g. ``Detection · entry_4P · 3/12 frames``.
+        ``op_name`` is the mlgidBASE method name (``run_detection`` /
+        ``run_fitting`` / ``run_matching``) which we map to a human
+        title; ``entry`` may be the literal entry name or a sentinel
+        like ``"all entries"`` when the run iterates the whole file.
+
+        Memoises the last paint state and skips redundant widget
+        writes so a fast pipeline emitting many frame events per
+        second does not turn into a paint storm.
+        """
+        if not hasattr(self, "_progress_bar"):
+            return
+        if total <= 1:
+            if getattr(self, "_frame_progress_last_visible", True):
+                self._progress_bar.hide()
+                self._progress_label.hide()
+                self._frame_progress_last_visible = False
+            return
+        new_state = (int(done), int(total), str(op_name), str(entry))
+        if getattr(self, "_frame_progress_last_state", None) == new_state:
+            return
+        self._frame_progress_last_state = new_state
+        title = _OP_TITLES.get(op_name, op_name)
+        entry_part = f" · {entry}" if entry else ""
+        if self._progress_bar.maximum() != total:
+            self._progress_bar.setRange(0, total)
+        self._progress_bar.setValue(done)
+        self._progress_label.setText(f"{title}{entry_part} · {done}/{total} frames")
+        if not getattr(self, "_frame_progress_last_visible", False):
+            self._progress_label.show()
+            self._progress_bar.show()
+            self._frame_progress_last_visible = True
 
     # -- UI construction --
 
@@ -222,6 +332,42 @@ class PipelinePanel(QWidget):
         inner = QVBoxLayout(content)
         inner.setContentsMargins(8, 8, 8, 8)
         inner.setSpacing(4)
+
+        # Progress rows — two stacked levels.
+        #   * Entry row: only visible during an "All entries" run, shows
+        #     "entry K/N · <entry>" and a determinate bar over the queue.
+        #   * Frame row: visible during any multi-frame run, shows
+        #     "<Op> · <entry> · K/N frames" and a bar over the entry's
+        #     frames.
+        # Both rows hide on idle and on single-{frame,entry} runs so the
+        # progress region collapses to zero pixels in the steady state.
+        self._entry_progress_label = QLabel("")
+        self._entry_progress_label.setStyleSheet("color: #aaa;")
+        self._entry_progress_label.hide()
+        self._entry_progress_bar = QProgressBar()
+        self._entry_progress_bar.setRange(0, 1)
+        self._entry_progress_bar.setValue(0)
+        self._entry_progress_bar.setTextVisible(False)
+        self._entry_progress_bar.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self._entry_progress_bar.hide()
+        inner.addWidget(self._entry_progress_label)
+        inner.addWidget(self._entry_progress_bar)
+
+        self._progress_label = QLabel("")
+        self._progress_label.setStyleSheet("color: #aaa;")
+        self._progress_label.hide()
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, 1)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setTextVisible(False)
+        self._progress_bar.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self._progress_bar.hide()
+        inner.addWidget(self._progress_label)
+        inner.addWidget(self._progress_bar)
 
         if not self._available:
             hint = QLabel(

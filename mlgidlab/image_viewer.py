@@ -33,7 +33,7 @@ from mlgidlab.file_model import (
     _LazyImageStack,
     _LazyPolarStack,
 )
-from mlgidlab.polar import stack_to_polar  # noqa: F401  (retained as a reference impl)
+from mlgidlab.polar import polar_to_qxyz, stack_to_polar  # noqa: F401 (stack_to_polar retained as a reference impl)
 
 import logging
 logger = logging.getLogger(__name__)
@@ -444,11 +444,14 @@ def _peaks_from_manual(manual: list[ManualPeak]) -> PeakTable:
             score=empty,
             amplitude=empty,
         )
+    _radius = np.array([m.radius for m in manual], dtype=float)
+    _angle = np.array([m.angle for m in manual], dtype=float)
+    _qxy, _qz = polar_to_qxyz(_radius, _angle)
     return PeakTable(
-        q_xy=np.array([m.radius * np.cos(np.deg2rad(m.angle)) for m in manual]),
-        q_z=np.array([m.radius * np.sin(np.deg2rad(m.angle)) for m in manual]),
-        angle=np.array([m.angle for m in manual], dtype=float),
-        radius=np.array([m.radius for m in manual], dtype=float),
+        q_xy=_qxy,
+        q_z=_qz,
+        angle=_angle,
+        radius=_radius,
         angle_width=np.array([m.angle_width for m in manual], dtype=float),
         radius_width=np.array([m.radius_width for m in manual], dtype=float),
         is_ring=np.array([m.is_ring for m in manual], dtype=bool),
@@ -1778,8 +1781,7 @@ class GIWAXSImageViewer(QWidget):
                 table.angle[idx] = a
                 table.radius_width[idx] = dr
                 table.angle_width[idx] = da
-                table.q_xy[idx] = r * np.cos(np.deg2rad(a))
-                table.q_z[idx] = r * np.sin(np.deg2rad(a))
+                table.q_xy[idx], table.q_z[idx] = polar_to_qxyz(r, a)
         # If the user edited a fitted peak, every matched solution that
         # references it must re-slice from the updated fitted table.
         if kind == "fitted":
@@ -2380,8 +2382,7 @@ class GIWAXSImageViewer(QWidget):
         # to the cartesian grid so the readout still shows a real
         # intensity near the edge.
         if intensity != intensity:  # NaN
-            q_xy_val = r_val * np.cos(np.deg2rad(theta_deg))
-            q_z_val = r_val * np.sin(np.deg2rad(theta_deg))
+            q_xy_val, q_z_val = polar_to_qxyz(r_val, theta_deg)
             intensity = self._lookup_cartesian_intensity(
                 frame, q_xy_val, q_z_val
             )
@@ -2815,8 +2816,7 @@ class GIWAXSImageViewer(QWidget):
                         table.angle[idx] = new_a
                         table.angle_width[idx] = h
                     cur_a = float(table.angle[idx])
-                    table.q_xy[idx] = new_r * np.cos(np.deg2rad(cur_a))
-                    table.q_z[idx] = new_r * np.sin(np.deg2rad(cur_a))
+                    table.q_xy[idx], table.q_z[idx] = polar_to_qxyz(new_r, cur_a)
 
         self._render_overlays(self.current_frame)
         self.peakGeometryChanged.emit(sel)

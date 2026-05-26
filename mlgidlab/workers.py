@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 import numpy as np
@@ -125,6 +126,86 @@ class _SignalLogHandler(logging.Handler):
             pass
 
 
+# mlgidbase emits one of these lines per frame at the end of each
+# frame's processing for detection / fitting / matching. We use them
+# as the only available "frame N done" signal, since none of
+# mlgidbase, pygidfit, pygid or mlgidmatch accepts a progress
+# callback. Keep this in sync with mlgidbase's log strings:
+#   mlgidbase/mlgiddetect_functions.py:~182
+#   mlgidbase/pygidfit_functions.py    (fitted)
+#   mlgidbase/mlgidmatch_functions.py:~244
+#
+# Anchored at start with re.match (not re.search) so noise records
+# don't pay for a full scan. The ``_FRAME_DONE_PREFIX`` fast-path
+# check skips records whose raw msg doesn't begin with the prefix,
+# avoiding a getMessage() call on the 99% of records that aren't
+# frame-completion lines.
+_FRAME_DONE_PREFIX = "Saved "
+_FRAME_DONE_RE = re.compile(
+    r"Saved (?P<kind>\w+) peaks to file: .*, entry: (?P<entry>[^,]+), "
+    r"frame: (?P<frame>\d+)"
+)
+
+
+class _FrameProgressHandler(logging.Handler):
+    """Counts mlgidbase per-frame completion log lines and emits a Qt
+    signal so the GUI can size a progress bar.
+
+    Composed alongside ``_SignalLogHandler`` rather than folded into
+    it: the string handler still forwards every record to the log
+    panel verbatim; this one classifies the subset that match
+    ``_FRAME_DONE_RE`` and turns them into structured progress events.
+    Decoupling the two means a future tweak to the visible log format
+    can't accidentally break progress tracking and vice versa.
+
+    Performance: the raw-msg prefix check (``startswith``) is the only
+    work paid by the overwhelming majority of records (clustering /
+    fitting INFO lines, etc.). Only the per-frame "Saved … peaks"
+    records pay ``getMessage`` + regex match + Qt signal emit, and
+    those are emitted at most once per frame by mlgidbase.
+    """
+
+    def __init__(self, sink: Signal, total: int, op_name: str) -> None:
+        super().__init__()
+        self._sink = sink
+        self._total = int(total)
+        self._op = str(op_name)
+        self._done = 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            # Fast-path: bail before computing the formatted message
+            # on records whose raw format string can't be a frame-
+            # completion line. mlgidbase uses f-strings for these
+            # lines so ``record.msg`` is the literal final text
+            # including the ``Saved `` prefix.
+            raw = record.msg
+            if not isinstance(raw, str) or not raw.startswith(_FRAME_DONE_PREFIX):
+                return
+            # Anchored match — the line is fully described by the
+            # regex from char 0 so re.match avoids a full-string scan.
+            m = _FRAME_DONE_RE.match(record.getMessage())
+            if not m:
+                return
+            self._done += 1
+            # Don't clamp _done > _total: if mlgidbase emits more
+            # frame-completion lines than we expected (multi-entry
+            # scope where our pre-count missed an entry, e.g.), the
+            # bar will look saturated which beats stalling at <100%.
+            # Cap the emitted ``done`` at ``total`` so the panel UI
+            # never sees a value past max.
+            done_capped = min(self._done, self._total) if self._total > 0 else self._done
+            self._sink.emit(
+                done_capped,
+                self._total,
+                self._op,
+                m.group("entry"),
+            )
+        except Exception:
+            logger.debug("suppressed exception in _FrameProgressHandler.emit", exc_info=True)
+            pass
+
+
 class ConversionWorker(QObject):
     """Runs ``pygid`` raw → NeXus conversion off the GUI thread.
 
@@ -189,15 +270,62 @@ class ConversionWorker(QObject):
 
 
 class PipelineWorker(QObject):
-    """Runs one mlgidbase pipeline command and streams its log records."""
+    """Runs one mlgidbase pipeline command and streams its log records.
+
+    Emits ``frameProgress(done, total, op, entry)`` for the host's
+    multi-frame progress bar. ``total`` is pre-computed from the file
+    + the scope encoded in ``command.kwargs`` so the bar's range is
+    fixed for the lifetime of the run; ``done`` increments whenever
+    mlgidbase logs a per-frame completion line (see
+    ``_FrameProgressHandler``). The host's panel UI hides the bar
+    when ``total <= 1`` so single-frame runs do not show a
+    meaningless 1/1 widget.
+    """
 
     finished = Signal(object, object)  # (result, Exception | None)
     log = Signal(str)
+    frameProgress = Signal(int, int, str, str)  # (done, total, op, entry)
 
     def __init__(self, file_path: Path, command: PipelineCommand) -> None:
         super().__init__()
         self._file_path = file_path
         self._command = command
+
+    def _resolve_total_frames(self) -> tuple[int, str]:
+        """Resolve ``(total_frames, entry_label)`` for the run's scope.
+
+        The mlgidBASE methods we drive iterate frames internally —
+        per-entry (when ``entry`` is pinned and ``frame_num`` is None),
+        a single frame (when ``frame_num`` is set), or every entry +
+        every frame (when neither is set). Pre-computing the total
+        lets the panel size a determinate progress bar; for the
+        single-frame case we return ``(1, entry)`` so the host can
+        decide to hide the bar.
+
+        Best-effort: any failure resolving counts (file just closed,
+        bad metadata) falls back to ``(0, "")`` which the host treats
+        as "indeterminate, don't show a bar".
+        """
+        from mlgidlab.file_model import count_frames, list_entries
+
+        kw = self._command.kwargs
+        entry = kw.get("entry")
+        frame_num = kw.get("frame_num")
+        try:
+            # Single-frame scope: skip a list_entries open, hide the
+            # bar at the panel layer.
+            if isinstance(frame_num, int):
+                return 1, str(entry or "")
+            if isinstance(entry, str) and entry:
+                return count_frames(self._file_path, entry), entry
+            # All entries: sum across every q-image entry in the file.
+            entries = list_entries(self._file_path)
+            total = sum(count_frames(self._file_path, e) for e in entries)
+            label = "all entries" if entries else ""
+            return total, label
+        except Exception:
+            logger.debug("suppressed exception in PipelineWorker._resolve_total_frames", exc_info=True)
+            return 0, ""
 
     def run(self) -> None:
         # Force pygid / mlgidbase import-time basicConfig side effects
@@ -221,8 +349,23 @@ class PipelineWorker(QObject):
         if root.level == logging.NOTSET or root.level > logging.INFO:
             root.setLevel(logging.INFO)
 
+        total, entry_label = self._resolve_total_frames()
+        op_name = self._command.op_name
+        progress_handler = _FrameProgressHandler(self.frameProgress, total, op_name)
+        root.addHandler(progress_handler)
+        # Initial emit so the panel can paint a 0% bar before
+        # mlgidbase starts logging its first frame. The host keeps the
+        # bar hidden when ``total <= 1`` so single-frame runs stay quiet.
+        self.frameProgress.emit(0, total, op_name, entry_label)
         try:
             result = execute(self._file_path, self._command)
+            # Cap at total on the successful path. mlgidbase may have
+            # emitted slightly fewer frame-completion lines than our
+            # pre-count expected (e.g. it skipped a frame that had no
+            # work). Pin to total so the bar always reads "done" on
+            # success.
+            if total > 0:
+                self.frameProgress.emit(total, total, op_name, entry_label)
             self.finished.emit(result, None)
         except Exception as exc:
             # Stream the traceback through the log channel so the user
@@ -237,6 +380,7 @@ class PipelineWorker(QObject):
             self.finished.emit(None, exc)
         finally:
             root.removeHandler(handler)
+            root.removeHandler(progress_handler)
             root.setLevel(prev_level)
 
 

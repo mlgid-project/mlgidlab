@@ -62,7 +62,7 @@ def execute(file_path: Path, command: PipelineCommand) -> Any:
     # doesn't exist"`` deep inside h5py. Surface a clear, actionable
     # error instead — naming the offending groups — so the user can
     # remove / rename them rather than chasing the h5py stack.
-    from mlgidlab.file_model import list_pygid_incompatible_top_level
+    from mlgidlab.file_model import list_entries, list_pygid_incompatible_top_level
     bad = list_pygid_incompatible_top_level(file_path)
     if bad:
         raise RuntimeError(
@@ -74,6 +74,31 @@ def execute(file_path: Path, command: PipelineCommand) -> Any:
             f"them, or open the source raw file via the Conversion "
             f"workflow to produce a proper NeXus output."
         )
+
+    # Pre-flight: if the caller pinned an entry, make sure it's a
+    # 2D ``img_gid_q`` entry the file actually carries. Otherwise
+    # pygidfit/mlgidbase raises an opaque
+    # ``ValueError("entry not found in the NeXus file")`` deep inside
+    # ``ProcessDataFromFile.process_data_from_file`` and the user has
+    # no idea which entries are even available. Common triggers:
+    # the entry combo carried a stale name across a file-modification
+    # event, or an entry was deleted externally between selection and
+    # run. The list is the same one ``MainWindow._populate_entries``
+    # uses to fill the combo, so the contract is symmetric.
+    requested_entry = command.kwargs.get("entry")
+    if isinstance(requested_entry, str) and requested_entry:
+        valid_entries = list_entries(file_path)
+        if requested_entry not in valid_entries:
+            available = ", ".join(repr(e) for e in valid_entries) if valid_entries else "<none>"
+            raise RuntimeError(
+                f"Cannot run {command.op_name!r}: entry {requested_entry!r} "
+                f"is not present in {Path(file_path).name} (or its 'data' "
+                f"group does not declare signal='img_gid_q'). Available "
+                f"2D q-image entries: {available}. The GUI's entry selector "
+                f"should be in sync; this usually means the file was "
+                f"modified externally between selection and run, or the "
+                f"selection survived a file swap."
+            )
 
     # Some labeled training files (e.g. ``organic_labeled.h5``) carry
     # fitted_peaks rows that only have polar coordinates — Cartesian
@@ -194,8 +219,8 @@ def _backfill_fitted_peaks_polar_to_cartesian(
     No-op when the file is already populated correctly.
     """
     import h5py
-    import numpy as np
 
+    from mlgidlab import polar
     from mlgidlab.file_model import is_entry_group_name
 
     if entry is not None:
@@ -235,9 +260,9 @@ def _backfill_fitted_peaks_polar_to_cartesian(
                 if not need_xy.any() and not need_amp.any():
                     continue
                 if need_xy.any():
-                    ang_rad = np.deg2rad(fp["angle"][need_xy])
-                    fp["q_xy"][need_xy] = fp["radius"][need_xy] * np.cos(ang_rad)
-                    fp["q_z"][need_xy] = fp["radius"][need_xy] * np.sin(ang_rad)
+                    fp["q_xy"][need_xy], fp["q_z"][need_xy] = polar.polar_to_qxyz(
+                        fp["radius"][need_xy], fp["angle"][need_xy]
+                    )
                 if need_amp.any():
                     # Placeholder unit amplitude so intensity-filtered
                     # matching still sees the peak. Real amplitudes
@@ -542,6 +567,20 @@ def _build_cif_pattern_from_raw(
         cifs=cifs,
         create_all=True,
     )
+
+
+class _EnergyOutOfRangeError(ValueError):
+    """Raised when photon energy derived in ``_exp_params_from_nexus``
+    falls outside the plausible X-ray range.
+
+    Subclass of ``ValueError`` so it surfaces as a normal validation
+    error to callers; named distinctly so the broad ``except Exception``
+    in ``_exp_params_from_nexus`` can re-raise it instead of swallowing
+    it into the silent defaults fallback. Closes physics-audit
+    finding F-02 (energy derivation unit contract): a future pygidsim
+    flip from eV to keV would shrink the computed value 1000x and
+    trip the lower bound here before any CIF pattern is simulated.
+    """
 
 
 def _exp_params_from_nexus(
