@@ -10,6 +10,7 @@ import numpy as np
 
 from PySide6.QtCore import (
     QCoreApplication,
+    QMetaObject,
     QSettings,
     QSignalBlocker,
     Qt,
@@ -672,34 +673,36 @@ class MainWindow(QMainWindow):
         full roadmap.
         """
         tools_menu = bar.addMenu("&Tools")
-        # The three clear-* actions all do the same kind of thing (wipe one
-        # peak family) so they live under a single hover-expanding
-        # "Clear peaks" submenu rather than cluttering the Tools root.
+        # The three per-kind clear-* entries each expand into a scope
+        # sub-submenu (Active frame / Active entry / All entries) so the
+        # user can wipe exactly the slice they mean. The Reset submenu
+        # below still offers a one-click "everything on this scope"
+        # for when the user does not care about the kind split.
         clear_menu = tools_menu.addMenu("&Clear peaks")
+        clear_menu.setToolTipsVisible(True)
 
-        self.action_clear_detected = QAction("Detected", self)
-        self.action_clear_detected.triggered.connect(
-            lambda: self._action_clear_file_peaks("detected")
+        self._clear_detected_menu = self._build_clear_kind_submenu(
+            clear_menu, "Detected", "detected"
         )
-        clear_menu.addAction(self.action_clear_detected)
 
         # "Fitted and Matched": clearing fitted necessarily invalidates
         # matched, because matched solutions reference fitted ids and an
         # orphaned matched_* group would render against missing rows.
         # The cascade is one-way (fitted -> matched).
-        self.action_clear_fitted = QAction("Fitted and Matched", self)
-        self.action_clear_fitted.triggered.connect(
-            lambda: self._action_clear_file_peaks("fitted")
+        self._clear_fitted_menu = self._build_clear_kind_submenu(
+            clear_menu, "Fitted and Matched", "fitted"
         )
-        clear_menu.addAction(self.action_clear_fitted)
 
         # "Matched" clears only the matched_* solutions; detected and
         # fitted are left intact (re-match without re-fitting).
-        self.action_clear_matched = QAction("Matched", self)
-        self.action_clear_matched.triggered.connect(
-            lambda: self._action_clear_file_peaks("matched")
+        self._clear_matched_menu = self._build_clear_kind_submenu(
+            clear_menu, "Matched", "matched"
         )
-        clear_menu.addAction(self.action_clear_matched)
+
+        # Re-evaluate "Active frame" gates across every per-kind submenu
+        # just before the Clear peaks parent is shown. Cheap, and avoids
+        # plumbing a frame-count signal into every action.
+        clear_menu.aboutToShow.connect(self._refresh_clear_menu_state)
 
         # Reset submenu — full wipe of det + fit + match (and manual,
         # in-memory) at three scopes. "Active frame" is greyed out
@@ -710,16 +713,6 @@ class MainWindow(QMainWindow):
         reset_menu.setToolTipsVisible(True)
         self._reset_menu = reset_menu
 
-        self.action_reset_entry = QAction("Active entry (all frames)", self)
-        self.action_reset_entry.setToolTip(
-            "Clear detected, fitted, matched, and manual peaks on the "
-            "currently displayed entry."
-        )
-        self.action_reset_entry.triggered.connect(
-            lambda: self._action_reset_analysis("entry")
-        )
-        reset_menu.addAction(self.action_reset_entry)
-
         self.action_reset_all = QAction("All entries", self)
         self.action_reset_all.setToolTip(
             "Clear detected, fitted, matched, and manual peaks on every "
@@ -729,6 +722,16 @@ class MainWindow(QMainWindow):
             lambda: self._action_reset_analysis("all")
         )
         reset_menu.addAction(self.action_reset_all)
+
+        self.action_reset_entry = QAction("Active entry (all frames)", self)
+        self.action_reset_entry.setToolTip(
+            "Clear detected, fitted, matched, and manual peaks on the "
+            "currently displayed entry."
+        )
+        self.action_reset_entry.triggered.connect(
+            lambda: self._action_reset_analysis("entry")
+        )
+        reset_menu.addAction(self.action_reset_entry)
 
         self.action_reset_frame = QAction("Active frame", self)
         self.action_reset_frame.setToolTip(
@@ -762,8 +765,85 @@ class MainWindow(QMainWindow):
         self.action_export_csv.triggered.connect(self._action_export_csv)
         tools_menu.addAction(self.action_export_csv)
 
-    def _action_clear_file_peaks(self, kind: str) -> None:
-        """Empty every ``<kind>_peaks`` dataset for the active entry.
+    def _build_clear_kind_submenu(self, parent_menu, label: str, kind: str):
+        """Build a per-kind Clear-peaks submenu with three scope choices.
+
+        ``kind`` is one of ``detected``/``fitted``/``matched`` and is
+        forwarded to ``_action_clear_file_peaks`` together with the
+        chosen scope. Keeps the per-action references on ``self`` so
+        ``_refresh_clear_menu_state`` can flip "Active frame" enabled
+        when the active entry has a single frame (no per-frame scope
+        is meaningful there — it would just duplicate Active entry).
+        Returns the QMenu so the caller can stash it for raw-mode
+        gating.
+        """
+        sub = parent_menu.addMenu(label)
+        sub.setToolTipsVisible(True)
+
+        act_all = QAction("All entries", self)
+        act_all.setToolTip(
+            f"Clear every {kind} peak on every entry in the active file."
+        )
+        act_all.triggered.connect(
+            lambda _checked=False, k=kind: self._action_clear_file_peaks(k, "all")
+        )
+        sub.addAction(act_all)
+
+        act_entry = QAction("Active entry (all frames)", self)
+        act_entry.setToolTip(
+            f"Clear every {kind} peak on the currently displayed entry."
+        )
+        act_entry.triggered.connect(
+            lambda _checked=False, k=kind: self._action_clear_file_peaks(k, "entry")
+        )
+        sub.addAction(act_entry)
+
+        act_frame = QAction("Active frame", self)
+        act_frame.setToolTip(
+            f"Clear {kind} peaks on just the currently displayed frame "
+            "of the active entry."
+        )
+        act_frame.triggered.connect(
+            lambda _checked=False, k=kind: self._action_clear_file_peaks(k, "frame")
+        )
+        sub.addAction(act_frame)
+
+        # Stash per-kind frame action so _refresh_clear_menu_state can
+        # gate it on the live frame count.
+        setattr(self, f"_clear_{kind}_frame_action", act_frame)
+        setattr(self, f"_clear_{kind}_entry_action", act_entry)
+        setattr(self, f"_clear_{kind}_all_action", act_all)
+        return sub
+
+    def _refresh_clear_menu_state(self) -> None:
+        """Gate the per-kind Clear-peaks scope actions.
+
+        Mirrors ``_refresh_reset_menu_state``: "Active frame" is greyed
+        out unless there's an open session and the current entry has
+        more than one frame. Active-entry / All-entries need only an
+        open session. Kept cheap (called on ``aboutToShow``) — no signal
+        plumbing on every viewer event.
+        """
+        has_session = self.session is not None and self._pipe_thread is None
+        n_frames = getattr(self.viewer, "n_frames", 0) if has_session else 0
+        for kind in ("detected", "fitted", "matched"):
+            entry_a = getattr(self, f"_clear_{kind}_entry_action", None)
+            all_a = getattr(self, f"_clear_{kind}_all_action", None)
+            frame_a = getattr(self, f"_clear_{kind}_frame_action", None)
+            if entry_a is not None:
+                entry_a.setEnabled(has_session)
+            if all_a is not None:
+                all_a.setEnabled(has_session)
+            if frame_a is not None:
+                frame_a.setEnabled(has_session and n_frames > 1)
+
+    def _action_clear_file_peaks(self, kind: str, scope: str = "entry") -> None:
+        """Empty every ``<kind>_peaks`` dataset at the requested scope.
+
+        ``scope`` is one of:
+        - ``"entry"`` — active entry, every frame in it.
+        - ``"all"``   — every entry in the active file, every frame.
+        - ``"frame"`` — active entry, just the active frame.
 
         Cascade rule (one-way):
         - clearing ``fitted`` also clears ``matched`` (matched rows
@@ -771,14 +851,41 @@ class MainWindow(QMainWindow):
         - clearing ``matched`` clears matched only; detected and fitted
           are left intact (re-match without re-fitting). See the
           Tools-menu wiring above.
+
+        Manual peaks are session-wide and live only in memory — they
+        are deliberately *not* touched here; only ``Reset all peaks``
+        wipes them.
         """
         if self.session is None or self._pipe_thread is not None:
             return
-        entry = self.entry_combo.currentText()
-        if not entry:
+        active_entry = self.entry_combo.currentText()
+        if scope in ("entry", "frame") and not active_entry:
             return
-        if not self._confirm_clear(kind):
+        if scope == "frame" and getattr(self.viewer, "n_frames", 0) <= 1:
             return
+
+        # Build scope-specific (entry, frame|None) targets, same shape
+        # as _action_reset_analysis.
+        if scope == "all":
+            try:
+                targets = [
+                    (e, None) for e in file_model.list_entries(self.session.temp_path)
+                ]
+            except Exception as exc:
+                QMessageBox.critical(self, "Clear failed", f"Could not list entries: {exc}")
+                return
+            scope_label = f"all {len(targets)} entries"
+        elif scope == "entry":
+            targets = [(active_entry, None)]
+            scope_label = f"entry {active_entry}"
+        else:  # frame
+            frame_idx = int(self.viewer.current_frame)
+            targets = [(active_entry, frame_idx)]
+            scope_label = f"frame {frame_idx} of {active_entry}"
+
+        if not self._confirm_clear(kind, scope_label):
+            return
+
         kinds_to_clear = [kind]
         if kind == "fitted":
             kinds_to_clear.append("matched")
@@ -786,10 +893,11 @@ class MainWindow(QMainWindow):
         with self._detached_silx_tree():
             try:
                 removed_total = 0
-                for k in kinds_to_clear:
-                    removed_total += file_model.clear_peaks(
-                        self.session.temp_path, entry, k
-                    )
+                for entry, frame in targets:
+                    for k in kinds_to_clear:
+                        removed_total += file_model.clear_peaks(
+                            self.session.temp_path, entry, k, frame=frame
+                        )
             except Exception as exc:
                 QMessageBox.critical(self, "Clear failed", str(exc))
                 return
@@ -799,10 +907,11 @@ class MainWindow(QMainWindow):
         # Bulk wipe invalidates every FileGeomAction and the selection.
         self.viewer.clear_history()
         self.viewer.clear_selection()
-        self._load_entry_into_viewer(entry, preserve_view=True)
+        if active_entry:
+            self._load_entry_into_viewer(active_entry, preserve_view=True)
         self.pipeline_panel.append_log(
             f"Cleared {' + '.join(kinds_to_clear)} peaks "
-            f"({removed_total} rows total) on {entry}"
+            f"({removed_total} rows total) on {scope_label}"
         )
 
     def _refresh_reset_menu_state(self) -> None:
@@ -1004,23 +1113,24 @@ class MainWindow(QMainWindow):
             f"Exported {n} {kind} peak rows ({scope}) to {path}"
         )
 
-    def _confirm_clear(self, kind: str) -> bool:
+    def _confirm_clear(self, kind: str, scope_label: str = "") -> bool:
         descriptions = {
             "detected": ("detected peaks",
-                         "every row of detected_peaks for the active entry"),
+                         "every row of detected_peaks"),
             "fitted":   ("fitted + matched peaks",
                          "every row of fitted_peaks AND every matched_* "
-                         "solution for the active entry "
-                         "(matched references fitted, so it has to go too)"),
+                         "solution (matched references fitted, so it has "
+                         "to go too)"),
             "matched":  ("matched peaks",
-                         "every matched_* solution for the active entry "
+                         "every matched_* solution "
                          "(detected and fitted peaks are left intact)"),
         }
         title, body = descriptions.get(kind, (kind, kind))
+        scope_suffix = f" on {scope_label}" if scope_label else ""
         reply = QMessageBox.question(
             self,
             f"Clear {title}",
-            f"Remove {body}?\n\nThis cannot be undone.",
+            f"Remove {body}{scope_suffix}?\n\nThis cannot be undone.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         )
@@ -2759,13 +2869,15 @@ class MainWindow(QMainWindow):
         # Cartesian / Polar radios — meaningless before conversion.
         self.viewer.set_mode_radios_visible(not is_raw)
         # Tools > Clear peaks submenu has nothing to clear in raw mode.
-        for action in (
-            getattr(self, "action_clear_detected", None),
-            getattr(self, "action_clear_fitted", None),
-            getattr(self, "action_clear_matched", None),
+        # Each kind is now a scope submenu, so disable the menu via its
+        # menuAction (greys out the whole hover-target).
+        for kind_menu in (
+            getattr(self, "_clear_detected_menu", None),
+            getattr(self, "_clear_fitted_menu", None),
+            getattr(self, "_clear_matched_menu", None),
         ):
-            if action is not None:
-                action.setEnabled(not is_raw)
+            if kind_menu is not None:
+                kind_menu.menuAction().setEnabled(not is_raw)
 
     def _confirm_discard_changes(self, session: BaseSession | None = None) -> bool:
         target = session if session is not None else self._active_session
@@ -2822,10 +2934,23 @@ class MainWindow(QMainWindow):
         # Tell the background prefetch worker to drop its own h5py
         # handle too. mlgidbase opens the same file r+ in the worker
         # we're about to spawn; an outstanding read handle from the
-        # prefetcher would either contend (Windows) or silently
+        # prefetcher would either contend (Windows), trip HDF5 file
+        # locking ("Unable to synchronously open file"), or silently
         # serve pre-write data into the LRU mid-pipeline (Linux).
+        #
+        # Must be synchronous: a queued emit returns before the
+        # worker has actually closed its handle, so the immediate
+        # r+ open downstream of every caller (clear_peaks, the
+        # pipeline run, save-as, peak-CSV export) would race the
+        # release. BlockingQueuedConnection blocks the GUI thread
+        # until the worker's release() slot has returned and the
+        # handle is provably closed.
         if self._prefetch_worker is not None:
-            self._prefetchRelease.emit()
+            QMetaObject.invokeMethod(
+                self._prefetch_worker,
+                "release",
+                Qt.ConnectionType.BlockingQueuedConnection,
+            )
 
     def _reattach_silx_tree(self) -> None:
         """Re-insert every session's files + reopen the viewer's

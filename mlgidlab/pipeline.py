@@ -54,6 +54,27 @@ def execute(file_path: Path, command: PipelineCommand) -> Any:
 
     from mlgidbase import mlgidBASE  # noqa: N814
 
+    # Pre-flight: refuse to invoke mlgidBASE when the file has a
+    # top-level group pygid can't handle. ``pygid.NexusFile`` iterates
+    # every root key and unconditionally opens ``/<name>/data``, so a
+    # single raw-style or stray-metadata group at the top level brings
+    # down the whole open with an opaque ``KeyError: "object 'data'
+    # doesn't exist"`` deep inside h5py. Surface a clear, actionable
+    # error instead — naming the offending groups — so the user can
+    # remove / rename them rather than chasing the h5py stack.
+    from mlgidlab.file_model import list_pygid_incompatible_top_level
+    bad = list_pygid_incompatible_top_level(file_path)
+    if bad:
+        raise RuntimeError(
+            f"Cannot run {command.op_name!r}: {Path(file_path).name} "
+            f"contains top-level group(s) that pygid cannot read — "
+            f"each entry must expose a /data subgroup with a valid "
+            f"'signal' attribute. Offending: "
+            f"{', '.join(repr(n) for n in bad)}. Remove or rename "
+            f"them, or open the source raw file via the Conversion "
+            f"workflow to produce a proper NeXus output."
+        )
+
     # Some labeled training files (e.g. ``organic_labeled.h5``) carry
     # fitted_peaks rows that only have polar coordinates — Cartesian
     # ``q_xy`` / ``q_z`` and ``amplitude`` are stored as zeros. mlgidmatch

@@ -166,6 +166,47 @@ def list_entry_signals(file_path: Path) -> dict[str, str | None]:
     return out
 
 
+def list_pygid_incompatible_top_level(file_path: Path) -> list[str]:
+    """Return top-level group names that would crash ``pygid.NexusFile``.
+
+    pygid's ``NexusFile.read_structure`` iterates *every* top-level
+    group with ``for entry in root`` and unconditionally indexes
+    ``root[f"/{entry}/data"]`` (see
+    ``pygid/nexus_reader.py::get_entry_type``) so HDF5 refuses
+    to open with ``KeyError: "object 'data' doesn't exist"`` the
+    moment any top-level group lacks a ``data`` child. This trips on:
+
+      - raw detector files whose layout is ``/entry/data0/image``
+        rather than ``/entry/data/...`` (the user "opened raw as
+        NeXus" mistake), and
+      - mixed files where an extra metadata / log / calibration
+        group was added next to the entries.
+
+    A group counts as incompatible when either ``/<name>/data`` is
+    missing or its ``signal`` attribute names a dataset that isn't
+    actually present under ``/<name>/data``. The check mirrors the
+    two lookups pygid performs in ``get_entry_type``: the ``/data``
+    open and the ``/data/<signal>`` shape probe.
+    """
+    bad: list[str] = []
+    with h5py.File(file_path, "r") as f:
+        for name in f.keys():
+            obj = f.get(name)
+            if not isinstance(obj, h5py.Group):
+                bad.append(name)
+                continue
+            data = obj.get("data")
+            if not isinstance(data, h5py.Group):
+                bad.append(name)
+                continue
+            signal = data.attrs.get("signal")
+            if isinstance(signal, bytes):
+                signal = signal.decode("utf-8", errors="replace")
+            if not isinstance(signal, str) or signal not in data:
+                bad.append(name)
+    return bad
+
+
 def load_entry(file_path: Path, entry: str) -> EntryStack:
     """Open one entry as a lazily-readable stack.
 
