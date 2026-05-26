@@ -632,12 +632,39 @@ def _exp_params_from_nexus(
         c = 299792458.0
         eV = 1.602176634e-19
         en = (h * c / wl_m) / eV if wl_m > 0 else defaults["en"]
+        # F-02 guard. Plausible X-ray energies sit between ~1 keV
+        # (soft, e.g. tender X-ray near 1.5 nm) and ~200 keV (hard
+        # X-ray, beyond which we are into γ territory). Anything
+        # outside that bracket means either:
+        #   * the wavelength datum is malformed (wrong units, e.g.
+        #     stored in Å rather than m → en under 1 keV by 1e10),
+        #   * pygidsim has silently changed its ``en`` contract from
+        #     eV to keV (would shrink en 1000x and trip the lower
+        #     bound) — this is the divergence risk the physics audit
+        #     calls out.
+        # In either case, fail loud here rather than feed a wrong
+        # wavelength into the CIF pattern simulation and produce
+        # plausible-looking but physically invalid matches.
+        if wl_m > 0 and not (1e3 <= en <= 2e5):
+            raise _EnergyOutOfRangeError(
+                f"Photon energy derived from "
+                f"{nexus_file.name}/{entry_name}/instrument/monochromator/"
+                f"wavelength={wl_m:.6e} m is en={en:.4g} eV, outside the "
+                f"plausible 1-200 keV X-ray range (1e3-2e5 eV). Inspect "
+                f"the wavelength datum, or check that pygidsim still "
+                f"expects ``en`` in eV (physics-audit finding F-02)."
+            )
         return ExpParameters(
             q_xy_max=q_xy_max,
             q_z_max=q_z_max,
             ai=ai,
             en=en,
         )
+    except _EnergyOutOfRangeError:
+        # Re-raise instead of swallowing — this is a hard physics
+        # validation error, not a "metadata happens to be missing"
+        # case that the silent defaults fallback covers.
+        raise
     except Exception:
         logger.debug("suppressed exception in _exp_params_from_nexus", exc_info=True)
         return ExpParameters(**defaults)
