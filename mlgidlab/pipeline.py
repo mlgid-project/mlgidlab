@@ -129,6 +129,45 @@ def execute(file_path: Path, command: PipelineCommand) -> Any:
                 file_path, exc,
             )
 
+    # Physics-audit F-04 closure: invalidate every ``matched_*`` row
+    # on the scope we're about to refit. pygidFIT replaces an entry's
+    # ``fitted_peaks`` wholesale and gives no index-stability
+    # guarantee — old ``peak_list`` integer indices that survive
+    # ``load_matched_peaks``'s read-side clamp (``file_model.py``)
+    # could silently mis-render against re-ordered fitted positions.
+    # Clearing matches before the run gives the user a clean slate
+    # and forces a deliberate re-match. The clear lands in the same
+    # write window as the silx detach the caller has already done.
+    if command.op_name == "run_fitting":
+        try:
+            from mlgidlab.file_model import clear_peaks
+            entry_arg = command.kwargs.get("entry")
+            frame_arg = command.kwargs.get("frame_num")
+            frame_to_clear = int(frame_arg) if isinstance(frame_arg, int) else None
+            if isinstance(entry_arg, str) and entry_arg:
+                entries_to_clear = [entry_arg]
+            else:
+                entries_to_clear = list_entries(file_path)
+            total_removed = 0
+            for ent in entries_to_clear:
+                total_removed += clear_peaks(
+                    file_path, ent, "matched", frame=frame_to_clear
+                )
+            if total_removed > 0:
+                logging.getLogger("mlgidBASE").info(
+                    "Invalidated %d stale matched-peak row(s) before "
+                    "run_fitting on %s (physics-audit F-04: "
+                    "fitted_peaks rewrite breaks peak_list index "
+                    "stability).",
+                    total_removed, Path(file_path).name,
+                )
+        except Exception as exc:
+            logging.getLogger("mlgidBASE").warning(
+                "Could not invalidate matched solutions before "
+                "run_fitting on %s: %s",
+                Path(file_path).name, exc,
+            )
+
     # Import lazily — see the function docstring. Every pre-flight
     # above must be able to run on a CI box that lacks the private
     # ``mlgidbase`` backend.
@@ -612,38 +651,114 @@ def _exp_params_from_nexus(
     runs against the wrong wavelength and matching silently returns
     "no solutions". When ``entry`` is None, the alphabetically-first
     entry is used as a fallback (preserves previous behaviour for
-    callers that don't yet plumb through an entry name). Falls back
-    to ExpParameters() defaults when any value is missing.
+    callers that don't yet plumb through an entry name).
+
+    Per-field fallbacks (physics-audit F-05 closure). Each datum is
+    read independently; if any one is missing or unreadable, only
+    that field falls back to its plausible default and a structured
+    ``WARNING`` log line is emitted naming the substituted fields,
+    the entry, and the file. The pipeline-panel log handler renders
+    these warnings prominently, so a matching run on a file with
+    incomplete instrument metadata is no longer silently physically
+    wrong — the user is told exactly which geometry was guessed.
     """
     from pygidsim.experiment import ExpParameters
 
     defaults = dict(q_xy_max=2.7, q_z_max=2.7, ai=0.3, en=18000.0)
+
+    import h5py
+    import numpy as np
+
+    from mlgidlab.file_model import is_entry_group_name
+
+    # File / entry resolution: any failure at this layer is whole-
+    # file-level (path bad, no q-entries inside) and falls back to
+    # the full defaults dict. This is qualitatively different from
+    # per-field fallback — a single warning naming the file is the
+    # right granularity.
     try:
-        import h5py
-        import numpy as np
-
-        from mlgidlab.file_model import is_entry_group_name
-
-        with h5py.File(nexus_file, "r") as f:
+        h5_handle = h5py.File(nexus_file, "r")
+    except OSError as exc:
+        logger.warning(
+            "Geometry fallback: could not open %s (%s); "
+            "using ExpParameters defaults %r for the matching run.",
+            nexus_file, exc, defaults,
+        )
+        return ExpParameters(**defaults)
+    try:
+        with h5_handle as f:
             if entry is not None and entry in f:
                 entry_name = entry
+            elif entry is not None:
+                logger.warning(
+                    "Geometry fallback: entry %r not present in %s; "
+                    "using ExpParameters defaults %r for the matching run.",
+                    entry, nexus_file.name, defaults,
+                )
+                return ExpParameters(**defaults)
             else:
                 entry_names = sorted(
                     k for k in f.keys() if is_entry_group_name(k)
                 )
                 if not entry_names:
+                    logger.warning(
+                        "Geometry fallback: no entry groups in %s; "
+                        "using ExpParameters defaults %r for the matching run.",
+                        nexus_file.name, defaults,
+                    )
                     return ExpParameters(**defaults)
                 entry_name = entry_names[0]
             grp = f[entry_name]
-            q_xy_max = float(np.max(np.abs(grp["data/q_xy"][()])))
-            q_z_max = float(np.max(np.abs(grp["data/q_z"][()])))
-            wl_m = float(np.asarray(grp["instrument/monochromator/wavelength"]).ravel()[0])
-            ai = float(np.asarray(grp["instrument/angle_of_incidence"]).ravel()[0])
-        # h*c / λ in eV — physical constants are exact in SI 2019.
-        h = 6.62607015e-34
-        c = 299792458.0
-        eV = 1.602176634e-19
-        en = (h * c / wl_m) / eV if wl_m > 0 else defaults["en"]
+
+            # Per-field reads. ``fallbacks`` tracks (field, reason)
+            # tuples so the warning log line can name exactly which
+            # parameters were guessed and why.
+            fallbacks: list[tuple[str, str]] = []
+
+            def _read_scalar(rel_path: str, field: str):
+                try:
+                    return float(np.asarray(grp[rel_path]).ravel()[0])
+                except Exception as inner:
+                    fallbacks.append((field, f"could not read {rel_path}: {inner}"))
+                    return None
+
+            def _read_axis_max(rel_path: str, field: str):
+                try:
+                    return float(np.max(np.abs(grp[rel_path][()])))
+                except Exception as inner:
+                    fallbacks.append((field, f"could not read {rel_path}: {inner}"))
+                    return None
+
+            q_xy_max = _read_axis_max("data/q_xy", "q_xy_max")
+            q_z_max = _read_axis_max("data/q_z", "q_z_max")
+            wl_m = _read_scalar("instrument/monochromator/wavelength", "wavelength")
+            ai = _read_scalar("instrument/angle_of_incidence", "ai")
+    except _EnergyOutOfRangeError:
+        raise  # never set here — defensive against future restructures
+    except Exception as exc:
+        # File was opened but a structural read past the entry pick
+        # itself failed — e.g. the entry's ``data`` group is missing
+        # entirely. Surface as one whole-file warning.
+        logger.warning(
+            "Geometry fallback: structural read failed on %s (%s); "
+            "using ExpParameters defaults %r for the matching run.",
+            nexus_file.name, exc, defaults,
+        )
+        return ExpParameters(**defaults)
+
+    # h*c / λ in eV — physical constants are exact in SI 2019.
+    h = 6.62607015e-34
+    c = 299792458.0
+    eV = 1.602176634e-19
+    if wl_m is None or wl_m <= 0:
+        en = defaults["en"]
+        if wl_m is None:
+            # already in fallbacks via _read_scalar
+            pass
+        else:
+            fallbacks.append(("en", f"wavelength {wl_m} not positive"))
+    else:
+        en = (h * c / wl_m) / eV
         # F-02 guard. Plausible X-ray energies sit between ~1 keV
         # (soft, e.g. tender X-ray near 1.5 nm) and ~200 keV (hard
         # X-ray, beyond which we are into γ territory). Anything
@@ -657,7 +772,7 @@ def _exp_params_from_nexus(
         # In either case, fail loud here rather than feed a wrong
         # wavelength into the CIF pattern simulation and produce
         # plausible-looking but physically invalid matches.
-        if wl_m > 0 and not (1e3 <= en <= 2e5):
+        if not (1e3 <= en <= 2e5):
             raise _EnergyOutOfRangeError(
                 f"Photon energy derived from "
                 f"{nexus_file.name}/{entry_name}/instrument/monochromator/"
@@ -666,17 +781,33 @@ def _exp_params_from_nexus(
                 f"the wavelength datum, or check that pygidsim still "
                 f"expects ``en`` in eV (physics-audit finding F-02)."
             )
-        return ExpParameters(
-            q_xy_max=q_xy_max,
-            q_z_max=q_z_max,
-            ai=ai,
-            en=en,
+
+    # Apply per-field defaults for anything that did not read.
+    if q_xy_max is None:
+        q_xy_max = defaults["q_xy_max"]
+    if q_z_max is None:
+        q_z_max = defaults["q_z_max"]
+    if ai is None:
+        ai = defaults["ai"]
+
+    if fallbacks:
+        # One structured WARNING per call — the pipeline panel log
+        # surfaces these prominently. Naming each substituted field
+        # is the F-05 closure: the user knows which geometry was
+        # guessed and which datum to fix in the NeXus file.
+        substituted = ", ".join(f"{name}={defaults.get(name, '?')!r}" for name, _ in fallbacks)
+        reasons = "; ".join(f"{name}: {reason}" for name, reason in fallbacks)
+        logger.warning(
+            "Geometry fallback in %s/%s: substituted %s. Reasons: %s. "
+            "Matching will run against these default values; results "
+            "may be physically invalid if the real geometry differs "
+            "(physics-audit finding F-05).",
+            nexus_file.name, entry_name, substituted, reasons,
         )
-    except _EnergyOutOfRangeError:
-        # Re-raise instead of swallowing — this is a hard physics
-        # validation error, not a "metadata happens to be missing"
-        # case that the silent defaults fallback covers.
-        raise
-    except Exception:
-        logger.debug("suppressed exception in _exp_params_from_nexus", exc_info=True)
-        return ExpParameters(**defaults)
+
+    return ExpParameters(
+        q_xy_max=q_xy_max,
+        q_z_max=q_z_max,
+        ai=ai,
+        en=en,
+    )

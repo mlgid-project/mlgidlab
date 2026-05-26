@@ -834,6 +834,13 @@ def load_matched_peaks(
                 idx = np.asarray(arr["peak_list"][i], dtype=int)
                 # Tolerate stale matches: drop indices that no longer exist
                 # in fitted_peaks (e.g. fitting was re-run after matching).
+                # Physics-audit F-04 is closed at the *write* side — the
+                # ``pipeline.execute`` pre-flight clears matched_* on every
+                # entry/frame before run_fitting rewrites fitted_peaks, so
+                # this clamp should never fire on files produced by the
+                # current GUI. Kept as defence-in-depth for files written
+                # by older GUI builds (or external tooling) where matches
+                # may still reference stale fitted positions.
                 idx = idx[(idx >= 0) & (idx < n_fit)]
                 if idx.size == 0:
                     continue
