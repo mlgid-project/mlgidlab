@@ -67,6 +67,7 @@ from silx.gui.hdf5 import Hdf5TreeModel, Hdf5TreeView
 from silx.gui.hdf5.NexusSortFilterProxyModel import NexusSortFilterProxyModel
 
 from mlgidlab import file_model
+from mlgidlab.fit import fit_gaussian_anchored
 from mlgidlab.image_viewer import (
     GIWAXSImageViewer,
     MATCHED_STYLE,
@@ -84,7 +85,7 @@ from mlgidlab.pipeline import (
     is_mlgidbase_available,
 )
 from mlgidlab.pipeline_panel import PipelinePanel
-from mlgidlab.profile_viewer import ProfileViewer
+from mlgidlab.profile_viewer import FITTED_FIT_REGION_FACTOR, ProfileViewer
 from mlgidlab.conversion_panel import ConversionPanel
 from mlgidlab.session import BaseSession, NexusSession, RawSession, Session
 from mlgidlab.workers import (
@@ -126,6 +127,8 @@ def _make_color_swatch(color: str, width: int = 26, height: int = 12) -> QPixmap
     return _make_pen_swatch(
         {"color": color, "style": MATCHED_STYLE["style"]}, width, height
     )
+
+
 
 
 class _MlgidHdf5TreeModel(Hdf5TreeModel):
@@ -586,6 +589,13 @@ class MainWindow(QMainWindow):
         self._ring_pre_geom: tuple[
             ManualPeak, float, float, float, float, bool
         ] | None = None
+
+        # 2D-preview cache: (fingerprint, ManualFitResult | None).
+        # Fingerprint is the user-controlled inputs to the live
+        # pygidfit call; identical fingerprint → reuse the cached
+        # result instead of rerunning the (slow) 2D fit. Cleared
+        # when a fresh entry / session / file load happens.
+        self._2d_preview_cache: tuple[tuple, object] | None = None
 
         self.setWindowTitle(APP_NAME)
         self.resize(1400, 900)
@@ -2398,6 +2408,17 @@ class MainWindow(QMainWindow):
         self.viewer.selectionChanged.connect(self._forward_selection_to_profile)
         self.viewer.peakGeometryChanged.connect(self._forward_geom_to_profile)
         self.profile_viewer.peakGeometryChanged.connect(self.viewer.update_peak_geometry_external)
+        # Detected-peak profile region drag — live updates flow into
+        # the viewer's in-memory PeakTable so the colored overlay
+        # tracks the drag; the disk write fires once on drag-end via
+        # _on_detected_border_commit (mirrors how the image-side ROI
+        # drag commits via peakRowWriteRequested).
+        self.profile_viewer.detectedPeakGeometryChanged.connect(
+            self.viewer.update_detected_geometry_external
+        )
+        self.profile_viewer.detectedPeakBorderCommit.connect(
+            self._on_detected_border_commit
+        )
         # The faint fitted-preview box for the selected manual peak follows
         # the profile viewer's 1D Gaussian fits. It also has to drop when
         # the selection changes away from a manual peak.
@@ -2428,6 +2449,35 @@ class MainWindow(QMainWindow):
         # toggles ring/segment — otherwise the preview would lag until
         # the next fit recompute.
         self.parameter_panel.saveAsRingChanged.connect(self._on_save_as_ring_changed)
+        # Flipping the 1D / 2D fit-mode radios changes how the dashed
+        # cyan preview's box widths are computed — re-invoke the
+        # preview slot with the cached 1D fits so the box redraws at
+        # the new mode's convention immediately, instead of lagging
+        # until the next fit recompute (frame change, ROI drag, etc.).
+        self.parameter_panel.fitModeChanged.connect(self._on_fit_mode_changed)
+        # Live 2D preview: run pygidfit on selection / frame / mode
+        # changes so the profile fits + cyan box mirror what
+        # Add-to-fitted (2D) will save. Selection already calls
+        # ``_refresh_2d_preview`` via ``_on_selection_for_preview``;
+        # also wire frame + mode + ring so all four user-triggers
+        # refresh the override.
+        self.viewer.frameChanged.connect(
+            lambda _f: self._refresh_2d_preview()
+        )
+        self.parameter_panel.fitModeChanged.connect(
+            lambda _m: self._refresh_2d_preview()
+        )
+        self.parameter_panel.saveAsRingChanged.connect(
+            lambda _r: self._refresh_2d_preview()
+        )
+        # ROI drag-end: the user repositions a manual / detected box
+        # to a new peak. ``peakGeometryChanged`` fires per drag tick
+        # (too slow for pygidfit), ``peakGeometryDragFinished`` fires
+        # once after the handle settles. Cache fingerprint includes
+        # the geometry, so the next refresh is a real recompute.
+        self.viewer.peakGeometryDragFinished.connect(
+            lambda _sel: self._refresh_2d_preview()
+        )
         self.parameter_panel.deletePeakRequested.connect(
             lambda: self._on_delete_peak_requested(self.viewer.selected_peak)
         )
@@ -3792,48 +3842,319 @@ class MainWindow(QMainWindow):
             return
         self.profile_viewer.sync_regions_from_peak(sel)
 
+    def _on_detected_border_commit(self, sel: SelectedPeak) -> None:
+        """Persist a detected-peak border drag from the profile viewer
+        to ``detected_peaks`` on disk.
+
+        Funnels through the same ``_on_peak_row_write_requested`` slot
+        the image-side ROI drag uses — it owns the silx detach /
+        update_peak_row / matched cascade dance. The profile-side
+        drag merely fires this commit signal at drag-end; everything
+        else (live overlay sync, in-memory PeakTable mutation,
+        ``q_xy``/``q_z`` recompute) has already happened during the
+        live drag via ``update_detected_geometry_external``.
+        """
+        polar = {
+            "radius": float(sel.radius),
+            "angle": float(sel.angle),
+            "radius_width": float(sel.radius_width),
+            "angle_width": float(sel.angle_width),
+        }
+        self._on_peak_row_write_requested(
+            int(sel.frame), "detected", int(sel.peak_id), polar,
+        )
+
     def _on_selection_for_preview(self, sel: SelectedPeak | None) -> None:
         """Drop the fitted-preview overlay when the active selection isn't
         a candidate-for-fitted peak. Manual + detected are both candidates
         — Add-to-fitted is enabled for either — so the preview is shown
         for both kinds. Fitted / matched already have a stored box, so a
         cyan refit overlay there would be visual noise.
+
+        Also kicks ``_refresh_2d_preview`` so the pygidfit override
+        on the profile viewer follows the new selection.
         """
         if sel is None or sel.kind not in ("manual", "detected"):
             self.viewer.set_fitted_preview(None, None, None, None)
+        self._refresh_2d_preview()
+
+    def _refresh_2d_preview(self) -> None:
+        """Run pygidfit on the active selection (in 2D mode) and push
+        pygidfit's refined box + projected 1D Gaussians to the
+        profile viewer as a single coherent override.
+
+        In 2D mode the user wants the radial / angular profile fit
+        curves AND the underlying grey integrated trace AND the
+        cyan dashed preview box to all reflect pygidfit's refined
+        box — same centre, same widths, one coherent view of what
+        ``_build_fitted_row_2d`` will save. We achieve this by
+        passing three pieces of state into
+        ``profile_viewer.set_2d_preview(box, rfit, afit)``:
+
+        * ``box`` controls the integration slicing in
+          ``_recompute_curves`` (grey trace).
+        * ``rfit`` / ``afit`` control the projected-Gaussian pink
+          curves and downstream consumers via ``fitParamsChanged``
+          (parameter panel readout, cyan image-side preview box).
+
+        Wired to ``viewer.selectionChanged``,
+        ``viewer.frameChanged``, ``parameter_panel.fitModeChanged``,
+        ``parameter_panel.saveAsRingChanged``. The pygidfit result
+        is cached by ``(file, entry, frame, sel geometry)`` so
+        repeated triggers don't re-pay the ~100-500 ms cost.
+
+        Cleared (``set_2d_preview(None, None, None)``) when 2D mode
+        doesn't apply or pygidfit fails — profile viewer reverts to
+        scipy 1D + user-box integration + draggable regions.
+        """
+        sel = self.viewer.selected_peak
+        save_as_ring = self.parameter_panel.save_as_ring()
+        is_2d = self.parameter_panel.fit_mode() == ParameterPanel.FIT_MODE_2D
+        # Ring forces 1D in ``fit_mode()`` already; the ``save_as_ring``
+        # guard here is defensive (mode is False in ring → caught by
+        # is_2d).
+        applies = (
+            is_2d
+            and not save_as_ring
+            and sel is not None
+            and sel.kind in ("manual", "detected")
+            and self.session is not None
+            and self._pipe_thread is None
+        )
+        if not applies:
+            self.profile_viewer.set_2d_preview(None, None, None)
+            return
+
+        entry = self.entry_combo.currentText()
+        if not entry:
+            self.profile_viewer.set_2d_preview(None, None, None)
+            return
+        frame = self.viewer.current_frame
+
+        # Fingerprint the inputs so repeated calls (e.g. cursor moves
+        # that re-emit signals downstream) don't rerun the slow
+        # pygidfit call. Frame data + geometry + fit kwargs are all
+        # entry+frame derived, so (entry, frame, sel geometry) is a
+        # safe key.
+        fp = (
+            self.session.temp_path,
+            entry,
+            int(frame),
+            sel.kind,
+            int(sel.peak_id) if sel.peak_id is not None else -1,
+            float(sel.radius), float(sel.radius_width),
+            float(sel.angle), float(sel.angle_width),
+        )
+        if self._2d_preview_cache is not None and self._2d_preview_cache[0] == fp:
+            fit_2d = self._2d_preview_cache[1]
+        else:
+            fit_2d, _err = self._run_pygidfit_for_selection(sel, entry, frame)
+            self._2d_preview_cache = (fp, fit_2d)
+        if fit_2d is None:
+            # pygidfit failed for this box — clear the override so
+            # the scipy 1D fit shows up (still useful for the user
+            # to see *something*) and let the eventual Add-to-fitted
+            # click surface the failure reason.
+            self.profile_viewer.set_2d_preview(None, None, None)
+            return
+
+        # pygidfit's ``radius_width`` / ``angle_width`` are ``2σ``
+        # (pipeline convention) — divide by 2 to recover σ.
+        sigma_r = float(fit_2d.radius_width) / 2.0
+        sigma_a = float(fit_2d.angle_width) / 2.0
+
+        # Render + fit the pink curves over a window scaled to the
+        # FITTED box (``FITTED_FIT_REGION_FACTOR / 2 × 2σ``), not the
+        # user-drawn ROI. Keeps the Gaussian's tails visible even
+        # when pygidfit refines the box much narrower than the user
+        # drew, and gives the linear-bg term enough context to
+        # converge.
+        render_r = (
+            float(fit_2d.radius)
+            - 0.5 * FITTED_FIT_REGION_FACTOR * float(fit_2d.radius_width),
+            float(fit_2d.radius)
+            + 0.5 * FITTED_FIT_REGION_FACTOR * float(fit_2d.radius_width),
+        )
+        render_a = (
+            float(fit_2d.angle)
+            - 0.5 * FITTED_FIT_REGION_FACTOR * float(fit_2d.angle_width),
+            float(fit_2d.angle)
+            + 0.5 * FITTED_FIT_REGION_FACTOR * float(fit_2d.angle_width),
+        )
+
+        radius_axis = self.profile_viewer.radius_axis()
+        angle_axis = self.profile_viewer.angle_axis()
+        # Integrate the polar image over pygidfit's refined box —
+        # the SAME box ``_recompute_curves`` will use once
+        # ``set_2d_preview`` runs below. Reading the previously-
+        # cached trace (still sliced over the user's ROI) would
+        # fit the pink curve to a different dataset than the user
+        # sees, which was the visible undershoot.
+        box = (
+            float(fit_2d.radius), float(fit_2d.radius_width),
+            float(fit_2d.angle), float(fit_2d.angle_width),
+        )
+        radial_data, angular_data = self.profile_viewer.integrate_over_box(
+            box,
+        )
+
+        # Anchored fit: centre and sigma allowed to drift within a
+        # bounded neighbourhood of pygidfit's values, amplitude +
+        # linear background fit freely. The bounded drift lets the
+        # pink curve realign on the 1D-projected data peak when
+        # pygidfit's 2D centroid differs (theta ≠ 0, asymmetric
+        # peaks, mlgidlab/pygidfit polar-grid interpolation
+        # mismatch). Cyan box width may differ from the saved blue
+        # box by up to the chosen tolerance; the user accepted that
+        # trade-off for a visually clean overlay.
+        rfit = None
+        if radius_axis is not None and radial_data is not None:
+            rfit = fit_gaussian_anchored(
+                radius_axis, radial_data,
+                center=float(fit_2d.radius),
+                sigma=sigma_r,
+                center_drift=0.5 * sigma_r,
+                sigma_factor=1.2,
+                fit_range=render_r,
+                render_range=render_r,
+            )
+        afit = None
+        if angle_axis is not None and angular_data is not None:
+            afit = fit_gaussian_anchored(
+                angle_axis, angular_data,
+                center=float(fit_2d.angle),
+                sigma=sigma_a,
+                center_drift=0.5 * sigma_a,
+                sigma_factor=1.2,
+                fit_range=render_a,
+                render_range=render_a,
+            )
+        self.profile_viewer.set_2d_preview(box, rfit, afit)
 
     def _update_fitted_preview(self, rfit, afit) -> None:
-        """Sync the viewer's fitted-preview box to the latest 1D fits.
+        """Sync the viewer's fitted-preview box to the latest fit params.
 
-        Relevant for manual + detected selections — both feed Add-to-fitted.
-        File-resident fitted / matched peaks already carry their stored box
-        and aren't previewed here. ``rfit`` / ``afit`` may be ``None`` (no
-        convergence) → clear the preview unless we're previewing a ring,
-        in which case only ``rfit`` matters.
+        Relevant for manual + detected selections — both feed
+        Add-to-fitted. File-resident fitted / matched peaks already
+        carry their stored box and aren't previewed here.
+
+        Mode-dependent — cyan box always matches what the
+        corresponding commit path will save:
+
+        * **2D mode**: cyan paints at pygidfit's *exact* box
+          (``radius, radius_width, angle, angle_width`` straight
+          from the cached ``ManualFitResult``). The pink profile
+          curve is allowed to drift slightly via the anchored fit
+          for visual cleanliness; that drift must not leak into
+          the cyan box, which the user expects to match the saved
+          blue box exactly.
+        * **1D mode** (or ring, which forces 1D): cyan paints at
+          ``(scipy_centre, 2σ_scipy)`` per axis — same convention
+          ``_build_fitted_row_1d`` saves (``radius_width = FWHM ×
+          1/√(2 ln 2)``). Per-axis fallback to the selected peak's
+          drawn box when scipy hasn't converged.
+
+        The pygidfit cache outlives a mode toggle, so the 2D-mode
+        branch is gated on the live ``fit_mode()`` reading — without
+        that gate, switching from 2D to 1D would briefly paint cyan
+        at pygidfit's box even though the next commit would use
+        scipy's geometry.
         """
         sel = self.viewer.selected_peak
         if sel is None or sel.kind not in ("manual", "detected"):
             self.viewer.set_fitted_preview(None, None, None, None)
             return
         save_as_ring = self.parameter_panel.save_as_ring()
-        if rfit is None:
-            self.viewer.set_fitted_preview(None, None, None, None)
-            return
+        # Ring forces 1D in ``fit_mode()``; defensive check here keeps
+        # the 2D-cyan-box branch off when the user has ring on but the
+        # 2D-preview cache hasn't yet been cleared for the new state.
+        is_2d_mode = (
+            self.parameter_panel.fit_mode() == ParameterPanel.FIT_MODE_2D
+            and not save_as_ring
+        )
+
+        fwhm_to_2sigma = 1.0 / float(np.sqrt(2.0 * np.log(2.0)))
+
+        # 2D mode + a cached pygidfit result on the current selection:
+        # paint the cyan box at pygidfit's *exact* geometry instead of
+        # the anchored-fit ``rfit``/``afit``. The pink profile curve
+        # was deliberately allowed to drift (centre ±0.5σ, sigma ×1.2)
+        # so it sits clean on the data; that drift must NOT leak into
+        # the image-side cyan box, which the user expects to match
+        # the saved blue box exactly. Skipped in 1D mode because the
+        # pygidfit cache can persist after a mode switch — 1D commit
+        # uses scipy's fit, so cyan must follow rfit/afit there.
+        if is_2d_mode:
+            pygidfit_box = self._current_pygidfit_box_for_selection(sel)
+            if pygidfit_box is not None:
+                fr, fdr, fa, fda = pygidfit_box
+                self.viewer.set_fitted_preview(
+                    fr, fdr, fa, fda, is_ring=False,
+                )
+                return
+
+        if rfit is not None:
+            center_r = float(rfit.center)
+            width_r = float(rfit.fwhm) * fwhm_to_2sigma
+        else:
+            center_r = float(sel.radius)
+            width_r = float(sel.radius_width)
+
         if save_as_ring:
-            # Angular fit isn't required for rings — pass placeholders.
+            # Ring sentinel — the painter ignores the angular args.
+            # Ring forces 1D so the cached pygidfit result is never
+            # used here; the radial width comes from scipy's rfit.
             self.viewer.set_fitted_preview(
-                float(rfit.center), float(rfit.fwhm),
-                None, None,
-                is_ring=True,
+                center_r, width_r, None, None, is_ring=True,
             )
             return
-        if afit is None:
-            self.viewer.set_fitted_preview(None, None, None, None)
-            return
+
+        if afit is not None:
+            center_a = float(afit.center)
+            width_a = float(afit.fwhm) * fwhm_to_2sigma
+        else:
+            center_a = float(sel.angle)
+            width_a = float(sel.angle_width)
+
         self.viewer.set_fitted_preview(
-            float(rfit.center), float(rfit.fwhm),
-            float(afit.center), float(afit.fwhm),
-            is_ring=False,
+            center_r, width_r, center_a, width_a, is_ring=False,
+        )
+
+    def _current_pygidfit_box_for_selection(
+        self, sel: SelectedPeak,
+    ) -> tuple[float, float, float, float] | None:
+        """Return pygidfit's refined box for ``sel`` if cached, else None.
+
+        The 2D-preview cache keyed by ``(file, entry, frame, sel
+        geometry)`` is built in ``_refresh_2d_preview``. If the cache
+        entry matches the current ``sel`` and holds a non-None
+        ``ManualFitResult``, return its ``(r, dr, a, da)``. Otherwise
+        return None — caller falls back to the rfit/afit-driven cyan
+        box (the 1D-mode / no-pygidfit-yet path).
+        """
+        if self._2d_preview_cache is None:
+            return None
+        if self.session is None:
+            return None
+        entry = self.entry_combo.currentText()
+        if not entry:
+            return None
+        frame = self.viewer.current_frame
+        fp = (
+            self.session.temp_path,
+            entry,
+            int(frame),
+            sel.kind,
+            int(sel.peak_id) if sel.peak_id is not None else -1,
+            float(sel.radius), float(sel.radius_width),
+            float(sel.angle), float(sel.angle_width),
+        )
+        cache_fp, fit_2d = self._2d_preview_cache
+        if cache_fp != fp or fit_2d is None:
+            return None
+        return (
+            float(fit_2d.radius), float(fit_2d.radius_width),
+            float(fit_2d.angle), float(fit_2d.angle_width),
         )
 
     def _on_save_as_ring_changed(self, is_ring: bool) -> None:
@@ -3913,6 +4234,18 @@ class MainWindow(QMainWindow):
         # Drop the angular fit *before* recomputing the preview so the
         # cached afit is None when _update_fitted_preview reads it.
         self.profile_viewer.set_skip_angular_fit(is_ring)
+        fits = self.profile_viewer.last_fit_params()
+        self._update_fitted_preview(fits.get("radial"), fits.get("angular"))
+
+    def _on_fit_mode_changed(self, _mode: str) -> None:
+        """Re-render the cyan preview when the user flips 1D ↔ 2D.
+
+        The preview is only painted in 1D mode (see
+        ``_update_fitted_preview``); flipping to 2D hides it,
+        flipping back shows it. Without this hook the on-screen
+        state wouldn't update until the next ROI / frame /
+        selection change.
+        """
         fits = self.profile_viewer.last_fit_params()
         self._update_fitted_preview(fits.get("radial"), fits.get("angular"))
 
@@ -4333,14 +4666,29 @@ class MainWindow(QMainWindow):
         self._on_pipeline_run(self.session.temp_path, PipelineCommand("add_peak", kwargs))
 
     def _on_add_to_fitted(self) -> None:
-        """Append a row to fitted_peaks using the profile viewer's 1D fits.
+        """Append a row to fitted_peaks for the active manual / detected box.
 
-        Accepts the active selection when ``kind`` is manual or detected —
-        both are candidate boxes whose 1D fit is the natural input for
-        fitted_peaks. Geometry comes from the radial / angular Gaussian
-        centers (and FWHMs); amplitude from the radial fit. Fields not
-        measurable from 1D fits (theta, A, B, C, score) get zeroed —
-        downstream code that needs them should re-run the proper 2D fit.
+        Dispatches strictly on ``parameter_panel.fit_mode()``:
+
+        * ``FIT_MODE_2D`` (pygidfit) → route through
+          ``manual_fit.fit_one_peak``; the persisted row carries real
+          A/B/C/theta shape coefficients — identical to what the
+          pipeline ``run_fitting`` writes for the same box.
+        * ``FIT_MODE_1D`` (legacy scipy) → use the profile viewer's
+          cached 1D fits + zero-fill the 2D shape coefficients. Width
+          convention matches the 2D path so saved boxes render
+          identically: ``radius_width = angle_width = 2σ ≈ 0.849 ×
+          FWHM`` (see ``_build_fitted_row_1d``).
+
+        Ring storage forces 1D regardless of the radio (pygidfit's
+        segment model can't fit rings — the ring saved row uses
+        ``angle = 45°``, ``angle_width = ∞``).
+
+        Strict failure: if the chosen mode can't produce a fit (1D
+        without scipy convergence, or 2D with pygidfit raising / NaN /
+        missing geometry), the user gets a clear error naming both
+        the chosen mode and the reason — no silent fall-back to the
+        other mode. Physics-audit finding F-06 closure.
         """
         if self.session is None or self._pipe_thread is not None:
             return
@@ -4348,60 +4696,35 @@ class MainWindow(QMainWindow):
         entry = self.entry_combo.currentText()
         if sel is None or sel.kind not in ("manual", "detected") or not entry:
             return
-        # The ring/segment toggle in the parameter panel decides which
-        # storage convention to use — defaults to the source's is_ring on
-        # selection but the user can flip it before clicking. For rings,
-        # the angular fit is irrelevant (and frequently undefined) so we
-        # only require the radial fit.
         save_as_ring = self.parameter_panel.save_as_ring()
         frame = self.viewer.current_frame
+        # ``fit_mode()`` already collapses to FIT_MODE_1D when ring is
+        # checked, so the rest of this function just branches on the
+        # token.
+        mode = self.parameter_panel.fit_mode()
 
-        fits = self.profile_viewer.last_fit_params()
-        rfit = fits.get("radial")
-        afit = fits.get("angular")
-        if rfit is None:
-            QMessageBox.warning(
-                self, "Add to fitted",
-                "No radial Gaussian fit is available for this peak. Drag "
-                "the box until the pink fit curve appears in the radial "
-                "profile, then try again.",
-            )
-            return
-        if not save_as_ring and afit is None:
-            QMessageBox.warning(
-                self, "Add to fitted",
-                "No angular Gaussian fit is available — required for "
-                "segment peaks. Drag the box until the pink fit curve "
-                "appears in the angular profile, or check 'Save fitted "
-                "as ring' if this is a ring.",
-            )
-            return
-
-        if save_as_ring:
-            # Canonical ring convention used in already-labelled fitted_peaks
-            # rows (angle = 45°, angle_width = ∞). q_xy / q_z are recomputed
-            # from this in add_fitted_peak_row.
-            angle_to_save = 45.0
-            angle_width_to_save = float("inf")
+        if mode == ParameterPanel.FIT_MODE_2D:
+            row = self._build_fitted_row_2d(sel, entry, frame)
         else:
-            angle_to_save = float(afit.center)
-            # Box convention: radial border = FWHM, azimuthal border =
-            # 2 × FWHM. The wider azimuthal box gives the next refit
-            # enough context to converge on the same Gaussian; the radial
-            # box hugs the FWHM tightly because that's where peak position
-            # matters most for downstream matching.
-            angle_width_to_save = float(2.0 * afit.fwhm)
+            row = self._build_fitted_row_1d(sel, save_as_ring)
+        if row is None:
+            # The helper already showed a QMessageBox / log line.
+            return
 
         with self._detached_silx_tree():
             try:
                 new_id = file_model.add_fitted_peak_row(
                     self.session.temp_path, entry, frame,
-                    radius=float(rfit.center),
-                    radius_width=float(rfit.fwhm),
-                    angle=angle_to_save,
-                    angle_width=angle_width_to_save,
-                    amplitude=float(rfit.amplitude),
+                    radius=row["radius"],
+                    radius_width=row["radius_width"],
+                    angle=row["angle"],
+                    angle_width=row["angle_width"],
+                    amplitude=row["amplitude"],
                     is_ring=save_as_ring,
+                    theta=row["theta"],
+                    A=row["A"],
+                    B=row["B"],
+                    C=row["C"],
                 )
             except KeyError as exc:
                 QMessageBox.warning(self, "Add to fitted", str(exc))
@@ -4431,29 +4754,218 @@ class MainWindow(QMainWindow):
             f"{entry}/frame{frame:05d}"
         )
 
+    def _run_pygidfit_for_selection(
+        self, sel: SelectedPeak, entry: str, frame: int,
+    ) -> tuple["ManualFitResult | None", str | None]:
+        """Run pygidfit on ``sel`` and return ``(result, error)``.
+
+        Silent — no QMessageBox, no logging at warning level. Used by
+        both the commit path (``_build_fitted_row_2d``) and the live
+        preview path (``_refresh_2d_preview``). When ``result`` is
+        None, ``error`` is a short human-readable string the caller
+        can surface or ignore.
+
+        Replicates ``pygidfit.ProcessDataFromFile.process_single_frame``
+        — same polar resolution (``512 × 1024``), ``img_preprocessing``
+        masking, ``crit_angle`` / ``theta_fixed`` / ``clustering_*``
+        values pulled from the Pipeline panel — so the preview's box
+        equals what the commit would save.
+        """
+        from mlgidlab.manual_fit import ManualFitError, fit_one_peak
+
+        fs = getattr(self.viewer, "_frame_source", None)
+        stack = getattr(self.viewer, "_stack", None)
+        if fs is None or not fs.is_open or stack is None:
+            return None, (
+                "The active frame isn't currently available "
+                "(viewer mid-pipeline or released)."
+            )
+        try:
+            cartesian = np.asarray(fs.get_cartesian(int(frame)))
+        except Exception as exc:
+            return None, f"Could not load the cartesian frame: {exc}"
+        q_xy = np.asarray(stack.q_xy)
+        q_z = np.asarray(stack.q_z)
+
+        if self.session is None:
+            return None, "No active session."
+        geom = file_model.read_geometry_for_entry(
+            self.session.temp_path, entry, frame=int(frame),
+        )
+        if geom is None:
+            return None, (
+                "Instrument metadata (wavelength / angle of incidence "
+                "/ q ranges) is missing or malformed for this entry."
+            )
+        geom = dict(geom)
+        geom.pop("q_z_axis", None)
+
+        panel = self.pipeline_panel
+        try:
+            crit_angle = float(panel.fit_crit_angle.value())
+            cdp = float(panel.fit_dist_peaks.value())
+            cdr = float(panel.fit_dist_rings.value())
+            ce = int(panel.fit_cluster_extend.value())
+            tf = bool(panel.fit_theta_fixed.isChecked())
+        except Exception:
+            crit_angle, cdp, cdr, ce, tf = 0.0, 10.0, 10.0, 2, True
+
+        try:
+            fit_2d = fit_one_peak(
+                cartesian, q_xy, q_z,
+                radius=float(sel.radius),
+                radius_width=float(sel.radius_width),
+                angle=float(sel.angle),
+                angle_width=float(sel.angle_width),
+                crit_angle=crit_angle,
+                theta_fixed=tf,
+                clustering_distance_peaks=cdp,
+                clustering_distance_rings=cdr,
+                clustering_extend=ce,
+                **geom,
+            )
+        except ManualFitError as exc:
+            return None, str(exc)
+        except Exception as exc:
+            return None, f"Unexpected 2D fit error: {exc!r}"
+        return fit_2d, None
+
+    def _build_fitted_row_2d(
+        self, sel: SelectedPeak, entry: str, frame: int,
+    ) -> dict | None:
+        """Run pygidfit on ``sel`` and shape the result into an
+        ``add_fitted_peak_row`` kwarg dict. Surfaces a QMessageBox
+        on failure — strict, no silent fall-back to the 1D path.
+        Delegates the actual fit to ``_run_pygidfit_for_selection``
+        so the live-preview path can reuse the same code.
+        """
+        fit_2d, err = self._run_pygidfit_for_selection(sel, entry, frame)
+        if fit_2d is None:
+            QMessageBox.warning(
+                self, "Add to fitted (2D)",
+                f"pygidfit could not fit this box: {err}\n\n"
+                "Try widening the box, or switch to '1D fit (scipy)' "
+                "mode to commit with the legacy 1D Gaussian fit.",
+            )
+            return None
+        return {
+            "radius": fit_2d.radius,
+            "radius_width": fit_2d.radius_width,
+            "angle": fit_2d.angle,
+            "angle_width": fit_2d.angle_width,
+            "amplitude": fit_2d.amplitude,
+            "theta": fit_2d.theta,
+            "A": fit_2d.A, "B": fit_2d.B, "C": fit_2d.C,
+        }
+
+    def _build_fitted_row_1d(
+        self, sel: SelectedPeak, save_as_ring: bool,
+    ) -> dict | None:
+        """Build the row from the profile viewer's cached 1D scipy fits.
+
+        Width convention matches the 2D path so the saved blue box for
+        the same physical Gaussian renders identically regardless of
+        which mode produced it: ``radius_width = angle_width = 2σ =
+        FWHM / sqrt(2 ln 2) ≈ 0.849 × FWHM``. This is pygidfit's
+        convention (see ``manual_fit.fit_one_peak``) and what the
+        pipeline ``run_fitting`` writes. The only difference between
+        modes is whether 2D shape coefficients (A/B/C/theta) carry
+        real values — 1D zero-fills them.
+
+        Ring storage keeps ``angle = 45°``, ``angle_width = inf`` as
+        the sentinel — not a Gaussian width, so the unified
+        convention doesn't apply.
+
+        Returns ``None`` and shows a QMessageBox when the required 1D
+        fit isn't available (typical cause: narrow detected box where
+        scipy didn't converge). Strict — no fall-back to pygidfit.
+        """
+        fits = self.profile_viewer.last_fit_params()
+        rfit = fits.get("radial")
+        afit = fits.get("angular")
+        if rfit is None:
+            QMessageBox.warning(
+                self, "Add to fitted (1D)",
+                "No radial Gaussian fit is available. Drag the box "
+                "until the pink fit curve appears in the radial "
+                "profile, or switch to '2D fit (pygidfit)' mode.",
+            )
+            return None
+        if not save_as_ring and afit is None:
+            QMessageBox.warning(
+                self, "Add to fitted (1D)",
+                "No angular Gaussian fit is available — required for "
+                "segment peaks in 1D mode. Drag the box until the "
+                "pink fit curve appears in the angular profile, "
+                "check 'Save fitted as ring' if this is a ring, or "
+                "switch to '2D fit (pygidfit)' mode.",
+            )
+            return None
+        fwhm_to_2sigma = 1.0 / float(np.sqrt(2.0 * np.log(2.0)))
+        if save_as_ring:
+            angle_to_save = 45.0
+            angle_width_to_save = float("inf")
+        else:
+            angle_to_save = float(afit.center)
+            angle_width_to_save = float(afit.fwhm) * fwhm_to_2sigma
+        return {
+            "radius": float(rfit.center),
+            "radius_width": float(rfit.fwhm) * fwhm_to_2sigma,
+            "angle": angle_to_save,
+            "angle_width": angle_width_to_save,
+            "amplitude": float(rfit.amplitude),
+            "theta": 0.0, "A": 0.0, "B": 0.0, "C": 0.0,
+        }
+
     def _on_delete_peak_requested(self, sel: SelectedPeak | None) -> None:
-        """Confirm + cascade-delete a non-manual peak via mlgidbase."""
+        """Confirm + delete a non-manual peak — kind-scoped, no cascade.
+
+        Replaces the previous ``mlgidbase.delete_peak`` dispatch
+        (which removed the row from detected + fitted + matched in
+        one shot, leaving the user unable to delete just the fitted
+        prediction without also wiping its detected source). Now:
+
+        * ``sel.kind == "detected"`` → delete only the detected row.
+          Leaves fitted / matched alone.
+        * ``sel.kind == "fitted"`` → delete only the fitted row.
+          ``matched_*`` integer indices into ``fitted_peaks`` would
+          go stale, so we also clear ``matched_*`` on that frame
+          (same invalidate-on-refit cascade F-04 uses for
+          ``run_fitting``).
+        * ``sel.kind == "matched"`` → still routes through
+          ``mlgidbase.delete_peak`` for now — matched live across
+          per-solution datasets and a dedicated single-solution
+          deleter isn't built yet. Leaves detected / fitted intact
+          via mlgidbase's own per-kind missing-id tolerance.
+        """
         if (
             sel is None or sel.kind == "manual"
             or self.session is None or self._pipe_thread is not None
         ):
             return
+        entry = self.entry_combo.currentText()
+        if not entry:
+            return
+
+        if sel.kind in ("detected", "fitted"):
+            return self._delete_file_peak_scoped(sel, entry)
+
+        # matched fallthrough — keep the cascade path until a
+        # dedicated single-matched-row deleter exists.
         if not is_mlgidbase_available():
             QMessageBox.information(
                 self, "Delete peak",
                 "mlgidbase is not installed; cannot delete peaks.",
             )
             return
-        entry = self.entry_combo.currentText()
-        if not entry:
-            return
         reply = QMessageBox.question(
             self,
-            "Delete peak",
+            "Delete matched peak",
             (
-                f"Delete {sel.kind} peak id={sel.peak_id} on frame {sel.frame}?\n\n"
-                "It will be removed from detected, fitted, and all matched "
-                "solutions. This cannot be undone."
+                f"Delete matched peak id={sel.peak_id} on frame {sel.frame}?\n\n"
+                "It will be removed from every matched solution that "
+                "references it. Detected and fitted rows are left "
+                "intact. This cannot be undone."
             ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
@@ -4468,9 +4980,76 @@ class MainWindow(QMainWindow):
                 "peak_id": int(sel.peak_id),
             },
         )
-        if self.session is None:
-            return
         self._on_pipeline_run(self.session.temp_path, cmd)
+
+    def _delete_file_peak_scoped(
+        self, sel: SelectedPeak, entry: str,
+    ) -> None:
+        """Delete only the selected kind's row, no cross-kind cascade.
+
+        For fitted: also clears ``matched_*`` on the frame because
+        ``peak_list`` integer indices into ``fitted_peaks`` go stale
+        when the row ordering changes. Mirrors the F-04 invalidation
+        the pipeline ``run_fitting`` path uses.
+        """
+        kind = sel.kind  # "detected" or "fitted"
+        kind_human = "detected" if kind == "detected" else "fitted"
+        siblings_msg = (
+            "The fitted row (and any matched solutions on this frame) "
+            "will stay intact."
+            if kind == "detected"
+            else "The detected row will stay intact; matched solutions "
+            "on this frame will be cleared (their peak indices into "
+            "fitted_peaks would otherwise go stale)."
+        )
+        reply = QMessageBox.question(
+            self,
+            f"Delete {kind_human} peak",
+            (
+                f"Delete {kind_human} peak id={sel.peak_id} on frame "
+                f"{sel.frame}?\n\n{siblings_msg} This cannot be undone."
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        with self._detached_silx_tree():
+            try:
+                removed = file_model.delete_peak_row(
+                    self.session.temp_path, entry,
+                    frame=int(sel.frame),
+                    kind=kind,
+                    peak_id=int(sel.peak_id),
+                )
+                if kind == "fitted" and removed > 0:
+                    file_model.clear_peaks(
+                        self.session.temp_path, entry,
+                        kind="matched", frame=int(sel.frame),
+                    )
+            except Exception as exc:
+                QMessageBox.critical(
+                    self, f"Delete {kind_human} peak", str(exc),
+                )
+                return
+        if removed == 0:
+            self.pipeline_panel.append_log(
+                f"Delete {kind_human}: no peak with id={sel.peak_id} on "
+                f"{entry}/frame{int(sel.frame):05d} (already gone?)"
+            )
+            return
+        self.session.mark_dirty()
+        self._update_title()
+        # Bulk row delete invalidates pending FileGeomActions whose ids
+        # may have referenced the dropped peak.
+        self.viewer.clear_history()
+        self.viewer.clear_selection()
+        self._load_entry_into_viewer(entry, preserve_view=True)
+        self.pipeline_panel.append_log(
+            f"Deleted {kind_human} peak id={sel.peak_id} on "
+            f"{entry}/frame{int(sel.frame):05d}"
+            + (" (matched_* on this frame cleared)" if kind == "fitted" else "")
+        )
 
     def _on_peak_row_write_requested(
         self, frame: int, kind: str, peak_id: int, polar: dict

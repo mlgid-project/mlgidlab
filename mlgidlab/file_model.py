@@ -136,6 +136,61 @@ def list_entries(file_path: Path) -> list[str]:
             if signal == "img_gid_q"]
 
 
+def read_geometry_for_entry(
+    file_path: Path, entry: str, frame: int = 0,
+) -> dict | None:
+    """Read the geometry fields a single-peak 2D fit needs.
+
+    Returns ``{'wavelength_angstrom', 'q_xy_max', 'q_z_max', 'ai_deg',
+    'q_z_axis'}`` on success, or ``None`` when any required field is
+    missing. The GUI's "Add to fitted" handler uses this to feed
+    ``mlgidlab.manual_fit.fit_one_peak`` without dragging in
+    ``pygidsim`` (so the headless CI suite can still exercise the
+    Add-to-fitted path's fallback branch by patching pygidfit out).
+
+    Wavelength is stored in metres in NeXus; the fitter expects
+    Ångströms, so we convert here at the boundary. The angle of
+    incidence falls back to ``0.0`` (transmission geometry) when the
+    dataset is missing, since pygidfit's default for the same
+    parameter is ``0``. ``frame`` selects which entry of a
+    per-frame ``angle_of_incidence`` array to read (0-D / length-1
+    arrays use index 0 regardless). The q_xy / q_z extents are
+    required; ``q_z_axis`` is the 1-D q_z array (returned because
+    ``pygidfit.process_scans.img_preprocessing`` masks rows below
+    the sample horizon via a q_z comparison).
+    """
+    try:
+        with h5py.File(file_path, "r") as f:
+            if entry not in f:
+                return None
+            grp = f[entry]
+            q_xy_arr = np.asarray(grp["data/q_xy"][()])
+            q_z_arr = np.asarray(grp["data/q_z"][()])
+            q_xy_max = float(np.max(np.abs(q_xy_arr)))
+            q_z_max = float(np.max(np.abs(q_z_arr)))
+            wl_m = float(
+                np.asarray(grp["instrument/monochromator/wavelength"]).ravel()[0]
+            )
+            if wl_m <= 0:
+                return None
+            try:
+                ai_raw = np.asarray(grp["instrument/angle_of_incidence"]).ravel()
+                ai_idx = int(frame) if 0 <= int(frame) < ai_raw.size else 0
+                ai_deg = float(ai_raw[ai_idx])
+            except Exception:
+                ai_deg = 0.0
+    except Exception:
+        logger.debug("suppressed exception in read_geometry_for_entry", exc_info=True)
+        return None
+    return {
+        "wavelength_angstrom": wl_m * 1e10,
+        "q_xy_max": q_xy_max,
+        "q_z_max": q_z_max,
+        "ai_deg": ai_deg,
+        "q_z_axis": q_z_arr,
+    }
+
+
 def count_frames(file_path: Path, entry: str) -> int:
     """Return the number of frames in ``entry`` without loading any data.
 
@@ -347,9 +402,10 @@ class FrameSource:
                     FRAME_LRU_MIN, min(FRAME_LRU_MAX, half // frame_bytes)
                 )
                 # Polar grid is denser than Cartesian for the typical
-                # (n_radius=1000, n_angle=900) defaults — size the polar
-                # LRU at half the Cartesian count so total stays under
-                # the target.
+                # (n_radius=1024, n_angle=512) defaults (= ``524288``
+                # samples per frame, matching pygidfit's pipeline
+                # polar grid) — size the polar LRU at half the
+                # Cartesian count so total stays under the target.
                 self._polar_lru_max = max(
                     FRAME_LRU_MIN // 2, self._cart_lru_max // 2
                 )
@@ -1029,6 +1085,74 @@ def normalize_for_pygid(file_path: Path) -> dict[str, list[str]]:
             if created_any:
                 patched_frames.append(entry_name)
     return {"angle": patched_angle, "frames": patched_frames}
+
+
+def delete_peak_row(
+    file_path: Path,
+    entry: str,
+    frame: int,
+    kind: str,
+    peak_id: int,
+) -> int:
+    """Delete a single row from one kind's ``<kind>_peaks`` dataset.
+
+    ``kind`` is ``"detected"`` or ``"fitted"``. Removes the row whose
+    ``id`` field matches ``peak_id`` and writes the surviving rows
+    back; the dataset is recreated at the new length, preserving
+    dtype and attrs. Returns the number of rows removed (0 if no
+    row had the requested id, in which case the file is untouched).
+
+    **Does not cascade across kinds.** mlgidbase's
+    ``_delete_peak_single_frame`` removes the row from detected,
+    fitted, and matched_* in one shot (and reindexes ids on each).
+    This helper is the opposite: deletes only the kind you ask for,
+    leaves the other kinds alone, and **does not reindex**
+    ``id`` — the remaining ids stay stable so a delete operation
+    can't silently shift external references. Callers that need a
+    cascade (e.g. fitted-delete invalidates matched ``peak_list``
+    integer indices into ``fitted_peaks``) must invoke
+    ``clear_peaks(..., "matched", frame=frame)`` separately.
+
+    ``raise ValueError`` for unsupported ``kind`` (matched can't be
+    row-deleted through here because ``matched_*`` lives across
+    multiple per-solution datasets; use ``clear_peaks(...,
+    "matched", ...)`` to wipe them or write a dedicated helper).
+    """
+    if kind not in ("detected", "fitted"):
+        raise ValueError(
+            f"delete_peak_row: kind must be detected or fitted, got {kind!r}"
+        )
+    ds_name = f"{kind}_peaks"
+    frame_key = FRAME_KEY_FMT.format(int(frame))
+    with h5py.File(file_path, "r+") as f:
+        ds_path = f"{entry}/{ANALYSIS_REL}/{frame_key}/{ds_name}"
+        if ds_path not in f:
+            return 0
+        ds = f[ds_path]
+        arr = ds[()]
+        keep = arr["id"] != int(peak_id)
+        if keep.all():
+            return 0
+        new_arr = arr[keep]
+        # Preserve dtype + attrs by recreating the dataset, mirroring
+        # the in-place delete + recreate pattern used by clear_peaks
+        # and add_fitted_peak_row. pygid creates these as fixed-shape
+        # datasets so .resize is unavailable.
+        attrs = dict(ds.attrs)
+        parent = ds.parent
+        del parent[ds_name]
+        new_ds = parent.create_dataset(
+            ds_name, data=new_arr,
+        )
+        for k, v in attrs.items():
+            new_ds.attrs[k] = v
+        # ``fitted_peaks`` row ordering changed → matched_* peak_list
+        # integer indices into this frame's fitted_peaks may now be
+        # stale. The caller is expected to invoke
+        # ``clear_peaks(..., "matched", frame=frame)`` after this
+        # helper for the fitted case; we don't do it here so the
+        # contract stays "this helper touches exactly one kind".
+        return int(arr.shape[0] - new_arr.shape[0])
 
 
 def clear_peaks(

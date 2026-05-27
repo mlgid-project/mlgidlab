@@ -264,6 +264,13 @@ class SelectedPeak:
     # peaks (which have no model provenance) so the parameter panel can
     # skip the row instead of showing a misleading zero.
     score: float | None = None
+    # Peak amplitude (2D-Gaussian peak height). Populated for detected /
+    # fitted / matched selections; the profile viewer uses it to render
+    # the projection of the persisted 2D Gaussian onto the radial /
+    # angular axis (physics-audit F-06: "profile must reflect 2D fit").
+    # None for manual peaks (no fit yet), which fall back to the live
+    # 1D scipy fit on the integrated profile data.
+    amplitude: float | None = None
     # When non-None, the selection represents a *matched structure*
     # rather than a single peak. The list holds every fitted-peak id
     # that belongs to the structure; the overlay highlight is drawn
@@ -777,6 +784,14 @@ class GIWAXSImageViewer(QWidget):
     manualPeakRemoved = Signal(int, object)   # frame, ManualPeak
     selectionChanged = Signal(object)         # SelectedPeak | None
     peakGeometryChanged = Signal(object)      # SelectedPeak whose r/dr/a/da changed
+    # Drag-end variant of ``peakGeometryChanged``. Fires once when the
+    # user releases the ROI handle (or the user-side undo/redo path
+    # settles a geometry mutation). Consumers that want to react only
+    # to the final position — not every drag tick — subscribe here.
+    # MainWindow's 2D-preview refresh listens to this one because each
+    # pygidfit call is ~100-500 ms and per-tick refits would freeze
+    # the drag.
+    peakGeometryDragFinished = Signal(object)  # SelectedPeak (post-drag)
     # Emitted on drag-end for non-manual peaks: (frame, kind, peak_id,
     # polar_kwargs). MainWindow drives the actual h5py mutation since it
     # owns the silx tree handle that needs releasing first.
@@ -1395,9 +1410,19 @@ class GIWAXSImageViewer(QWidget):
         opens the same temp file ``r+`` (pipeline runs, ROI commit
         write-throughs, Add-to-fitted, clear-peaks, save-as).
         Idempotent — safe to call when no FrameSource is active.
+
+        Also clears ``self._polar_cache`` so the cursor-readout
+        handler's ``self._polar_cache is None`` guard fires while
+        the FrameSource is closed. Without this drop, the cached
+        ``_LazyPolarStack`` would still satisfy that None-check but
+        its ``__getitem__`` would call into a released
+        ``FrameSource`` and raise ``RuntimeError("FrameSource not
+        acquired")`` every time the user moved the mouse across the
+        polar plot during a pipeline run.
         """
         if self._frame_source is not None:
             self._frame_source.release()
+        self._polar_cache = None
 
     def acquire_frame_source(self) -> None:
         """Reopen the FrameSource's h5py handle after a write completes.
@@ -1596,28 +1621,30 @@ class GIWAXSImageViewer(QWidget):
     def set_fitted_preview(
         self,
         center_r: float | None,
-        fwhm_r: float | None,
+        width_r: float | None,
         center_a: float | None,
-        fwhm_a: float | None,
+        width_a: float | None,
         *,
         is_ring: bool = False,
     ) -> None:
-        """Show / hide the faint preview of the would-be fitted_peaks box.
+        """Paint the dashed cyan preview of the would-be fitted_peaks box.
 
-        Pass any None to clear. When ``is_ring`` is False, paints a dashed
-        cyan box of size ``FWHM_r × 2·FWHM_a`` centered at
-        ``(center_r, center_a)`` — the same convention ``Add to fitted``
-        uses to compute ``radius_width`` and ``angle_width``. When
-        ``is_ring`` is True, ``center_a`` / ``fwhm_a`` are ignored and the
-        preview is drawn as a full-angular-sweep ring at the canonical
-        ``angle = 45°, angle_width = ∞`` (matching what Add-to-fitted will
-        write). Visible only while a manual or detected peak is selected;
-        the parameter panel's selection-changed slot calls this with None
-        for any other kind.
+        Pure painter: the box is drawn at ``(width_r × width_a)``
+        verbatim, centred at ``(center_r, center_a)``. All convention
+        math (``2σ_r × 2σ_a`` for both modes; fallback to the user's
+        drawn box when scipy's 1D fit hasn't converged) lives in the
+        caller (``MainWindow._update_fitted_preview``) so a single
+        place owns the rules.
+
+        Pass any of ``center_r`` / ``width_r`` as ``None`` to hide.
+        Pass ``is_ring=True`` to draw a full-angular-sweep ring at the
+        canonical ``angle = 45°, angle_width = ∞`` — the caller still
+        passes a sentinel for ``center_a`` / ``width_a`` (they're
+        ignored).
         """
         if (
-            center_r is None or fwhm_r is None
-            or not (np.isfinite(center_r) and np.isfinite(fwhm_r) and fwhm_r > 0)
+            center_r is None or width_r is None
+            or not (np.isfinite(center_r) and np.isfinite(width_r) and width_r > 0)
         ):
             self._fitted_preview_geom = None
             self._fitted_preview_is_ring = False
@@ -1626,19 +1653,19 @@ class GIWAXSImageViewer(QWidget):
             # — store sentinel angular values that _render_overlays
             # rewrites to (45°, ∞) when it builds the preview row.
             self._fitted_preview_geom = (
-                float(center_r), float(fwhm_r), 45.0, 0.0,
+                float(center_r), float(width_r), 45.0, 0.0,
             )
             self._fitted_preview_is_ring = True
         elif (
-            center_a is None or fwhm_a is None
-            or not (np.isfinite(center_a) and np.isfinite(fwhm_a) and fwhm_a > 0)
+            center_a is None or width_a is None
+            or not (np.isfinite(center_a) and np.isfinite(width_a) and width_a > 0)
         ):
             self._fitted_preview_geom = None
             self._fitted_preview_is_ring = False
         else:
             self._fitted_preview_geom = (
-                float(center_r), float(fwhm_r),
-                float(center_a), float(fwhm_a),
+                float(center_r), float(width_r),
+                float(center_a), float(width_a),
             )
             self._fitted_preview_is_ring = False
         self._render_overlays(self.current_frame)
@@ -2183,24 +2210,33 @@ class GIWAXSImageViewer(QWidget):
             and self._selected is not None
             and self._selected.kind in ("manual", "detected")
         ):
-            cr, fr, ca, fa = self._fitted_preview_geom
+            cr, wr, ca, wa = self._fitted_preview_geom
             if self._fitted_preview_is_ring:
                 # Ring preview: angular dimensions ignored, full sweep at
-                # the canonical (45°, ∞) ring convention.
+                # the canonical (45°, ∞) ring convention. ``wr`` is the
+                # literal radial box width the caller wants drawn — see
+                # ``set_fitted_preview`` (dumb painter, no convention
+                # math here).
                 preview_table = _peaks_from_manual([
                     ManualPeak(
                         radius=cr, angle=45.0,
-                        radius_width=fr,        # FWHM_r
+                        radius_width=wr,
                         angle_width=float("inf"),
                         is_ring=True, temp_id=0,
                     )
                 ])
             else:
+                # Both ``wr`` and ``wa`` are the literal box widths the
+                # caller wants drawn (``MainWindow._update_fitted_preview``
+                # has already done the convention math: both modes use
+                # ``2σ_r × 2σ_a``). Do NOT double / scale anything here
+                # — that produced a preview twice as wide as the saved
+                # row when the caller's contract changed under us.
                 preview_table = _peaks_from_manual([
                     ManualPeak(
                         radius=cr, angle=ca,
-                        radius_width=fr,            # FWHM_r
-                        angle_width=2.0 * fa,       # 2 × FWHM_a
+                        radius_width=wr,
+                        angle_width=wa,
                         is_ring=False, temp_id=0,
                     )
                 ])
@@ -2402,8 +2438,19 @@ class GIWAXSImageViewer(QWidget):
         returned intensity stays constant while the cursor is inside
         the same displayed pixel — matches pyqtgraph's ``pos=axis[0]``
         / ``scale=step`` image transform exactly.
+
+        Returns NaN while the FrameSource is released by the silx
+        detach/reattach dance (pipeline runs, Add-to-fitted, clear-
+        peaks, save-as). Without this guard, ``stack3d[...]`` delegates
+        into ``FrameSource.get_cartesian`` which raises
+        ``RuntimeError("FrameSource not acquired")`` every time the
+        cursor moves over the cartesian plot during a write. Polar
+        mode uses the ``self._polar_cache is None`` guard for the
+        same reason; this is the cartesian-side mirror.
         """
         if self._stack is None:
+            return float("nan")
+        if self._frame_source is None or not self._frame_source.is_open:
             return float("nan")
         stack3d = self._stack.image_stack
         qxy_axis = self._stack.q_xy
@@ -2517,6 +2564,7 @@ class GIWAXSImageViewer(QWidget):
                         angle_width=float(table.angle_width[i]),
                         is_ring=bool(table.is_ring[i]),
                         score=float(table.score[i]),
+                        amplitude=float(table.amplitude[i]),
                     ))
                     return
 
@@ -2544,6 +2592,7 @@ class GIWAXSImageViewer(QWidget):
                             structure_label=s.label,
                             structure_color=color,
                             score=float(tbl.score[i]),
+                            amplitude=float(tbl.amplitude[i]),
                             # Clicking any peak of the structure
                             # promotes the whole structure into the
                             # selection — overlay highlights every
@@ -2647,9 +2696,10 @@ class GIWAXSImageViewer(QWidget):
 
         Polar mode only, and only for editable kinds (manual / detected).
         Fitted and matched selections show the box but no ROI — fitted
-        boxes encode the FWHM convention so dragging their bounds would
-        misrepresent the underlying Gaussian; matched is a derived view
-        of fitted_peaks. Both edit through Add-to-fitted / delete instead.
+        boxes encode the ``2σ`` convention so dragging their bounds
+        would misrepresent the underlying Gaussian; matched is a
+        derived view of fitted_peaks. Both edit through Add-to-fitted
+        / delete instead.
 
         Handles ring peaks (``is_ring`` true or non-finite ``angle_width``)
         and peaks whose box edges fall outside the visible polar range:
@@ -2852,6 +2902,9 @@ class GIWAXSImageViewer(QWidget):
                 {"radius": after[0], "angle": after[1],
                  "radius_width": after[2], "angle_width": after[3]},
             )
+        # Drag-end notification (all kinds) — subscribers that want the
+        # final geometry without per-tick refits hook here.
+        self.peakGeometryDragFinished.emit(sel)
 
     def update_peak_geometry_external(self, peak: ManualPeak) -> None:
         """Sync the ROI to a peak whose geometry was changed elsewhere
@@ -2870,6 +2923,44 @@ class GIWAXSImageViewer(QWidget):
         self._selected.angle = peak.angle
         self._selected.radius_width = peak.radius_width
         self._selected.angle_width = peak.angle_width
+        self._sync_roi_geometry()
+        self._render_overlays(self.current_frame)
+        self.peakGeometryChanged.emit(self._selected)
+
+    def update_detected_geometry_external(self, sel: "SelectedPeak") -> None:
+        """Sync the detected-peak overlay to a SelectedPeak whose geometry
+        was changed elsewhere — currently the profile region drag (see
+        ``profile_viewer.detectedPeakGeometryChanged``).
+
+        Mirrors the in-memory mutation that ``_on_roi_changed`` does
+        for detected/fitted peaks during an image-side ROI drag:
+        updates the cached ``_frame_peaks`` PeakTable so the colored
+        overlay tracks the drag live; recomputes the row's Cartesian
+        ``q_xy`` / ``q_z`` from the new polar coordinates; re-renders
+        and re-syncs the image-space ROI. Disk persistence happens
+        separately on drag-end via the host's
+        ``_on_peak_row_write_requested`` slot.
+        """
+        if (
+            self._selected is None
+            or self._selected.kind != "detected"
+            or sel is not self._selected
+            or self._roi_item is None
+        ):
+            return
+        peaks_for_frame = self._frame_peaks.get(sel.frame) or {}
+        table = peaks_for_frame.get("detected")
+        if table is None or len(table) == 0:
+            return
+        matches = np.where(table.ids == sel.peak_id)[0]
+        if matches.size == 0:
+            return
+        idx = int(matches[0])
+        table.radius[idx] = sel.radius
+        table.radius_width[idx] = sel.radius_width
+        table.angle[idx] = sel.angle
+        table.angle_width[idx] = sel.angle_width
+        table.q_xy[idx], table.q_z[idx] = polar_to_qxyz(sel.radius, sel.angle)
         self._sync_roi_geometry()
         self._render_overlays(self.current_frame)
         self.peakGeometryChanged.emit(self._selected)

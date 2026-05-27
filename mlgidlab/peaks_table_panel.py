@@ -217,9 +217,11 @@ class PeaksTablePanel(QWidget):
             self._fitted_model,
             [("ID",    "Peak id (sortable)"),
              ("r",     "Radius (Å⁻¹)"),
-             ("FWHM_r","Radial FWHM (Å⁻¹)"),
+             ("Δr",    "Radial width = 2σ_r (Å⁻¹). Same convention as "
+                      "pygidfit / pipeline; FWHM_r ≈ 1.177 × Δr."),
              ("a",     "Angle (°)"),
-             ("FWHM_a","Angular FWHM (°)"),
+             ("Δa",    "Angular width = 2σ_a (°). Same convention as "
+                      "pygidfit / pipeline; FWHM_a ≈ 1.177 × Δa."),
              ("amp",   "Peak amplitude (2D-Gaussian height)"),
              ("score", "mlgidDETECT confidence score"),
              ("type",  "Ring vs segment")],

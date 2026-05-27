@@ -103,8 +103,8 @@ def cartesian_to_polar(
     image: np.ndarray,
     q_xy: np.ndarray,
     q_z: np.ndarray,
-    n_radius: int = 1000,
-    n_angle: int = 900,
+    n_radius: int = 1024,
+    n_angle: int = 512,
 ) -> PolarImage:
     """Resample a Cartesian (q_z, q_xy)-indexed image onto a polar (radius, angle) grid.
 
@@ -115,6 +115,18 @@ def cartesian_to_polar(
     render in full. The Cartesian-to-polar mapping uses signed
     ``Q_xy`` / ``Q_z``, so the q_xy / q_z arrays may be increasing,
     decreasing, positive, negative, or mixed without any pre-flipping.
+
+    Default resolution matches pygidfit's pipeline polar grid: in
+    ``pygidfit.process_scans._get_polar_grid`` the hardcoded
+    ``polar_shape=[512, 1024]`` corresponds to ``[n_phi=512,
+    n_radius=1024]`` (axis 0 = angle, axis 1 = radius — see
+    ``_data2container`` for the scaling). Matching the per-axis
+    sample counts here removes the residual centroid drift between
+    pygidfit's 2D fit and mlgidlab's 1D-projected integration that
+    we used to see on the 2D live preview. Note that mlgidlab's
+    own image is shape ``(n_radius, n_angle)`` — opposite array
+    layout from pygidfit's — but the interpolation density per
+    physical axis is now identical.
     """
     if image.ndim != 2:
         raise ValueError(f"expected 2D image, got shape {image.shape}")

@@ -134,14 +134,37 @@ A working sample is bundled at `example/BA2PbI4.h5` plus
   the existing one (single undo entry). `Esc` dismisses an
   in-progress box. Click any peak (manual / detected / fitted /
   matched) to select it; drag the ROI edges to resize (manual +
-  detected + fitted); press `Delete` to remove. Geometry edits
-  write straight into the NeXus file.
-- Commit a manual peak to the file with **Add to detected** (uses
-  the box) or **Add to fitted** (uses the live 1D Gaussian fit;
-  tick *Save fitted as ring* for full-azimuthal peaks — the box
-  expands to the full angular sweep and reverts on uncheck).
+  detected + fitted); press `Delete` to remove. Deletion is
+  scoped to the kind you selected — deleting a detected peak
+  leaves its fitted / matched derivatives alone, and deleting a
+  fitted peak invalidates only its dependent matched solutions.
+  Geometry edits write straight into the NeXus file.
+- Commit a manual or detected peak with **Add to detected** (uses
+  the drawn box) or **Add to fitted**. The parameter panel carries
+  a **1D / 2D fit-mode** radio pair that decides what
+  Add-to-fitted runs:
+  - **2D fit (pygidfit)** — default. Runs the same 2D Gaussian
+    fit the pipeline uses for batch fitting, so the saved row is
+    identical to what a fresh `Run fitting` would produce on the
+    same box.
+  - **1D fit (scipy)** — quicker fallback for narrow or unusual
+    peaks where pygidfit can't converge; uses the live 1D
+    Gaussian fits shown on the profile plots and zero-fills the
+    2D shape coefficients.
+- Both modes save the same width convention (`2σ` in radial and
+  angular), so the saved blue box looks the same for the same
+  Gaussian regardless of which mode produced it.
+- **Live preview.** While a manual or detected peak is selected, a
+  cyan dashed box on the image previews exactly where the next
+  Add-to-fitted commit will land. In 2D mode the preview runs
+  pygidfit live as you reposition the ROI — the profile plots'
+  pink fit curves and the cyan box both follow the actual 2D fit,
+  so what you see is what you save. Tick **Save fitted as ring**
+  for full-azimuthal peaks: the cyan preview switches to a
+  full-quadrant ring and ring storage forces 1D (pygidfit doesn't
+  model rings).
 - **Undo / redo** with `Ctrl+Z` / `Ctrl+Shift+Z` covers manual
-  add / remove / geometry edits and detected/fitted geometry
+  add / remove / geometry edits and detected / fitted geometry
   edits. Pipeline ops that re-index peak ids clear the history.
 - The **Display dock** carries a master Matched-peaks toggle that
   cascades to every per-structure row; ticking a single structure
@@ -173,10 +196,14 @@ A working sample is bundled at `example/BA2PbI4.h5` plus
   image overlay without altering the per-structure checkbox state;
   drop the slider/filter to bring them back.
 - The **Profiles** dock shows live radial and angular Gaussian fits
-  of the selected peak (with linear background); manual peaks get
-  a real bounded refit, file-resident peaks render the Gaussian
-  implied by their stored width. The X range pans with the box on
-  ROI drag so the borders stay visible. A **Log y** checkbox above
+  of the selected peak (with linear background). The fit source
+  depends on the active Add-to-fitted mode: in **1D mode** the
+  pink curves are scipy fits over the user-drawn box; in **2D
+  mode** they come from pygidfit's 2D fit, projected onto each
+  axis so the curve sits on the integrated data over pygidfit's
+  refined box. Either way, the pink curve previews what
+  Add-to-fitted will store. The X range pans with the box on ROI
+  drag so the borders stay visible. A **Log y** checkbox above
   the plots switches both y-axes to log10 — useful when peak
   amplitudes span multiple orders of magnitude.
 - The matched palette uses 10 colours × 4 line styles for
@@ -312,97 +339,23 @@ so peaks outside the upper-right quadrant still render.
 
 ## For developers
 
-### Repository layout
+### How edits and runs hit disk
 
-```
-mlgidlab/
-  main_window.py        QMainWindow: menus, docks, status bar,
-                        session / pipeline / conversion plumbing,
-                        drag-and-drop + recent-files, frame
-                        keyboard shortcuts, reset layout, Help menu
-  image_viewer.py       pyqtgraph viewer, ROI, overlays, undo
-                        stack, raw-mode rendering, cursor readout,
-                        matched filter-hidden overlay mask
-  profile_viewer.py     1D radial + angular profile widget with
-                        live Gaussian + linear-background fits
-  parameter_panel.py    "Selected peak" readout + commit / delete
-  pipeline_panel.py     Detection / Fitting / Matching launcher,
-                        scrollable, multi-expand, Run-full-pipeline
-  conversion_panel.py   pygid raw → NeXus conversion launcher with
-                        Create… buttons that open the pyFAI
-                        calibration dialog
-  peaks_table_panel.py  Tabbed sortable per-frame peak tables with
-                        bidirectional click-sync to the viewer
-  calibration_dialog.py Embedded pyFAI calibration + mask creation
-                        modal (Experiment / Mask / Peaks /
-                        Geometry / Integration tasks)
-  figure_export_window.py Non-modal figure-export window driving
-                        mlgidbase.plot_analysis_results with a
-                        live preview pane and on-demand render
-  pipeline.py           Lazy mlgidBASE wrappers (no Qt) — per-
-                        entry CIF preprocessing, fitted polar→
-                        Cartesian back-fill, matched dedup
-  conversion.py         Lazy pygid wrappers (no Qt)
-  file_model.py         h5py reads + targeted in-place writes +
-                        raw-entry walker + CSV exporters
-  fit.py                1D Gaussian + linear-background fitting
-                        helpers
-  polar.py              Cartesian↔polar transform; handles
-                        arbitrary q-axis orientation
-  session.py            BaseSession + NexusSession (writable temp
-                        copy) + RawSession (read-only batch)
-  workers.py            QThread workers for open / pipeline /
-                        conversion / CIF parse / prefetch
-  theme.py              qdarkstyle + pyqtgraph color overrides
-example/                Sample NeXus file + matching CIF pickle
-```
-
-### Editing model
-
-- Opening a NeXus file copies it into a session-local temp
-  directory; all edits target the temp file. The original is only
-  overwritten on **Save**.
-- Opening a raw file builds a read-only `RawSession` that lists the
-  raw inputs but never modifies them; conversion writes a fresh
+- Opening a NeXus file copies it into a session-local temp copy;
+  every edit (peak add / delete / geometry drag, pipeline runs,
+  Add-to-fitted commits) targets the temp file. The original is
+  only overwritten on **Save**.
+- Opening a raw file builds a read-only session that lists the
+  raw inputs but never modifies them; conversion writes fresh
   NeXus output.
-- Geometry edits (ROI drag) on detected / fitted peaks open the
-  temp file `r+` and rewrite the matching row by `id` — silx is
-  detached for the write and reattached afterward.
-- Pipeline and conversion runs go through the same detach /
-  reattach dance and run on worker threads so the UI stays
-  responsive.
-- The undo stack uses an `_Action` protocol (`ManualAddAction`,
-  `ManualRemoveAction`, `ManualGeomAction`, `ManualReplaceAction`,
-  `FileGeomAction`). Pipeline ops that reshuffle ids invalidate
-  the stack and clear it on completion.
+- Pipeline runs and conversion runs happen on worker threads, so
+  the UI stays responsive. Long-running ops show progress in the
+  status bar; the on-disk view detaches and re-attaches around
+  each write so the file browser doesn't fight the writer.
 
-### Conversion engine
-
-`conversion.execute(scans, cfg)`:
-1. Builds **one** shared `pygid.ExpParams` and `pygid.CoordMaps`
-   per run (the roadmap's "global objects").
-2. For each `RawScan`, instantiates a `pygid.Conversion` and
-   dispatches on `cfg.conv_type` (`det2q_gid` / `det2q` /
-   `det2pol_gid` / `det2pol`).
-3. Output paths and `entry_NNNN` group names are pre-planned by
-   `_plan_output_paths` and `_next_entry_index` so re-runs append
-   instead of overwriting.
-4. Sample / experimental metadata are passed through to pygid's
-   `ExpMetadata` / `SampleMetadata`.
-
-`pygid` is imported lazily so the GUI runs without it (view-only
-mode). Same pattern as `pipeline.py` for `mlgidbase`.
-
-### Persistent settings
-
-- `QSettings` org `mlgidLAB`, app `mlgidLAB`. Stores the
-  recent-files list (`recentFiles`) and the Playback Settings
-  dialog's choice between "Time per frame" and "Total play time"
-  with its associated values.
-- The embedded pyFAI calibration dialog uses a separate QSettings
-  namespace `mlgidLAB / pyFAI-calib` so pyFAI's own preferences
-  (recent calibrants, last-used dirs) don't collide with the main
-  app's settings.
+In-depth notes on the modules, the editing model, the polar
+transform, and the silx detach / reattach plumbing live in
+`Documentation/` — start with `01_overview.md`.
 
 ### Install / extras
 
@@ -416,6 +369,11 @@ Runtime base: `PySide6`, `silx[full]`, `h5py`, `numpy`, `scipy`,
 `pyqtgraph`, `qdarkstyle`, `pyFAI` (used by the in-GUI
 calibration + mask creation dialog and the figure export
 window). See `pyproject.toml` for pinned minimums.
+
+`pygid` and `mlgidbase` are imported lazily — the GUI starts up
+without them in view-only mode (open, browse, edit peaks
+manually, no Run buttons enabled). Install the `[pipeline]` extra
+to enable Conversion, Detection, Fitting, and Matching.
 
 ### Status
 

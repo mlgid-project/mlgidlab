@@ -1,5 +1,20 @@
-"""1D Gaussian fitting helpers used to overlay an expected peak shape on the
-radial / angular profile plots.
+"""1D Gaussian fitting helpers for the radial / angular profile overlays.
+
+**Display-only, never persisted.** This module's output is used to
+paint live preview curves on the profile viewer for the active
+manual / detected box. It is deliberately not pygidFIT and must
+not be written into ``fitted_peaks`` — the persistence path goes
+through ``mlgidlab.manual_fit.fit_one_peak`` → pygidfit's 2D fit.
+Physics-audit finding F-06 is closed by keeping these two
+responsibilities cleanly separated:
+
+  * ``fit.py``        — fast 1D scipy fit, live preview overlay only
+  * ``manual_fit.py`` — slow 2D pygidfit fit, persisted truth
+
+If a future caller ever wants to persist 1D-fit output, the audit
+verdict must be re-opened: pygidFIT's 2D cluster model is the
+upstream contract for fitted peaks, and the 1D Gaussian + linear
+background here is not it.
 
 Pure scipy/numpy — no Qt. Returns the fit curve sampled on a fine grid plus
 the fitted parameters; callers decide where to draw it.
@@ -49,6 +64,80 @@ def gaussian_with_constant_bg(
     intercept: float,
 ) -> np.ndarray:
     return amplitude * np.exp(-((x - center) ** 2) / (2.0 * sigma ** 2)) + intercept
+
+
+def gaussian_from_stored_params(
+    axis: np.ndarray,
+    center: float,
+    fwhm: float,
+    amplitude: float,
+    *,
+    data: np.ndarray | None = None,
+    render_range: tuple[float, float] | None = None,
+) -> GaussianFit | None:
+    """Render a 1D Gaussian curve **from persisted parameters** — no
+    fitting, no data lookup for the Gaussian shape.
+
+    For a peak that already lives in ``fitted_peaks`` or
+    ``matched_*``, the profile overlay shows the projection of the
+    persisted 2D Gaussian onto the radial / angular axis. The
+    projection of an axis-aligned 2D Gaussian along one axis is just
+    the 1D Gaussian with the same centre + FWHM in that direction, so
+    we sample ``amplitude * exp(-(x-center)^2 / (2*sigma^2))`` over
+    ``render_range`` and return it shaped like ``GaussianFit`` so the
+    profile viewer can plot it uniformly with the live preview path.
+
+    Baseline. When ``data`` is provided alongside ``axis`` (same
+    length), the curve is offset by the local minimum of the data
+    inside the rendered window — so the Gaussian sits on top of the
+    profile's actual baseline instead of falling to zero in the
+    tails. The persisted ``amplitude`` is the 2D fit's peak height
+    above local background, so this baseline reconstruction makes
+    the overlay visually agree with the data. Without ``data`` we
+    fall back to ``intercept=0`` (legacy behaviour).
+
+    Closes the "profile must reflect 2D fit" half of physics-audit
+    finding F-06.
+    """
+    if not (np.isfinite(center) and np.isfinite(fwhm)) or fwhm <= 0:
+        return None
+    if axis is None or len(axis) == 0:
+        return None
+    if not np.isfinite(amplitude):
+        return None
+    sigma = abs(fwhm) / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+    if render_range is not None:
+        rlo = max(float(render_range[0]), float(axis[0]))
+        rhi = min(float(render_range[1]), float(axis[-1]))
+        if not np.isfinite(rlo) or not np.isfinite(rhi) or rhi <= rlo:
+            rlo, rhi = float(axis[0]), float(axis[-1])
+    else:
+        rlo, rhi = float(axis[0]), float(axis[-1])
+    x_fine = np.linspace(rlo, rhi, FIT_RENDER_SAMPLES)
+
+    # Reconstruct the local baseline from the data, when provided.
+    # Take the *minimum* of the data inside the render window — the
+    # persisted amplitude is peak-above-background, so the baseline
+    # is what sits under the peak. Robust to noisy tails because
+    # we're aggregating across the full rendered window.
+    intercept = 0.0
+    if data is not None and len(data) == len(axis):
+        axis_arr = np.asarray(axis)
+        in_window = (axis_arr >= rlo) & (axis_arr <= rhi)
+        if in_window.any():
+            window_y = np.asarray(data)[in_window]
+            finite = np.isfinite(window_y)
+            if finite.any():
+                intercept = float(np.nanmin(window_y[finite]))
+
+    y_fine = float(amplitude) * np.exp(
+        -((x_fine - float(center)) ** 2) / (2.0 * sigma ** 2)
+    ) + intercept
+    return GaussianFit(
+        x=x_fine, y=y_fine,
+        amplitude=float(amplitude), center=float(center), sigma=sigma,
+        slope=0.0, intercept=intercept,
+    )
 
 
 def gaussian_from_box(
@@ -240,5 +329,171 @@ def fit_gaussian_on_axis(
     return GaussianFit(
         x=x_fine, y=y_fine,
         amplitude=amplitude, center=center, sigma=abs(sigma),
+        slope=slope, intercept=intercept,
+    )
+
+
+def fit_gaussian_anchored(
+    axis: np.ndarray,
+    data: np.ndarray,
+    *,
+    center: float,
+    sigma: float,
+    center_drift: float = 0.0,
+    sigma_factor: float = 1.0,
+    fit_range: tuple[float, float] | None = None,
+    render_range: tuple[float, float] | None = None,
+) -> GaussianFit | None:
+    """Fit a Gaussian + linear bg with centre / sigma loosely anchored.
+
+    When ``center_drift == 0`` and ``sigma_factor == 1.0`` this
+    behaves as a strict fix — only ``(amplitude, slope, intercept)``
+    are free. Otherwise scipy is bounded to:
+
+    * centre ∈ ``[center - center_drift, center + center_drift]``
+    * sigma  ∈ ``[sigma / sigma_factor, sigma * sigma_factor]``
+
+    Used by ``MainWindow._refresh_2d_preview`` so the pink projected
+    curve in 2D mode sits cleanly on the 1D-integrated grey trace
+    even when pygidfit's 2D centroid differs slightly from the
+    1D-projected centroid (theta ≠ 0, asymmetric peaks, polar-grid
+    interpolation mismatch between mlgidlab and pygidfit). The
+    bounded drift lets the curve realign on the actual data peak
+    without straying so far from pygidfit's geometry that the cyan
+    image-side preview box would feel disconnected.
+
+    Returns ``None`` when there aren't enough finite samples or
+    scipy doesn't converge — same precedent as
+    ``fit_gaussian_on_axis``; the caller (host) blanks the curve in
+    that case.
+    """
+    if len(axis) < 8:
+        return None
+    if not (np.isfinite(center) and np.isfinite(sigma)) or sigma <= 0:
+        return None
+    if center_drift < 0 or sigma_factor < 1.0:
+        return None
+
+    if fit_range is not None:
+        lo, hi = float(fit_range[0]), float(fit_range[1])
+        if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
+            return None
+    else:
+        half = max(3.0 * sigma, (axis[-1] - axis[0]) * 0.05)
+        lo, hi = center - half, center + half
+
+    lo_idx = int(np.searchsorted(axis, lo, side="left"))
+    hi_idx = int(np.searchsorted(axis, hi, side="right"))
+    lo_idx = max(0, lo_idx)
+    hi_idx = min(len(axis), hi_idx)
+    if hi_idx - lo_idx < 6:
+        return None
+
+    x = axis[lo_idx:hi_idx]
+    y = data[lo_idx:hi_idx]
+    finite = np.isfinite(y)
+    x = x[finite]
+    y = y[finite]
+    if len(x) < 6:
+        return None
+
+    # Estimate the linear background from the edge samples — same
+    # heuristic as ``fit_gaussian_on_axis`` for a stable initial
+    # guess.
+    n_edge = max(len(x) // 8, 2)
+    bg_x = np.concatenate([x[:n_edge], x[-n_edge:]])
+    bg_y = np.concatenate([y[:n_edge], y[-n_edge:]])
+    try:
+        slope_init, intercept_init = np.polyfit(bg_x, bg_y, 1)
+    except Exception:
+        logger.debug(
+            "suppressed exception in fit_gaussian_anchored", exc_info=True
+        )
+        slope_init, intercept_init = 0.0, float(np.nanmean(y))
+
+    bg_at_center = float(slope_init) * center + float(intercept_init)
+    amp_init = float(np.nanmax(y) - bg_at_center)
+    if amp_init <= 0:
+        amp_init = float(np.nanmax(y) - np.nanmin(y))
+    if amp_init <= 0:
+        amp_init = 1.0
+
+    target_center = float(center)
+    target_sigma = float(sigma)
+
+    strict = center_drift == 0.0 and sigma_factor == 1.0
+    if strict:
+        # Centre + sigma frozen — only 3 parameters free. Reuses the
+        # same curve_fit call shape as the bounded path so a future
+        # consolidation is easy.
+        def model(xs, amp, slope, intercept):
+            return gaussian_with_linear_bg(
+                xs, amp, target_center, target_sigma, slope, intercept,
+            )
+        try:
+            popt, _ = curve_fit(
+                model, x, y,
+                p0=[amp_init, slope_init, intercept_init],
+                maxfev=2000,
+            )
+            amplitude, slope, intercept = (float(v) for v in popt)
+        except Exception:
+            logger.debug(
+                "suppressed exception in fit_gaussian_anchored", exc_info=True
+            )
+            return None
+        fitted_center = target_center
+        fitted_sigma = target_sigma
+    else:
+        # Bounded 5-param fit. Centre and sigma allowed to drift
+        # within the supplied tolerances so the curve realigns on
+        # the data peak when pygidfit's 2D centroid doesn't match
+        # the 1D-projected centroid.
+        c_lo = target_center - center_drift
+        c_hi = target_center + center_drift
+        s_lo = target_sigma / sigma_factor
+        s_hi = target_sigma * sigma_factor
+        try:
+            popt, _ = curve_fit(
+                gaussian_with_linear_bg,
+                x, y,
+                p0=[
+                    amp_init, target_center, target_sigma,
+                    slope_init, intercept_init,
+                ],
+                bounds=(
+                    [0.0, c_lo, s_lo, -np.inf, -np.inf],
+                    [np.inf, c_hi, s_hi, np.inf, np.inf],
+                ),
+                maxfev=5000,
+            )
+            (
+                amplitude, fitted_center, fitted_sigma,
+                slope, intercept,
+            ) = (float(v) for v in popt)
+        except Exception:
+            logger.debug(
+                "suppressed exception in fit_gaussian_anchored", exc_info=True
+            )
+            return None
+
+    if not np.isfinite(amplitude):
+        return None
+
+    if render_range is not None:
+        rlo = max(float(render_range[0]), float(axis[0]))
+        rhi = min(float(render_range[1]), float(axis[-1]))
+        if not np.isfinite(rlo) or not np.isfinite(rhi) or rhi <= rlo:
+            rlo, rhi = float(x[0]), float(x[-1])
+    else:
+        rlo, rhi = float(x[0]), float(x[-1])
+    x_fine = np.linspace(rlo, rhi, FIT_RENDER_SAMPLES)
+    y_fine = gaussian_with_linear_bg(
+        x_fine, amplitude, fitted_center, fitted_sigma, slope, intercept,
+    )
+    return GaussianFit(
+        x=x_fine, y=y_fine,
+        amplitude=amplitude,
+        center=fitted_center, sigma=abs(fitted_sigma),
         slope=slope, intercept=intercept,
     )

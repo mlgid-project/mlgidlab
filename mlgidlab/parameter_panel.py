@@ -11,12 +11,14 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QRadioButton,
     QVBoxLayout,
     QWidget,
 )
@@ -36,12 +38,28 @@ _SOURCE_LABEL = {
 
 
 class ParameterPanel(QGroupBox):
+    # Mode tokens for the Add-to-fitted dispatch. ``"scipy_1d"`` runs
+    # the legacy 1D scipy + zero-fill code path that pre-dated the F-06
+    # work; ``"pygidfit_2d"`` routes through ``manual_fit.fit_one_peak``
+    # and matches what the pipeline ``run_fitting`` writes. Kept as
+    # module-level string constants so callers can compare cleanly
+    # (no enum import, no magic strings spread across files).
+    FIT_MODE_1D = "scipy_1d"
+    FIT_MODE_2D = "pygidfit_2d"
+
     addToDetectedRequested = Signal()
     addToFittedRequested = Signal()
     # Emits the new state of the "Save fitted as ring" checkbox so the host
     # can refresh the cyan fitted-preview overlay (rings render as a full
     # angular sweep) without waiting for the next selection change.
     saveAsRingChanged = Signal(bool)
+    # Emits the active fit-mode token (``"scipy_1d"`` or
+    # ``"pygidfit_2d"``) when the user flips the radio pair. The host
+    # connects this to a preview-refresh shim so the dashed cyan
+    # preview redraws immediately with the new mode's box widths
+    # (radial / angular convention differs per mode — see
+    # ``_update_fitted_preview`` in main_window).
+    fitModeChanged = Signal(str)
     deletePeakRequested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -81,7 +99,8 @@ class ParameterPanel(QGroupBox):
         _id_h.addWidget(self._source_swatch)
         # Fit-derived rows. Populated from the profile viewer's last 1D
         # Gaussian fits (manual peaks: real refit; non-manual: synthetic
-        # Gaussian honoring the FWHM_r / 2·FWHM_a box convention).
+        # Gaussian honoring the unified ``2σ`` box convention shared by
+        # the 1D and 2D Add-to-fitted code paths).
         self._fit_radius_label = self._make_value_label()
         self._fit_fwhm_r_label = self._make_value_label()
         self._fit_angle_label = self._make_value_label()
@@ -148,6 +167,47 @@ class ParameterPanel(QGroupBox):
         add_row_widget.setLayout(add_row)
         outer.addWidget(add_row_widget)
 
+        # Fit-mode selector for Add-to-fitted. Two radios, mutually
+        # exclusive via a QButtonGroup. Default is 2D pygidfit (matches
+        # what the pipeline run_fitting writes). 1D scipy is the legacy
+        # mode that pre-dated the F-06 work — kept available because
+        # narrow / off-shape peaks sometimes look better with scipy's
+        # quick 1D model than with the full 2D Gaussian. Greyed out
+        # when "Save fitted as ring" is on because pygidfit's segment
+        # model can't fit a ring cleanly; the ring storage convention
+        # bypasses both fit paths anyway.
+        self.rb_fit_2d = QRadioButton("2D fit (pygidfit)")
+        self.rb_fit_2d.setToolTip(
+            "Save through pygidfit's 2D Gaussian fit — same model the "
+            "pipeline 'run_fitting' uses. Stores real A/B/C/theta shape "
+            "coefficients on the row."
+        )
+        self.rb_fit_1d = QRadioButton("1D fit (scipy)")
+        self.rb_fit_1d.setToolTip(
+            "Save through the legacy 1D scipy Gaussian fit on the radial "
+            "and angular profile slices. 2D shape coefficients are "
+            "zero-filled. Useful when the 2D fit doesn't converge on "
+            "the active box."
+        )
+        self.rb_fit_2d.setChecked(True)
+        self._fit_mode_group = QButtonGroup(self)
+        self._fit_mode_group.setExclusive(True)
+        self._fit_mode_group.addButton(self.rb_fit_2d)
+        self._fit_mode_group.addButton(self.rb_fit_1d)
+        # Either toggled signal fires for both buttons in an exclusive
+        # group — fan in to one emit per user click.
+        self._fit_mode_group.buttonToggled.connect(
+            lambda *_: self.fitModeChanged.emit(self.fit_mode())
+        )
+        fit_mode_row = QWidget()
+        fit_mode_h = QHBoxLayout(fit_mode_row)
+        fit_mode_h.setContentsMargins(0, 0, 0, 0)
+        fit_mode_h.setSpacing(12)
+        fit_mode_h.addWidget(self.rb_fit_2d)
+        fit_mode_h.addWidget(self.rb_fit_1d)
+        fit_mode_h.addStretch(1)
+        outer.addWidget(fit_mode_row)
+
         # Ring/segment toggle — applies to whichever box "Add to fitted"
         # would commit. State is sticky: once the user (un)checks it the
         # value persists across selection changes; only Add-to-fitted
@@ -155,8 +215,13 @@ class ParameterPanel(QGroupBox):
         # When checked, the saved row uses the canonical ring convention
         # (angle = 45°, angle_width = ∞), the angular profile fit is
         # skipped, and the cyan preview renders as a full-sweep ring.
+        # Ring also forces the legacy 1D code path — pygidfit's segment
+        # model has no ring analogue — so the fit-mode radios above are
+        # greyed out while the ring box is checked (see
+        # ``_sync_fit_mode_enabled``).
         self.chk_save_as_ring = QCheckBox("Save fitted as ring")
         self.chk_save_as_ring.toggled.connect(self.saveAsRingChanged)
+        self.chk_save_as_ring.toggled.connect(self._sync_fit_mode_enabled)
         outer.addWidget(self.chk_save_as_ring)
 
         # Run fitting / Run matching used to live here too, but they're
@@ -335,6 +400,35 @@ class ParameterPanel(QGroupBox):
     def save_as_ring(self) -> bool:
         """Whether the next Add-to-fitted should commit a ring row."""
         return self.chk_save_as_ring.isChecked()
+
+    def fit_mode(self) -> str:
+        """Return the active Add-to-fitted dispatch mode.
+
+        ``FIT_MODE_1D`` (``"scipy_1d"``) → legacy 1D scipy + zero-fill
+        path. ``FIT_MODE_2D`` (``"pygidfit_2d"``) → pygidfit's 2D fit
+        via ``mlgidlab.manual_fit.fit_one_peak``. Returns the 1D token
+        whenever the ring toggle is on, since pygidfit's segment model
+        can't fit a ring cleanly — the host should respect this and
+        skip the 2D dispatch even if the radio is on.
+        """
+        if self.chk_save_as_ring.isChecked():
+            return self.FIT_MODE_1D
+        return (
+            self.FIT_MODE_2D if self.rb_fit_2d.isChecked() else self.FIT_MODE_1D
+        )
+
+    def _sync_fit_mode_enabled(self, ring_checked: bool) -> None:
+        """Grey out the fit-mode radios when ring storage is on.
+
+        pygidfit doesn't model rings, so the 2D option would
+        misconverge or fail; the ring code path uses the legacy 1D
+        machinery regardless. Disabling the radios while ring is on
+        makes that constraint visible — the user can see at a glance
+        that they can't pick a different mode here.
+        """
+        enabled = not bool(ring_checked)
+        self.rb_fit_2d.setEnabled(enabled)
+        self.rb_fit_1d.setEnabled(enabled)
 
     def reset_save_as_ring(self) -> None:
         """Force the ring toggle back to unchecked.
