@@ -481,7 +481,11 @@ class _LabelEventFilter(QObject):
     drawStarted = Signal(QPointF)
     drawUpdated = Signal(QPointF, QPointF)
     drawFinished = Signal(QPointF, QPointF)
-    selectAt = Signal(QPointF)
+    # LMB click (no drag). Carries the data-space click point + the
+    # keyboard modifiers that were held at press time. Ctrl+click is
+    # multi-select; bare click replaces; Ctrl+Alt+click never gets
+    # here because the press branch routes it to ``drawStarted``.
+    selectAt = Signal(QPointF, object)  # (QPointF, Qt.KeyboardModifiers)
     # Bare LMB double-click (no modifiers, no drag) — wired to reset zoom.
     doubleClicked = Signal()
     # Hover-aware cursor tracking — fires on every mouse move (with or
@@ -533,6 +537,16 @@ class _LabelEventFilter(QObject):
                 return True  # consume so pan doesn't engage
             self._press_pos = ev.position().toPoint()
             self._press_mods = mods
+            # Ctrl-only LMB press: consume so pyqtgraph's ViewBox
+            # doesn't take it as a zoom-rect / pan-modifier drag and
+            # swallow the matching release before our click handler
+            # sees it. Bare LMB still falls through so pyqtgraph can
+            # pan / zoom as before.
+            if (
+                bool(mods & Qt.KeyboardModifier.ControlModifier)
+                and not bool(mods & Qt.KeyboardModifier.AltModifier)
+            ):
+                return True
             return False
         if et == QEvent.Type.MouseMove:
             # Always emit cursor position for the status-bar readout —
@@ -553,16 +567,31 @@ class _LabelEventFilter(QObject):
                 return True
             if self._press_pos is not None:
                 delta = ev.position().toPoint() - self._press_pos
-                bare_click = (
+                is_click = (
                     delta.manhattanLength() <= self.CLICK_TOLERANCE_PX
-                    and self._press_mods == Qt.KeyboardModifier.NoModifier
                 )
+                press_mods = self._press_mods
                 self._press_pos = None
                 self._press_mods = Qt.KeyboardModifier.NoModifier
-                if bare_click:
+                ctrl_only_press = (
+                    bool(press_mods & Qt.KeyboardModifier.ControlModifier)
+                    and not bool(press_mods & Qt.KeyboardModifier.AltModifier)
+                )
+                if is_click:
+                    # Emit for any single-modifier combo (Ctrl alone for
+                    # multi-select toggle, no modifier for replace). Ctrl+Alt
+                    # never reaches here because the press branch routed
+                    # to ``drawStarted`` and consumed the event. Other
+                    # combinations (e.g. Shift) fall through to the same
+                    # slot, which can decide whether to act.
                     pos = self._viewport_to_data(ev.position().toPoint())
-                    self.selectAt.emit(pos)
-                    # Do not consume — pyqtgraph still emits a click for menus, etc.
+                    self.selectAt.emit(pos, press_mods)
+                    # Bare clicks don't consume — pyqtgraph still emits
+                    # a click for menus, etc. Ctrl+LMB release IS
+                    # consumed because we consumed the matching press;
+                    # pyqtgraph would otherwise see an orphan release.
+                    if ctrl_only_press:
+                        return True
         return False
 
     def _viewport_to_data(self, viewport_pt: QPoint) -> QPointF:
@@ -802,6 +831,11 @@ class GIWAXSImageViewer(QWidget):
     # different from what the UI showed last (frame change, fresh load,
     # re-render after pipeline run). Args: (frame, list[MatchedStructure]).
     matchedStructuresChanged = Signal(int, list)
+    # Emitted alongside ``selectionChanged`` with the full multi-selection
+    # list (primary + extras). Single-peak consumers stay on the legacy
+    # ``selectionChanged(SelectedPeak | None)``; multi-aware consumers
+    # (copy handler, batch-fit button enable) subscribe here.
+    selectionsChanged = Signal(list)          # list[SelectedPeak]
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -988,6 +1022,12 @@ class GIWAXSImageViewer(QWidget):
         self._polar_cache: "tuple[_LazyPolarStack, np.ndarray, np.ndarray] | None" = None  # type: ignore[name-defined]
         self._next_manual_id = -1  # negative IDs distinguish manual from detected
         self._selected: SelectedPeak | None = None
+        # Secondary selections for the multi-select (Ctrl+click / Ctrl+A)
+        # workflow. Restricted to ``kind == "detected"`` in this iteration
+        # (the only kind in scope for copy/paste + batch fit). The primary
+        # ``_selected`` can be any kind; extras are only ever appended via
+        # ``_toggle_selected`` which gates on detected.
+        self._selected_extras: list[SelectedPeak] = []
         self._roi_item: pg.ROI | None = None
         # Stacks of `_Action` objects. Pushing to undo clears redo. ROI drags
         # populate _roi_drag_before on sigRegionChangeStarted and consume it
@@ -1009,6 +1049,13 @@ class GIWAXSImageViewer(QWidget):
         # mirrors what Add-to-fitted will write when the "Save fitted as
         # ring" toggle is on.
         self._fitted_preview_is_ring: bool = False
+        # Cyan dashed previews for the Ctrl+click extras. Same shape
+        # as ``_fitted_preview_geom`` but a list — one entry per extra
+        # whose pygidfit result the host has computed. Always
+        # segments (extras are detected, no ring sentinel).
+        self._fitted_preview_extras_geoms: list[
+            tuple[float, float, float, float]
+        ] = []
 
         # NB: pyqtgraph's sigTimeChanged is no longer connected — we
         # stopped feeding ImageView 3D stacks once lazy frame loading
@@ -1375,6 +1422,7 @@ class GIWAXSImageViewer(QWidget):
         self._selection.clear_path()
         self._fitted_preview.clear_path()
         self._fitted_preview_geom = None
+        self._fitted_preview_extras_geoms = []
         self._frame_peaks.clear()
         self._manual_peaks.clear()
         self._undo_stack.clear()
@@ -1385,6 +1433,7 @@ class GIWAXSImageViewer(QWidget):
         self._matched_visibility.clear()
         had_selection = self._selected is not None
         self._selected = None
+        self._selected_extras = []
         self._roi_drag_before = None
         self._sync_roi()
         # Release the long-lived h5py read handle before dropping the
@@ -1585,14 +1634,17 @@ class GIWAXSImageViewer(QWidget):
         self._redo_stack.clear()
 
     def clear_selection(self) -> None:
-        if self._selected is None:
+        if self._selected is None and not self._selected_extras:
             return
         self._selected = None
+        self._selected_extras = []
         self._fitted_preview_geom = None
         self._fitted_preview_is_ring = False
+        self._fitted_preview_extras_geoms = []
         self._sync_roi()
         self._render_overlays(self.current_frame)
         self.selectionChanged.emit(None)
+        self.selectionsChanged.emit([])
 
     def clear_all_manual_peaks(self) -> None:
         """Drop every manual peak across all frames + the undo history.
@@ -1670,6 +1722,40 @@ class GIWAXSImageViewer(QWidget):
             self._fitted_preview_is_ring = False
         self._render_overlays(self.current_frame)
 
+    def set_fitted_preview_extras(
+        self,
+        geoms: list[tuple[float, float, float, float]],
+    ) -> None:
+        """Paint cyan dashed previews for every Ctrl+click extra.
+
+        ``geoms`` is a list of ``(radius, radius_width, angle,
+        angle_width)`` tuples — one per extra peak whose pygidfit
+        result the host has already computed (or fallen back from).
+        Pass ``[]`` to clear. Each tuple paints the same way the
+        primary preview does (no ring support for extras: extras are
+        detected peaks, which never use the ring sentinel).
+
+        Stored alongside ``_fitted_preview_geom`` (which still owns
+        the primary peak's preview) so the renderer can paint N
+        boxes from a single ``_PeakShapeItem``.
+        """
+        cleaned: list[tuple[float, float, float, float]] = []
+        for g in geoms:
+            try:
+                cr, wr, ca, wa = (float(g[0]), float(g[1]), float(g[2]), float(g[3]))
+            except (TypeError, ValueError, IndexError):
+                continue
+            if not (
+                np.isfinite(cr) and np.isfinite(wr) and wr > 0
+                and np.isfinite(ca) and np.isfinite(wa) and wa > 0
+            ):
+                continue
+            cleaned.append((cr, wr, ca, wa))
+        if cleaned == self._fitted_preview_extras_geoms:
+            return
+        self._fitted_preview_extras_geoms = cleaned
+        self._render_overlays(self.current_frame)
+
     def set_busy(self, busy: bool) -> None:
         """Disable interactive editing while a pipeline run is in flight."""
         self._busy = busy
@@ -1697,6 +1783,12 @@ class GIWAXSImageViewer(QWidget):
         per-frame overlays, and emits ``frameChanged`` plus
         ``matchedStructuresChanged`` exactly once.
 
+        Also prunes any selected peaks that belong to a different
+        frame so the white highlight overlay doesn't paint stale
+        rectangles at coordinates that don't correspond to a real
+        peak on the new frame (typical after a copy/paste workflow
+        where the source-frame selection lingers).
+
         No-op when ``frame`` is already current or out of range.
         """
         n = self.n_frames
@@ -1706,6 +1798,7 @@ class GIWAXSImageViewer(QWidget):
         if idx == self._frame_index:
             return
         self._frame_index = idx
+        self._prune_off_frame_selections(idx)
         self._render_frame(idx, auto_range=False)
         self._render_overlays(idx)
         self.frameChanged.emit(idx)
@@ -1713,9 +1806,64 @@ class GIWAXSImageViewer(QWidget):
         # signal — different frames can have different solutions.
         self.matchedStructuresChanged.emit(idx, self.matched_structures(idx))
 
+    def _prune_off_frame_selections(self, frame: int) -> None:
+        """Drop any selected peaks whose ``.frame`` is not ``frame``.
+
+        Called when the user navigates between frames so the white
+        highlight overlay only paints peaks that actually exist on
+        the visible frame. Manual peaks are exempt because their
+        ``.frame`` is the frame they were drawn on and the manual-
+        peak rendering already gates on ``self.current_frame``;
+        pruning them here would erase their selection across
+        navigation which is the wrong default. Detected / fitted /
+        matched selections are frame-bound and get pruned.
+
+        Emits ``selectionChanged`` and ``selectionsChanged`` once
+        if anything actually changed.
+        """
+        def _on_frame(s: SelectedPeak) -> bool:
+            # Manual peaks survive a frame switch — they have a
+            # frame field but their renderer is frame-aware and the
+            # user's draw intent is "this one specific peak".
+            if s.kind == "manual":
+                return True
+            return int(s.frame) == int(frame)
+
+        prev_primary = self._selected
+        prev_extras = list(self._selected_extras)
+        # Filter extras first.
+        self._selected_extras = [s for s in self._selected_extras if _on_frame(s)]
+        # If the primary doesn't belong here, promote the first
+        # surviving extra (or clear).
+        if self._selected is not None and not _on_frame(self._selected):
+            if self._selected_extras:
+                self._selected = self._selected_extras.pop(0)
+            else:
+                self._selected = None
+        if (
+            self._selected is prev_primary
+            and self._selected_extras == prev_extras
+        ):
+            return
+        self._sync_roi()
+        self.selectionChanged.emit(self._selected)
+        self.selectionsChanged.emit(self.selected_peaks())
+
     @property
     def selected_peak(self) -> SelectedPeak | None:
         return self._selected
+
+    def selected_peaks(self) -> list[SelectedPeak]:
+        """Full multi-selection list (primary + extras), or empty when
+        nothing is selected.
+
+        Backs the Ctrl+C copy handler and the batch-fit button enable
+        check on the host. Order is stable: primary first, extras in
+        the order they were Ctrl+click-added.
+        """
+        if self._selected is None:
+            return []
+        return [self._selected, *self._selected_extras]
 
     @property
     def is_dragging(self) -> bool:
@@ -2188,13 +2336,22 @@ class GIWAXSImageViewer(QWidget):
                 m for m in manual_list if m is not self._selected.manual_ref
             ]
         manual_table = _peaks_from_manual(manual_list)
-        # Selection highlight: a one-row PeakTable from whatever's selected,
-        # except suppressed when the ROI is doing the highlighting itself.
-        # Matched-structure selections (multi_peak_ids set) expand to
-        # every peak in the structure — pull the geometry from the frame's
-        # fitted table so the boxes track ROI edits / re-fits.
+        # Selection highlight: a PeakTable holding one row per selected
+        # peak (primary + Ctrl+click extras). The primary peak gets
+        # painted *both* the white outline and (for editable kinds)
+        # the resize-ROI handles — the redundant outline is a small
+        # price for the visual consistency of "every selected peak
+        # looks selected", which matters in multi-select where the
+        # user is scanning to confirm what's in the set.
+        #
+        # Matched-structure primary selections (multi_peak_ids set)
+        # expand to every peak in the structure — pull the geometry
+        # from the frame's fitted table so the boxes track ROI edits
+        # / re-fits. Matched-multi can't coexist with extras (extras
+        # only accept detected), so the two branches stay mutually
+        # exclusive.
         sel_table: PeakTable | None = None
-        if self._selected is not None and not roi_active:
+        if self._selected is not None:
             if self._selected.multi_peak_ids and fit is not None:
                 sel_table = _peaks_subset(fit, self._selected.multi_peak_ids)
                 # Fallback to the representative peak if every id has
@@ -2214,56 +2371,60 @@ class GIWAXSImageViewer(QWidget):
             else:
                 sel_table = _peaks_from_manual([
                     ManualPeak(
-                        radius=self._selected.radius,
-                        angle=self._selected.angle,
-                        radius_width=self._selected.radius_width,
-                        angle_width=self._selected.angle_width,
-                        is_ring=self._selected.is_ring,
-                        temp_id=self._selected.peak_id,
+                        radius=s.radius,
+                        angle=s.angle,
+                        radius_width=s.radius_width,
+                        angle_width=s.angle_width,
+                        is_ring=s.is_ring,
+                        temp_id=s.peak_id,
                     )
+                    for s in self.selected_peaks()
                 ])
 
-        # Fitted-preview overlay: only meaningful while a candidate peak
-        # (manual or detected) is the active selection — both are subject to
-        # an Add-to-fitted commit and the cyan box previews where the saved
-        # row would land. Hide for fitted/matched selections (already on
-        # file with their own box).
-        preview_table: PeakTable | None = None
-        if (
-            self._fitted_preview_geom is not None
-            and self._selected is not None
+        # Fitted-preview overlay: one cyan dashed box per fittable
+        # selected peak (primary + Ctrl+click extras). Only meaningful
+        # for manual / detected selections — fitted / matched are
+        # already on file with their own boxes.
+        #
+        # Layered painter contract: primary geometry comes from
+        # ``_fitted_preview_geom`` (with optional ring mode);
+        # extras come from ``_fitted_preview_extras_geoms`` (always
+        # segments). The host populates both before invoking
+        # ``_render_overlays``; this function just builds the table.
+        preview_peaks: list[ManualPeak] = []
+        primary_eligible = (
+            self._selected is not None
             and self._selected.kind in ("manual", "detected")
-        ):
+        )
+        if primary_eligible and self._fitted_preview_geom is not None:
             cr, wr, ca, wa = self._fitted_preview_geom
             if self._fitted_preview_is_ring:
-                # Ring preview: angular dimensions ignored, full sweep at
-                # the canonical (45°, ∞) ring convention. ``wr`` is the
-                # literal radial box width the caller wants drawn — see
-                # ``set_fitted_preview`` (dumb painter, no convention
-                # math here).
-                preview_table = _peaks_from_manual([
-                    ManualPeak(
-                        radius=cr, angle=45.0,
-                        radius_width=wr,
-                        angle_width=float("inf"),
-                        is_ring=True, temp_id=0,
-                    )
-                ])
+                preview_peaks.append(ManualPeak(
+                    radius=cr, angle=45.0,
+                    radius_width=wr,
+                    angle_width=float("inf"),
+                    is_ring=True, temp_id=0,
+                ))
             else:
-                # Both ``wr`` and ``wa`` are the literal box widths the
-                # caller wants drawn (``MainWindow._update_fitted_preview``
-                # has already done the convention math: both modes use
-                # ``2σ_r × 2σ_a``). Do NOT double / scale anything here
-                # — that produced a preview twice as wide as the saved
-                # row when the caller's contract changed under us.
-                preview_table = _peaks_from_manual([
-                    ManualPeak(
-                        radius=cr, angle=ca,
-                        radius_width=wr,
-                        angle_width=wa,
-                        is_ring=False, temp_id=0,
-                    )
-                ])
+                preview_peaks.append(ManualPeak(
+                    radius=cr, angle=ca,
+                    radius_width=wr,
+                    angle_width=wa,
+                    is_ring=False, temp_id=0,
+                ))
+        # Extras get a preview whenever the primary is fittable
+        # (extras only carry detected, which is always fittable).
+        if primary_eligible:
+            for cr, wr, ca, wa in self._fitted_preview_extras_geoms:
+                preview_peaks.append(ManualPeak(
+                    radius=cr, angle=ca,
+                    radius_width=wr,
+                    angle_width=wa,
+                    is_ring=False, temp_id=0,
+                ))
+        preview_table: PeakTable | None = (
+            _peaks_from_manual(preview_peaks) if preview_peaks else None
+        )
 
         # Live angular extent of the displayed polar stack so ring
         # overlays (and any segment whose stored angle_width spills
@@ -2535,19 +2696,39 @@ class GIWAXSImageViewer(QWidget):
             ManualReplaceAction(frame=frame, old_peak=old_peak, new_peak=peak)
         )
 
-    def _on_select_at(self, pos: QPointF) -> None:
+    def _on_select_at(self, pos: QPointF, mods=Qt.KeyboardModifier.NoModifier) -> None:
         # Raw mode has no q-space overlays to hit-test. Polar and
         # Cartesian both run the same hit-test pipeline; the click
         # coordinates arrive in whatever space the viewbox is currently
         # showing (polar = (r, a), cartesian = (q_xy, q_z)), and the
         # mode-specific helpers below normalise to polar before
         # checking containment.
+        #
+        # ``mods``: keyboard modifiers held at press time.
+        #
+        # * Bare click (no modifiers): walks the full priority list
+        #   ``manual > fitted > detected > matched`` and routes the
+        #   first hit through ``_set_selected``.
+        # * Ctrl+click: hit-tests *only* the detected overlay and
+        #   routes through ``_toggle_selected``. Skipping manual /
+        #   fitted / matched is intentional — Ctrl+click means
+        #   "multi-select detected", and the user otherwise can't
+        #   reach a detected peak that has a fitted box drawn on
+        #   top of it (which happens after every Run Fitting). If
+        #   no detected peak is under the cursor, Ctrl+click is a
+        #   no-op (the existing single selection stays put).
+        # * Ctrl+Alt never reaches here (press branch consumed it
+        #   as a draw gesture).
         if self._mode not in (MODE_POLAR, MODE_CARTESIAN) or self._busy:
             return
         x, y = float(pos.x()), float(pos.y())
         cart = self._mode == MODE_CARTESIAN
         frame = self.current_frame
         peaks_for_frame = self._frame_peaks.get(frame) or {}
+        ctrl_only = (
+            bool(mods & Qt.KeyboardModifier.ControlModifier)
+            and not bool(mods & Qt.KeyboardModifier.AltModifier)
+        )
 
         def hit_manual(peak: ManualPeak) -> bool:
             return _cart_box_contains(peak, x, y) if cart else _polar_box_contains(peak, x, y)
@@ -2557,6 +2738,34 @@ class GIWAXSImageViewer(QWidget):
                 _cart_table_row_contains(tbl, i, x, y) if cart
                 else _polar_table_row_contains(tbl, i, x, y)
             )
+
+        # Ctrl+click is restricted to the detected overlay so the
+        # gesture does what the user expects even when fitted /
+        # matched overlays cover the detected peak.
+        if ctrl_only:
+            if not self._visibility.get("detected", True):
+                return
+            table = peaks_for_frame.get("detected")
+            if table is None or len(table) == 0:
+                return
+            for i in reversed(range(len(table))):
+                if hit_table(table, i):
+                    self._toggle_selected(SelectedPeak(
+                        kind="detected",
+                        frame=frame,
+                        peak_id=int(table.ids[i]),
+                        radius=float(table.radius[i]),
+                        angle=float(table.angle[i]),
+                        radius_width=float(table.radius_width[i]),
+                        angle_width=float(table.angle_width[i]),
+                        is_ring=bool(table.is_ring[i]),
+                        score=float(table.score[i]),
+                        amplitude=float(table.amplitude[i]),
+                    ))
+                    return
+            # Ctrl+click on empty space (or only-non-detected hits) =
+            # no-op; the existing multi-selection stays put.
+            return
 
         # Priority order: manual > fitted > detected > matched. Matched is
         # last because it's a subset of fitted; the rare case where the user
@@ -2626,7 +2835,8 @@ class GIWAXSImageViewer(QWidget):
                         ))
                         return
 
-        # Click on empty space → deselect
+        # Click on empty space → deselect (the Ctrl branch already
+        # early-returned above, so this only runs on bare clicks).
         if self._selected is not None:
             self._set_selected(None)
 
@@ -2660,16 +2870,19 @@ class GIWAXSImageViewer(QWidget):
         an Add-to-fitted commit) and the matching redo closure in
         ``_push_fitted_add_undo``.
         """
-        if sel is None and self._selected is None:
+        if sel is None and self._selected is None and not self._selected_extras:
             return
-        if (
+        primary_unchanged = (
             sel is not None
             and self._selected is not None
             and sel.kind == self._selected.kind
             and sel.frame == self._selected.frame
             and sel.peak_id == self._selected.peak_id
             and sel.structure_uid == self._selected.structure_uid
-        ):
+        )
+        # When the primary doesn't change but extras exist, this call
+        # still has work to do (collapse multi-selection back to one).
+        if primary_unchanged and not self._selected_extras:
             return
         prev = self._selected
         transitioning_away_from_manual = (
@@ -2691,9 +2904,66 @@ class GIWAXSImageViewer(QWidget):
                 # store state will end up with the right value.
                 self.remove_manual_peak(prev.frame, prev.manual_ref)
         self._selected = sel
+        # _set_selected is the "replace the selection" path; extras
+        # always clear here. ``_toggle_selected`` is the alternative
+        # entry that appends instead.
+        self._selected_extras = []
         self._sync_roi()
         self._render_overlays(self.current_frame)
         self.selectionChanged.emit(sel)
+        self.selectionsChanged.emit(self.selected_peaks())
+
+    def _toggle_selected(self, sel: SelectedPeak) -> None:
+        """Add / remove ``sel`` to/from the multi-selection (Ctrl+click).
+
+        Detected-only in this iteration: if ``sel.kind`` isn't
+        ``"detected"`` or the current primary is a non-detected kind,
+        fall back to ``_set_selected`` so the existing single-select
+        UX is preserved for manual / fitted / matched peaks.
+
+        Toggle semantics:
+          * No primary yet → ``sel`` becomes the primary.
+          * ``sel`` matches the primary → demote: promote
+            ``_selected_extras[0]`` to primary if any, else clear.
+          * ``sel`` matches an extra → drop from extras.
+          * Otherwise → append to extras.
+        """
+        if sel.kind != "detected":
+            self._set_selected(sel)
+            return
+        if self._selected is not None and self._selected.kind != "detected":
+            self._set_selected(sel)
+            return
+        if self._selected is None:
+            self._selected = sel
+            self._sync_roi()
+            self._render_overlays(self.current_frame)
+            self.selectionChanged.emit(sel)
+            self.selectionsChanged.emit(self.selected_peaks())
+            return
+        # Match by (kind, frame, peak_id) — geometry can shift via ROI
+        # drag without changing identity.
+        def _same(a: SelectedPeak, b: SelectedPeak) -> bool:
+            return (
+                a.kind == b.kind
+                and a.frame == b.frame
+                and a.peak_id == b.peak_id
+            )
+        if _same(sel, self._selected):
+            if self._selected_extras:
+                self._selected = self._selected_extras.pop(0)
+            else:
+                self._selected = None
+        elif any(_same(sel, e) for e in self._selected_extras):
+            self._selected_extras = [
+                e for e in self._selected_extras if not _same(sel, e)
+            ]
+        else:
+            self._selected_extras.append(sel)
+        self._sync_roi()
+        self._render_overlays(self.current_frame)
+        self.selectionChanged.emit(self._selected)
+        self.selectionsChanged.emit(self.selected_peaks())
 
     def keyPressEvent(self, ev) -> None:  # type: ignore[override]
         if (
@@ -2724,7 +2994,56 @@ class GIWAXSImageViewer(QWidget):
             self.remove_manual_peak(self.current_frame, self._selected.manual_ref)
             ev.accept()
             return
+        # Ctrl+A: select every detected peak on the current frame as
+        # the multi-selection. First detected row becomes primary; the
+        # rest become extras. Cheap pre-flight if the frame has no
+        # detected_peaks dataset.
+        if (
+            ev.key() == Qt.Key.Key_A
+            and ev.modifiers() == Qt.KeyboardModifier.ControlModifier
+            and not self._busy
+        ):
+            self._select_all_detected_on_frame()
+            ev.accept()
+            return
         super().keyPressEvent(ev)
+
+    def _select_all_detected_on_frame(self) -> None:
+        """Replace the selection with every detected peak on the current frame.
+
+        No-op if the frame has no detected table or zero rows. Emits
+        both ``selectionChanged`` (primary) and ``selectionsChanged``
+        (full list) once.
+        """
+        frame = self.current_frame
+        peaks_for_frame = self._frame_peaks.get(frame) or {}
+        table = peaks_for_frame.get("detected")
+        if table is None or len(table) == 0:
+            return
+
+        def _sel(i: int) -> SelectedPeak:
+            return SelectedPeak(
+                kind="detected",
+                frame=frame,
+                peak_id=int(table.ids[i]),
+                radius=float(table.radius[i]),
+                angle=float(table.angle[i]),
+                radius_width=float(table.radius_width[i]),
+                angle_width=float(table.angle_width[i]),
+                is_ring=bool(table.is_ring[i]),
+                score=float(table.score[i]),
+                amplitude=float(table.amplitude[i]),
+            )
+
+        sels = [_sel(i) for i in range(len(table))]
+        # Bypass _set_selected (which would clear extras) and write
+        # the multi-selection in one shot.
+        self._selected = sels[0]
+        self._selected_extras = sels[1:]
+        self._sync_roi()
+        self._render_overlays(self.current_frame)
+        self.selectionChanged.emit(self._selected)
+        self.selectionsChanged.emit(self.selected_peaks())
 
     # -- Resizable ROI on the selected peak --
 
@@ -2781,14 +3100,23 @@ class GIWAXSImageViewer(QWidget):
         pos = (r_lo, a_lo)
         size = (r_hi - r_lo, a_hi - a_lo)
 
-        # ROI pen colored by the source overlay's hue so the user keeps a
-        # visual link to which list the peak came from.
-        roi_color = OVERLAY_STYLE.get(sel.kind, OVERLAY_STYLE["manual"])["color"]
-        pen = pg.mkPen(QColor(roi_color), width=2.0)
-        pen.setStyle(Qt.PenStyle.SolidLine)
+        # ROI pen uses the selection white so the resize handles
+        # match the selection-highlight outline that wraps every
+        # selected peak. Source-kind colouring is preserved by the
+        # static overlay items (red dashed for detected, yellow
+        # solid for manual) — those stay visible behind the white
+        # outline + ROI handles.
+        pen = pg.mkPen(
+            QColor(SELECTION_STYLE["color"]),
+            width=SELECTION_STYLE["width"],
+        )
+        pen.setStyle(SELECTION_STYLE["style"])
         pen.setCosmetic(True)
+        # Hover keeps the same white pen so there's no flicker on
+        # mouseover.
         hover_pen = pg.mkPen(
-            QColor(SELECTION_STYLE["color"]), width=SELECTION_STYLE["width"]
+            QColor(SELECTION_STYLE["color"]),
+            width=SELECTION_STYLE["width"],
         )
         hover_pen.setCosmetic(True)
 

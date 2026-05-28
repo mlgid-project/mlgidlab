@@ -928,16 +928,17 @@ def load_matched_peaks(
     return out
 
 
-def add_fitted_peak_row(
+def _add_peak_row(
     file_path: Path,
     entry: str,
     frame: int,
     *,
+    dataset_name: str,
     angle: float,
     angle_width: float,
     radius: float,
     radius_width: float,
-    amplitude: float,
+    amplitude: float = 0.0,
     is_ring: bool = False,
     theta: float = 0.0,
     score: float = 0.0,
@@ -948,23 +949,22 @@ def add_fitted_peak_row(
     is_cut_qxy: bool = False,
     visibility: int = 0,
 ) -> int:
-    """Append a new row to the frame's ``fitted_peaks`` dataset.
+    """Append a new row to ``{entry}/analysis/frameNNNNN/{dataset_name}``.
 
-    Mirrors mlgidbase's row layout (see pygid.datasaver pygid_results_dtype):
-    polar geometry + amplitude + 2D-Gaussian shape params (A, B, C, theta)
-    + flags + an auto-assigned id. q_xy/q_z are recomputed from polar.
-
-    Caller-supplied fields drive only the meaningful values; the 2D-shape
-    params (A/B/C/theta) and score default to zero because a 1D-fit-derived
-    row carries no 2D context. Returns the new peak's ``id``.
+    Shared body for ``add_fitted_peak_row`` and ``add_detected_peak_row`` —
+    detected_peaks and fitted_peaks use the same structured dtype, so the
+    write path is identical apart from the dataset name. q_xy/q_z are
+    recomputed from polar; unset fields default to zero / False; the new
+    peak's id is ``max(id)+1`` (or 0 for the first row). Returns the new id.
     """
     frame_key = FRAME_KEY_FMT.format(frame)
     with h5py.File(file_path, "r+") as f:
-        ds_path = f"{entry}/{ANALYSIS_REL}/{frame_key}/fitted_peaks"
+        ds_path = f"{entry}/{ANALYSIS_REL}/{frame_key}/{dataset_name}"
         if ds_path not in f:
             raise KeyError(
-                f"fitted_peaks dataset missing at {ds_path} — run fitting "
-                "at least once on this frame before adding manual fitted rows."
+                f"{dataset_name} dataset missing at {ds_path} — run the "
+                "appropriate pipeline stage at least once on this frame "
+                "before adding rows."
             )
         ds = f[ds_path]
         arr = ds[()]
@@ -1005,6 +1005,82 @@ def add_fitted_peak_row(
         for k, v in attrs.items():
             new_ds.attrs[k] = v
         return new_id
+
+
+def add_fitted_peak_row(
+    file_path: Path,
+    entry: str,
+    frame: int,
+    *,
+    angle: float,
+    angle_width: float,
+    radius: float,
+    radius_width: float,
+    amplitude: float,
+    is_ring: bool = False,
+    theta: float = 0.0,
+    score: float = 0.0,
+    A: float = 0.0,
+    B: float = 0.0,
+    C: float = 0.0,
+    is_cut_qz: bool = False,
+    is_cut_qxy: bool = False,
+    visibility: int = 0,
+) -> int:
+    """Append a new row to the frame's ``fitted_peaks`` dataset.
+
+    Mirrors mlgidbase's row layout (see pygid.datasaver pygid_results_dtype):
+    polar geometry + amplitude + 2D-Gaussian shape params (A, B, C, theta)
+    + flags + an auto-assigned id. q_xy/q_z are recomputed from polar.
+
+    Caller-supplied fields drive only the meaningful values; the 2D-shape
+    params (A/B/C/theta) and score default to zero because a 1D-fit-derived
+    row carries no 2D context. Returns the new peak's ``id``.
+    """
+    return _add_peak_row(
+        file_path, entry, frame,
+        dataset_name="fitted_peaks",
+        angle=angle, angle_width=angle_width,
+        radius=radius, radius_width=radius_width,
+        amplitude=amplitude, is_ring=is_ring,
+        theta=theta, score=score,
+        A=A, B=B, C=C,
+        is_cut_qz=is_cut_qz, is_cut_qxy=is_cut_qxy,
+        visibility=visibility,
+    )
+
+
+def add_detected_peak_row(
+    file_path: Path,
+    entry: str,
+    frame: int,
+    *,
+    angle: float,
+    angle_width: float,
+    radius: float,
+    radius_width: float,
+    score: float = 0.0,
+    is_ring: bool = False,
+) -> int:
+    """Append a new row to the frame's ``detected_peaks`` dataset.
+
+    Used by the copy/paste flow to replay a detected peak on another
+    frame without going through mlgidbase's ``add_peak`` (which would
+    need the ``pipeline`` extra installed and run async via the
+    PipelineWorker queue). The structured dtype is the same as
+    fitted_peaks, so we share the write body via ``_add_peak_row``; the
+    2D-shape fields (A/B/C/theta) and ``amplitude`` default to zero
+    since a detected row carries no fit context.
+
+    Returns the new peak's ``id``.
+    """
+    return _add_peak_row(
+        file_path, entry, frame,
+        dataset_name="detected_peaks",
+        angle=angle, angle_width=angle_width,
+        radius=radius, radius_width=radius_width,
+        score=score, is_ring=is_ring,
+    )
 
 
 def normalize_for_pygid(file_path: Path) -> dict[str, list[str]]:

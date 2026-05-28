@@ -168,10 +168,25 @@ A working sample is bundled at `example/BA2PbI4.h5` plus
   fitted as ring** for full-azimuthal peaks: the cyan preview
   switches to a full-quadrant ring and ring storage forces 1D
   (pygidfit doesn't model rings).
+- **Multi-select detected peaks** with `Ctrl+click` (toggle one peak
+  in / out of the selection) or `Ctrl+A` (every detected peak on
+  the current frame). Non-detected kinds still single-select; the
+  multi-selection is scoped to detected for this iteration.
+- **Copy / paste detected peaks** with `Ctrl+C` / `Ctrl+V`. Paste
+  appends new detected rows on the current frame with the same
+  polar geometry as the source — useful for replaying the same
+  peak layout across frames in a series. Same-entry only; pasting
+  after switching to a different entry is a no-op (status-bar
+  hint). One `Ctrl+Z` reverses the whole paste batch.
+- **Fit selected (2D)** runs pygidfit on every selected detected
+  peak in one batch, with a progress dialog and Cancel. Each
+  successful fit appends a fitted row. 1D batch fits are
+  intentionally not offered (the 1D projection doesn't generalise
+  across peaks the way pygidfit's 2D model does).
 - **Undo / redo** with `Ctrl+Z` / `Ctrl+Shift+Z` covers manual
   add / remove / geometry edits, detected / fitted geometry
-  edits, and Add-to-fitted commits (undoing one deletes the new
-  fitted row and reselects the source peak). Pipeline ops that
+  edits, Add-to-fitted commits, paste batches, and batch-fit
+  results — each is one grouped action. Pipeline ops that
   re-index peak ids clear the history.
 - The **Display dock** carries a master Matched-peaks toggle that
   cascades to every per-structure row; ticking a single structure

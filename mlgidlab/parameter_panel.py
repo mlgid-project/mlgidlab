@@ -49,6 +49,11 @@ class ParameterPanel(QGroupBox):
 
     addToDetectedRequested = Signal()
     addToFittedRequested = Signal()
+    # Batch 2D-fit of the multi-selection. Only emitted when at least
+    # one detected peak is selected and ring-storage is OFF (ring forces
+    # 1D, which doesn't batch). The host loops ``_run_pygidfit_for_selection``
+    # over the selected detected peaks inside a QProgressDialog.
+    batchFit2DRequested = Signal()
     # Emits the new state of the "Save fitted as ring" checkbox so the host
     # can refresh the cyan fitted-preview overlay (rings render as a full
     # angular sweep) without waiting for the next selection change.
@@ -147,6 +152,10 @@ class ParameterPanel(QGroupBox):
         self._form = form
 
         self._mlgidbase_available = is_mlgidbase_available()
+        # Host-driven flag: True while the viewer has ≥2 fittable
+        # peaks selected. Disables the 1D fit-mode radio because
+        # batch fits are 2D-only.
+        self._multi_select_active = False
 
         # "Add to detected" and "Add to fitted" are mutually exclusive choices
         # the user picks per manual peak — sit them side by side.
@@ -158,11 +167,24 @@ class ParameterPanel(QGroupBox):
             "parameters from the radial / angular profile."
         )
         self.btn_add_fitted.clicked.connect(self.addToFittedRequested)
+        # Batch 2D fit: run pygidfit on every selected detected peak in
+        # one go. Disabled unless multi-selection has at least one
+        # detected peak AND ring storage is OFF (ring forces 1D).
+        self.btn_fit_selected_2d = QPushButton("Fit selected (2D)")
+        self.btn_fit_selected_2d.setToolTip(
+            "Run pygidfit on every selected detected peak and append "
+            "a fitted_peaks row for each. 2D only — 1D batch fits are "
+            "not offered (the 1D projection doesn't generalise across "
+            "peaks the way pygidfit's 2D model does)."
+        )
+        self.btn_fit_selected_2d.setEnabled(False)
+        self.btn_fit_selected_2d.clicked.connect(self.batchFit2DRequested)
         add_row = QHBoxLayout()
         add_row.setContentsMargins(0, 0, 0, 0)
         add_row.setSpacing(6)
         add_row.addWidget(self.btn_add_detected)
         add_row.addWidget(self.btn_add_fitted)
+        add_row.addWidget(self.btn_fit_selected_2d)
         add_row_widget = QWidget()
         add_row_widget.setLayout(add_row)
         outer.addWidget(add_row_widget)
@@ -418,17 +440,37 @@ class ParameterPanel(QGroupBox):
         )
 
     def _sync_fit_mode_enabled(self, ring_checked: bool) -> None:
-        """Grey out the fit-mode radios when ring storage is on.
+        """Grey out the fit-mode radios for the active constraints.
 
-        pygidfit doesn't model rings, so the 2D option would
-        misconverge or fail; the ring code path uses the legacy 1D
-        machinery regardless. Disabling the radios while ring is on
-        makes that constraint visible — the user can see at a glance
-        that they can't pick a different mode here.
+        Two gates compose:
+
+        * **Ring storage on**: both radios disabled. pygidfit doesn't
+          model rings; the ring code path uses the legacy 1D machinery
+          regardless, so neither radio's choice can change the result.
+        * **Multi-select active**: only the 1D radio is disabled.
+          Batch fits are 2D-only (per user constraint: "should not be
+          possible for 1D fits since that does not make sense
+          physically"), so the 1D option would mislead about what
+          'Fit selected (2D)' will do.
         """
-        enabled = not bool(ring_checked)
-        self.rb_fit_2d.setEnabled(enabled)
-        self.rb_fit_1d.setEnabled(enabled)
+        ring_disabled = bool(ring_checked)
+        multi_disabled = self._multi_select_active
+        self.rb_fit_2d.setEnabled(not ring_disabled)
+        self.rb_fit_1d.setEnabled(not ring_disabled and not multi_disabled)
+
+    def set_multi_select_active(self, active: bool) -> None:
+        """Toggle the multi-select gate on the 1D fit-mode radio.
+
+        Driven by the host from ``selectionsChanged``: when ≥2
+        fittable peaks are selected, the 1D radio greys out. Pure
+        UI state; ``fit_mode()`` still reports whatever the radio
+        is checked on (the host's batch-fit handler ignores it and
+        always runs 2D).
+        """
+        if self._multi_select_active == bool(active):
+            return
+        self._multi_select_active = bool(active)
+        self._sync_fit_mode_enabled(self.chk_save_as_ring.isChecked())
 
     def reset_save_as_ring(self) -> None:
         """Force the ring toggle back to unchecked.
@@ -441,6 +483,32 @@ class ParameterPanel(QGroupBox):
         if self.chk_save_as_ring.isChecked():
             self.chk_save_as_ring.setChecked(False)
 
+    def set_batch_fit_enabled(self, enabled: bool) -> None:
+        """Enable / disable the 'Fit selected (2D)' button.
+
+        Driven by the host from ``selectionsChanged`` /
+        ``saveAsRingChanged``. The host computes the predicate
+        (≥1 detected selected AND not save-as-ring) since the panel
+        has no view of the multi-selection.
+        """
+        self.btn_fit_selected_2d.setEnabled(enabled)
+
+    def set_fit_button_visibility(
+        self, *, add_fitted: bool, fit_selected_2d: bool,
+    ) -> None:
+        """Show one of {Add to fitted, Fit selected (2D)} at a time.
+
+        Mutually exclusive visibility (mirrors the host's view of the
+        multi-selection: a single fittable peak shows Add to fitted;
+        ≥2 detected peaks show Fit selected (2D); neither when no
+        fittable selection exists). 'Add to detected' stays in
+        place and is only enable-toggled by ``_update_actions_enabled``.
+        Driven by the host on every ``selectionsChanged`` /
+        ``saveAsRingChanged`` tick.
+        """
+        self.btn_add_fitted.setVisible(add_fitted)
+        self.btn_fit_selected_2d.setVisible(fit_selected_2d)
+
     def set_busy(self, busy: bool) -> None:
         """Disable buttons while a pipeline run is in flight."""
         if not self._mlgidbase_available:
@@ -449,6 +517,7 @@ class ParameterPanel(QGroupBox):
             for btn in (
                 self.btn_add_detected,
                 self.btn_add_fitted,
+                self.btn_fit_selected_2d,
                 self.btn_delete_peak,
             ):
                 btn.setEnabled(False)

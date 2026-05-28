@@ -67,6 +67,7 @@ from silx.gui.hdf5 import Hdf5TreeModel, Hdf5TreeView
 from silx.gui.hdf5.NexusSortFilterProxyModel import NexusSortFilterProxyModel
 
 from mlgidlab import file_model
+from mlgidlab import peak_clipboard
 from mlgidlab.image_viewer import (
     GIWAXSImageViewer,
     MATCHED_STYLE,
@@ -636,12 +637,15 @@ class MainWindow(QMainWindow):
             ManualPeak, float, float, float, float, bool
         ] | None = None
 
-        # 2D-preview cache: (fingerprint, ManualFitResult | None).
+        # 2D-preview cache: fingerprint -> ManualFitResult | None.
         # Fingerprint is the user-controlled inputs to the live
         # pygidfit call; identical fingerprint → reuse the cached
-        # result instead of rerunning the (slow) 2D fit. Cleared
-        # when a fresh entry / session / file load happens.
-        self._2d_preview_cache: tuple[tuple, object] | None = None
+        # result instead of rerunning the (slow) 2D fit. A dict
+        # (not just one slot) so the multi-selection cyan-preview
+        # path can show N boxes without recomputing N peaks every
+        # selection-tick. ``None`` value means pygidfit ran but
+        # didn't converge — cached so we don't retry the same fail.
+        self._2d_preview_cache: dict[tuple, object] = {}
 
         self.setWindowTitle(APP_NAME)
         self.resize(1400, 900)
@@ -715,6 +719,37 @@ class MainWindow(QMainWindow):
         self.action_redo.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
         self.action_redo.triggered.connect(self._action_redo)
         edit_menu.addAction(self.action_redo)
+
+        edit_menu.addSeparator()
+        # Ctrl+C / Ctrl+V: copy + paste detected peaks across frames in
+        # the same entry. Scoped to detected in this iteration; fitted
+        # / matched / manual copy is deferred. Text widgets (QLineEdit,
+        # QSpinBox) intercept these for their own clipboard semantics
+        # before window-level actions see them, so typing in inputs
+        # works as expected.
+        self.action_copy_peaks = QAction("&Copy detected peak(s)", self)
+        self.action_copy_peaks.setShortcut(QKeySequence.StandardKey.Copy)
+        self.action_copy_peaks.setShortcutContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
+        self.action_copy_peaks.setToolTip(
+            "Copy the selected detected peak(s) to the in-app clipboard. "
+            "Paste on another frame in the same entry."
+        )
+        self.action_copy_peaks.triggered.connect(self._on_copy_peaks)
+        edit_menu.addAction(self.action_copy_peaks)
+
+        self.action_paste_peaks = QAction("&Paste detected peak(s)", self)
+        self.action_paste_peaks.setShortcut(QKeySequence.StandardKey.Paste)
+        self.action_paste_peaks.setShortcutContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
+        self.action_paste_peaks.setToolTip(
+            "Paste copied detected peak(s) onto the current frame. "
+            "Same-entry only; cross-entry paste is intentionally blocked."
+        )
+        self.action_paste_peaks.triggered.connect(self._on_paste_peaks)
+        edit_menu.addAction(self.action_paste_peaks)
 
         edit_menu.addSeparator()
         # Find peak by ID. Opens a modal asking for the kind + numeric
@@ -2495,6 +2530,22 @@ class MainWindow(QMainWindow):
         # delete reuse the existing PipelineWorker path.
         self.parameter_panel.addToDetectedRequested.connect(self._on_add_to_detected)
         self.parameter_panel.addToFittedRequested.connect(self._on_add_to_fitted)
+        # Batch 2D fit of the multi-selection. The button on the
+        # parameter panel emits ``batchFit2DRequested``; the host runs
+        # pygidfit inside a modal QProgressDialog (see
+        # ``_on_batch_fit_2d``). Enable state is re-evaluated on every
+        # selectionsChanged + saveAsRingChanged tick by
+        # ``_refresh_fit_buttons``.
+        self.parameter_panel.batchFit2DRequested.connect(self._on_batch_fit_2d)
+        self.viewer.selectionsChanged.connect(
+            lambda _sels: self._refresh_fit_buttons()
+        )
+        self.parameter_panel.saveAsRingChanged.connect(
+            lambda _r: self._refresh_fit_buttons()
+        )
+        # Apply once so the cold-start panel reflects the initial
+        # empty-selection state (both fit buttons hidden).
+        self._refresh_fit_buttons()
         # Refresh the cyan preview overlay immediately when the user
         # toggles ring/segment — otherwise the preview would lag until
         # the next fit recompute.
@@ -3999,81 +4050,77 @@ class MainWindow(QMainWindow):
         self.profile_viewer.set_fit_curves_visible(visible)
 
     def _refresh_2d_preview(self) -> None:
-        """Run pygidfit on the active selection (in 2D mode) and cache
-        the result so ``_update_fitted_preview`` can paint the cyan
-        image-side preview box at pygidfit's refined geometry.
+        """Run pygidfit on every fittable selected peak (primary +
+        Ctrl+click extras) and cache the results so
+        ``_update_fitted_preview`` (primary) and
+        ``set_fitted_preview_extras`` (extras) paint a cyan box for
+        each.
 
         The profile viewer is intentionally NOT updated from here
         anymore: in 2D mode the pink fit curves are hidden (see
         ``_apply_fit_curve_visibility``) and the grey integrated
         trace stays sliced over the user's ROI, so the only
-        consumer of the cached pygidfit result is the image-side
-        cyan box driven by ``_update_fitted_preview`` →
-        ``_current_pygidfit_box_for_selection``.
+        consumers of the cached pygidfit result are the image-side
+        cyan boxes.
 
         Wired to ``viewer.selectionChanged``,
-        ``viewer.frameChanged``, ``parameter_panel.fitModeChanged``,
+        ``viewer.selectionsChanged``, ``viewer.frameChanged``,
+        ``parameter_panel.fitModeChanged``,
         ``parameter_panel.saveAsRingChanged``, and
-        ``viewer.peakGeometryDragFinished``. The cache fingerprint
-        is ``(file, entry, frame, sel geometry)`` so repeated
-        triggers don't re-pay the ~100-500 ms pygidfit cost.
-
-        Every exit path calls ``_repaint_fitted_preview`` so a cache
-        update propagates to the cyan box on the same tick.
-        Otherwise the cyan box would render from whatever stale
-        rfit/afit ``fitParamsChanged`` last carried — typically the
-        scipy 1D fits, which is exactly the "1D preview painted in
-        2D mode" symptom on first entry into 2D after a selection.
+        ``viewer.peakGeometryDragFinished``. The cache is a dict
+        keyed by ``(file, entry, frame, sel geometry)`` so a
+        previously-fit peak that's re-selected (e.g. user toggles
+        a Ctrl+click extra off and back on) reuses the cached fit
+        instead of re-paying the ~100-500 ms pygidfit cost.
         """
-        sel = self.viewer.selected_peak
         save_as_ring = self.parameter_panel.save_as_ring()
         is_2d = self.parameter_panel.fit_mode() == ParameterPanel.FIT_MODE_2D
-        # Ring forces 1D in ``fit_mode()`` already; the ``save_as_ring``
-        # guard here is defensive (mode is False in ring → caught by
-        # is_2d).
         applies = (
             is_2d
             and not save_as_ring
-            and sel is not None
-            and sel.kind in ("manual", "detected")
             and self.session is not None
             and self._pipe_thread is None
         )
         if not applies:
-            self._2d_preview_cache = None
             self._repaint_fitted_preview()
             return
-
         entry = self.entry_combo.currentText()
         if not entry:
-            self._2d_preview_cache = None
             self._repaint_fitted_preview()
             return
-        frame = self.viewer.current_frame
 
-        # Fingerprint the inputs so repeated calls (e.g. cursor moves
-        # that re-emit signals downstream) don't rerun the slow
-        # pygidfit call. Frame data + geometry + fit kwargs are all
-        # entry+frame derived, so (entry, frame, sel geometry) is a
-        # safe key.
-        fp = (
-            self.session.temp_path,
+        # Compute pygidfit for every fittable selection that isn't
+        # already in the cache. The cache is preserved across calls
+        # so unchanged peaks (e.g. extras whose ROI hasn't moved)
+        # don't re-fit.
+        for s in self.viewer.selected_peaks():
+            if s.kind not in ("manual", "detected"):
+                continue
+            fp = self._preview_fingerprint(entry, s)
+            if fp in self._2d_preview_cache:
+                continue
+            fit_2d, _err = self._run_pygidfit_for_selection(
+                s, entry, int(s.frame),
+            )
+            # Cache the result either way (None on failure) so we
+            # don't retry a failed fit on every selectionsChanged
+            # tick.
+            self._2d_preview_cache[fp] = fit_2d
+        self._repaint_fitted_preview()
+
+    def _preview_fingerprint(
+        self, entry: str, sel: SelectedPeak,
+    ) -> tuple:
+        """Build the cache key for ``sel``'s pygidfit preview."""
+        return (
+            self.session.temp_path if self.session is not None else None,
             entry,
-            int(frame),
+            int(sel.frame),
             sel.kind,
             int(sel.peak_id) if sel.peak_id is not None else -1,
             float(sel.radius), float(sel.radius_width),
             float(sel.angle), float(sel.angle_width),
         )
-        if self._2d_preview_cache is not None and self._2d_preview_cache[0] == fp:
-            # Cache hit — still repaint so the cyan box catches up if
-            # a prior selectionChanged firing painted from scipy
-            # fits before this cache entry was visible.
-            self._repaint_fitted_preview()
-            return
-        fit_2d, _err = self._run_pygidfit_for_selection(sel, entry, frame)
-        self._2d_preview_cache = (fp, fit_2d) if fit_2d is not None else None
-        self._repaint_fitted_preview()
 
     def _schedule_drag_2d_preview(self, _sel) -> None:
         """Debounced ``_refresh_2d_preview`` while a manual / detected
@@ -4105,17 +4152,59 @@ class MainWindow(QMainWindow):
         feeds them through ``_update_fitted_preview`` (which
         prefers pygidfit cache in 2D mode) and
         ``_dispatch_fit_params`` (which routes pygidfit values to
-        the parameter panel in 2D mode for the same reason). This
-        is how a fresh pygidfit result reaches both the cyan box
-        and the parameter readout without waiting for the next
-        ``fitParamsChanged`` emission — the source for the debounced
-        live update during drag.
+        the parameter panel in 2D mode for the same reason). Also
+        pushes the cached pygidfit boxes for the Ctrl+click extras
+        into ``viewer.set_fitted_preview_extras`` so every selected
+        peak gets its own cyan preview.
         """
         fits = self.profile_viewer.last_fit_params()
         rfit = fits.get("radial")
         afit = fits.get("angular")
         self._update_fitted_preview(rfit, afit)
         self._dispatch_fit_params(rfit, afit)
+        self._push_extras_preview()
+
+    def _push_extras_preview(self) -> None:
+        """Compute the cyan preview geometries for every Ctrl+click
+        extra and push them to the viewer.
+
+        In 2D mode + non-ring + session-active: every extra (always
+        detected by construction) gets a cyan box at its cached
+        pygidfit-refined ``(r, dr, a, da)``. Extras with no cache
+        entry (still computing, or pygidfit failed) fall back to
+        the extra's own drawn geometry — better to show *something*
+        than to hide the box and let the user wonder if the
+        selection registered. In 1D / ring mode the extras preview
+        is cleared.
+        """
+        v = self.viewer
+        extras = v._selected_extras
+        if not extras:
+            v.set_fitted_preview_extras([])
+            return
+        is_2d_mode = (
+            self.parameter_panel.fit_mode() == ParameterPanel.FIT_MODE_2D
+            and not self.parameter_panel.save_as_ring()
+        )
+        if not is_2d_mode:
+            v.set_fitted_preview_extras([])
+            return
+        geoms: list[tuple[float, float, float, float]] = []
+        for s in extras:
+            if s.kind != "detected":
+                continue
+            box = self._current_pygidfit_box_for_selection(s)
+            if box is None:
+                # Fallback: show the user's drawn geometry so the
+                # box is at least visible. pygidfit may have failed
+                # or just not run yet for this peak.
+                geoms.append((
+                    float(s.radius), float(s.radius_width),
+                    float(s.angle), float(s.angle_width),
+                ))
+            else:
+                geoms.append(box)
+        v.set_fitted_preview_extras(geoms)
 
     def _dispatch_fit_params(self, rfit, afit) -> None:
         """Pick the right fit source for the parameter-panel readout.
@@ -4144,13 +4233,25 @@ class MainWindow(QMainWindow):
             return
         # 2D mode + source kind: feed pygidfit-derived values when
         # the cache has them; blank otherwise.
-        if (
-            self._2d_preview_cache is None
-            or self._current_pygidfit_box_for_selection(sel) is None
-        ):
+        box = self._current_pygidfit_box_for_selection(sel)
+        if box is None:
             self.parameter_panel.set_fits(None, None)
             return
-        fit_2d = self._2d_preview_cache[1]
+        fp = self._preview_fingerprint(
+            self.entry_combo.currentText(), sel,
+        )
+        fit_2d = self._2d_preview_cache.get(fp)
+        if fit_2d is None:
+            # Drag-fallback path returned a box from a stale
+            # fingerprint — find any cached fit for this peak's
+            # identity (file/entry/frame/kind/peak_id).
+            for cached_fp, cached_fit in self._2d_preview_cache.items():
+                if cached_fp[:5] == fp[:5] and cached_fit is not None:
+                    fit_2d = cached_fit
+                    break
+        if fit_2d is None:
+            self.parameter_panel.set_fits(None, None)
+            return
         pyg_rfit, pyg_afit = _pygidfit_to_fit_like(fit_2d)
         self.parameter_panel.set_fits(pyg_rfit, pyg_afit)
 
@@ -4264,32 +4365,36 @@ class MainWindow(QMainWindow):
         output through the drag instead of flickering into the
         scipy 1D fallback between debounced refits.
         """
-        if self._2d_preview_cache is None:
+        if not self._2d_preview_cache:
             return None
         if self.session is None:
             return None
         entry = self.entry_combo.currentText()
         if not entry:
             return None
-        frame = self.viewer.current_frame
         peak_id = int(sel.peak_id) if sel.peak_id is not None else -1
         identity = (
-            self.session.temp_path, entry, int(frame), sel.kind, peak_id,
+            self.session.temp_path, entry, int(sel.frame), sel.kind, peak_id,
         )
         full_fp = identity + (
             float(sel.radius), float(sel.radius_width),
             float(sel.angle), float(sel.angle_width),
         )
-        cache_fp, fit_2d = self._2d_preview_cache
-        if fit_2d is None:
-            return None
         if self.viewer.is_dragging:
             # During drag: match on identity only so the last
             # cached refined box survives geometry mismatches.
-            if cache_fp[:5] != identity:
+            # Pick the first non-None fit for the matching identity
+            # (typically there's just one).
+            fit_2d = None
+            for cache_fp, cached_fit in self._2d_preview_cache.items():
+                if cache_fp[:5] == identity and cached_fit is not None:
+                    fit_2d = cached_fit
+                    break
+            if fit_2d is None:
                 return None
         else:
-            if cache_fp != full_fp:
+            fit_2d = self._2d_preview_cache.get(full_fp)
+            if fit_2d is None:
                 return None
         return (
             float(fit_2d.radius), float(fit_2d.radius_width),
@@ -5085,6 +5190,587 @@ class MainWindow(QMainWindow):
             self.pipeline_panel.append_log(
                 f"Redo Add-to-fitted: re-added fitted id="
                 f"{readded_id} on {entry}/frame{int(frame):05d}"
+            )
+
+        self.viewer._push_undo(_CallbackAction(_undo, _redo))
+
+    # -- Copy / paste detected peaks ---------------------------------
+
+    def _on_copy_peaks(self) -> None:
+        """Snapshot the selected detected peaks into the in-app clipboard.
+
+        Filters the multi-selection to ``kind="detected"`` — non-detected
+        kinds are deferred per user scope. No-op + status-bar hint when
+        nothing copyable is selected. The clipboard remembers the source
+        entry so a same-entry paste check is enforced at paste time.
+        """
+        if self.session is None:
+            return
+        sels = [s for s in self.viewer.selected_peaks() if s.kind == "detected"]
+        if not sels:
+            self.statusBar().showMessage(
+                "Copy: select one or more detected peaks first", 4000
+            )
+            return
+        entry = self.entry_combo.currentText()
+        if not entry:
+            return
+        items = [
+            peak_clipboard.ClipboardItem(
+                radius=float(s.radius),
+                angle=float(s.angle),
+                radius_width=float(s.radius_width),
+                angle_width=float(s.angle_width),
+                is_ring=bool(s.is_ring),
+                source_frame=int(s.frame),
+                source_peak_id=int(s.peak_id) if s.peak_id is not None else -1,
+            )
+            for s in sels
+        ]
+        peak_clipboard.set_items(items, entry=entry)
+        self.statusBar().showMessage(
+            f"Copied {len(items)} detected peak(s)", 4000
+        )
+
+    def _on_paste_peaks(self) -> None:
+        """Paste clipboard contents onto the current frame as detected rows.
+
+        Same-entry only: ``peak_clipboard.take_items`` returns ``[]`` for
+        an entry mismatch. Writes synchronously via
+        ``file_model.add_detected_peak_row`` so the new ids are known
+        immediately and we can multi-select the pasted peaks after the
+        reload. Pushes one grouped ``_CallbackAction`` so a single
+        Ctrl+Z reverses the whole paste.
+        """
+        if self.session is None or self._pipe_thread is not None:
+            return
+        entry = self.entry_combo.currentText()
+        if not entry:
+            return
+        items = peak_clipboard.take_items(target_entry=entry)
+        if not items:
+            self.statusBar().showMessage(
+                "Paste: clipboard empty or copied from a different entry",
+                4000,
+            )
+            return
+        frame = int(self.viewer.current_frame)
+        added_ids: list[int] = []
+        with self._detached_silx_tree():
+            try:
+                for item in items:
+                    new_id = file_model.add_detected_peak_row(
+                        self.session.temp_path, entry, frame,
+                        radius=item.radius,
+                        angle=item.angle,
+                        radius_width=item.radius_width,
+                        angle_width=item.angle_width,
+                        is_ring=item.is_ring,
+                    )
+                    added_ids.append(int(new_id))
+            except KeyError as exc:
+                QMessageBox.warning(self, "Paste detected peaks", str(exc))
+                return
+            except Exception as exc:
+                QMessageBox.critical(self, "Paste detected peaks", str(exc))
+                return
+        if not added_ids:
+            return
+        self.session.mark_dirty()
+        self._update_title()
+        self.viewer.clear_history()
+        self._load_entry_into_viewer(entry, preserve_view=True)
+        # Add the pasted rows to the existing multi-selection so the
+        # user immediately sees what landed without losing whatever
+        # they had selected before. If the prior primary wasn't a
+        # detected peak (or there was no selection), the first pasted
+        # row becomes the new primary.
+        self._add_detected_to_selection(entry, frame, added_ids)
+        self._push_paste_undo(
+            entry=entry, frame=frame, ids=added_ids, items=items,
+        )
+        self.statusBar().showMessage(
+            f"Pasted {len(added_ids)} detected peak(s) on "
+            f"{entry}/frame{frame:05d}",
+            4000,
+        )
+        self.pipeline_panel.append_log(
+            f"Pasted {len(added_ids)} detected peak(s) on "
+            f"{entry}/frame{frame:05d}"
+        )
+
+    def _build_detected_sels(
+        self, frame: int, ids: list[int],
+    ) -> list[SelectedPeak]:
+        """Look up the freshly-loaded detected rows with the given ids
+        on ``frame`` and return them as ``SelectedPeak`` snapshots.
+
+        Silently skips ids that aren't present in the table (e.g. after
+        a follow-on pipeline rerun). Used by both the paste handler
+        (to extend the multi-selection) and the redo path (same)."""
+        if not ids:
+            return []
+        tables = self.viewer._frame_peaks.get(int(frame)) or {}
+        det = tables.get("detected")
+        if det is None:
+            return []
+        id_set = {int(x) for x in ids}
+        sels: list[SelectedPeak] = []
+        for i in range(len(det)):
+            if int(det.ids[i]) in id_set:
+                sels.append(SelectedPeak(
+                    kind="detected", frame=int(frame),
+                    peak_id=int(det.ids[i]),
+                    radius=float(det.radius[i]),
+                    angle=float(det.angle[i]),
+                    radius_width=float(det.radius_width[i]),
+                    angle_width=float(det.angle_width[i]),
+                    is_ring=bool(det.is_ring[i]),
+                    score=float(det.score[i]),
+                    amplitude=float(det.amplitude[i]),
+                ))
+        return sels
+
+    def _add_detected_to_selection(
+        self, entry: str, frame: int, ids: list[int],
+    ) -> None:
+        """Add the given detected rows to the existing multi-selection.
+
+        Behaviour mirrors a sequence of Ctrl+clicks: if the current
+        primary is a detected peak, all ``ids`` are appended to
+        ``_selected_extras``; otherwise the first id becomes the new
+        primary (so the multi-selection can grow) and the rest go to
+        extras. Replaces the previous "always replace the selection"
+        behaviour so paste / redo grow the user's selection instead
+        of wiping it.
+        """
+        sels = self._build_detected_sels(frame, ids)
+        if not sels:
+            return
+        v = self.viewer
+        if v._selected is None or v._selected.kind != "detected":
+            # ``preserve_manual`` so a previously-selected manual
+            # peak isn't auto-removed when we promote a detected
+            # peak to primary (matches the post-Add-to-fitted
+            # auto-select pattern at ``_on_add_to_fitted``).
+            v._set_selected(sels[0], preserve_manual=True)
+            v._selected_extras = list(sels[1:])
+        else:
+            # Avoid double-adding if any id is already in the
+            # selection.
+            existing = {
+                (s.kind, int(s.frame), int(s.peak_id))
+                for s in v.selected_peaks()
+            }
+            for s in sels:
+                key = (s.kind, int(s.frame), int(s.peak_id))
+                if key not in existing:
+                    v._selected_extras.append(s)
+        v._sync_roi()
+        v._render_overlays(v.current_frame)
+        v.selectionChanged.emit(v._selected)
+        v.selectionsChanged.emit(v.selected_peaks())
+
+    def _drop_detected_from_selection(
+        self, frame: int, ids: list[int],
+    ) -> None:
+        """Remove the given detected rows from the multi-selection.
+
+        Used by the undo path so the highlight overlay tracks the
+        on-disk state — without this, the just-deleted rows would
+        keep painting white selection boxes at their old positions
+        (the SelectedPeak holds its own geometry independent of the
+        peak table).
+        """
+        v = self.viewer
+        if v._selected is None and not v._selected_extras:
+            return
+        id_set = {(int(frame), int(i)) for i in ids}
+
+        def _hit(s: SelectedPeak) -> bool:
+            return (
+                s.kind == "detected"
+                and (int(s.frame), int(s.peak_id)) in id_set
+            )
+
+        # Filter extras first, then handle the primary.
+        v._selected_extras = [
+            s for s in v._selected_extras if not _hit(s)
+        ]
+        if v._selected is not None and _hit(v._selected):
+            if v._selected_extras:
+                v._selected = v._selected_extras.pop(0)
+            else:
+                v._selected = None
+        v._sync_roi()
+        v._render_overlays(v.current_frame)
+        v.selectionChanged.emit(v._selected)
+        v.selectionsChanged.emit(v.selected_peaks())
+
+    def _push_paste_undo(
+        self, *, entry: str, frame: int,
+        ids: list[int], items: list,
+    ) -> None:
+        """Undo / redo for a paste batch — one grouped action.
+
+        ``state["ids"]`` is the rotating list of fitted ids; each redo
+        re-adds rows and overwrites it with the freshly-assigned ids
+        so a follow-on undo deletes the right rows. Same pattern as
+        ``_push_fitted_add_undo`` extended for N rows.
+        """
+        state = {"ids": list(ids)}
+        snapshot = list(items)
+
+        def _undo() -> None:
+            if self.session is None or self._pipe_thread is not None:
+                return
+            if self.entry_combo.currentText() != entry:
+                self.entry_combo.setCurrentText(entry)
+            if int(self.viewer.current_frame) != int(frame):
+                self.viewer.set_frame(int(frame))
+            with self._detached_silx_tree():
+                try:
+                    for peak_id in state["ids"]:
+                        file_model.delete_peak_row(
+                            self.session.temp_path, entry,
+                            frame=int(frame), kind="detected",
+                            peak_id=int(peak_id),
+                        )
+                except Exception as exc:
+                    QMessageBox.critical(
+                        self, "Undo paste", str(exc)
+                    )
+                    return
+            self.session.mark_dirty()
+            self._update_title()
+            self._load_entry_into_viewer(entry, preserve_view=True)
+            # Drop the now-deleted rows from the multi-selection so
+            # the white highlight overlay tracks the on-disk state.
+            self._drop_detected_from_selection(int(frame), state["ids"])
+            self.pipeline_panel.append_log(
+                f"Undo paste: removed {len(state['ids'])} detected "
+                f"peak(s) on {entry}/frame{int(frame):05d}"
+            )
+
+        def _redo() -> None:
+            if self.session is None or self._pipe_thread is not None:
+                return
+            if self.entry_combo.currentText() != entry:
+                self.entry_combo.setCurrentText(entry)
+            if int(self.viewer.current_frame) != int(frame):
+                self.viewer.set_frame(int(frame))
+            new_ids: list[int] = []
+            with self._detached_silx_tree():
+                try:
+                    for item in snapshot:
+                        new_id = file_model.add_detected_peak_row(
+                            self.session.temp_path, entry, int(frame),
+                            radius=item.radius,
+                            angle=item.angle,
+                            radius_width=item.radius_width,
+                            angle_width=item.angle_width,
+                            is_ring=item.is_ring,
+                        )
+                        new_ids.append(int(new_id))
+                except Exception as exc:
+                    QMessageBox.critical(
+                        self, "Redo paste", str(exc)
+                    )
+                    return
+            state["ids"] = new_ids
+            self.session.mark_dirty()
+            self._update_title()
+            self._load_entry_into_viewer(entry, preserve_view=True)
+            # Re-add to the existing selection (additive, matching
+            # the original paste).
+            self._add_detected_to_selection(entry, int(frame), new_ids)
+            self.pipeline_panel.append_log(
+                f"Redo paste: re-added {len(new_ids)} detected "
+                f"peak(s) on {entry}/frame{int(frame):05d}"
+            )
+
+        self.viewer._push_undo(_CallbackAction(_undo, _redo))
+
+    # -- Batch 2D fit ------------------------------------------------
+
+    def _refresh_fit_buttons(self) -> None:
+        """Re-evaluate visibility + enable state for the fit buttons.
+
+        Visibility rule (per user request — only show the button that
+        makes sense, don't grey them out):
+
+        * Exactly one fittable peak selected (manual or detected) →
+          'Add to fitted' visible, 'Fit selected (2D)' hidden.
+        * Two or more detected peaks selected → 'Fit selected (2D)'
+          visible, 'Add to fitted' hidden.
+        * Otherwise (no selection, only fitted / matched, or the
+          mixed-kind edge case of 1 detected + 1 manual which neither
+          button handles cleanly) → both hidden.
+
+        'Add to detected' stays in place — its enable state is driven
+        by ``ParameterPanel._update_actions_enabled`` (greyed out for
+        non-manual selections).
+
+        Enable state for 'Fit selected (2D)' is still gated on
+        save-as-ring being OFF (ring forces 1D).
+        """
+        sels = self.viewer.selected_peaks()
+        n_fittable = sum(1 for s in sels if s.kind in ("manual", "detected"))
+        n_detected = sum(1 for s in sels if s.kind == "detected")
+        ring_on = self.parameter_panel.save_as_ring()
+        show_add_fitted = (n_fittable == 1)
+        show_batch_fit = (n_detected >= 2 and not ring_on)
+        self.parameter_panel.set_fit_button_visibility(
+            add_fitted=show_add_fitted,
+            fit_selected_2d=show_batch_fit,
+        )
+        # Keep the enable state coherent so a click on the visible
+        # batch-fit button always proceeds (otherwise a stale enable=False
+        # from before the visibility change could leak through).
+        self.parameter_panel.set_batch_fit_enabled(show_batch_fit)
+        # ≥2 fittable selected → batch fit is the only sensible
+        # action, and batch fit is 2D-only. Grey out the 1D radio
+        # to make that constraint visible.
+        self.parameter_panel.set_multi_select_active(n_fittable >= 2)
+
+    def _on_batch_fit_2d(self) -> None:
+        """Run pygidfit on every selected detected peak, in one batch.
+
+        Two-phase to keep the viewer's FrameSource open while pygidfit
+        reads frame data:
+
+        1. **Fit phase** (no silx detach): loop the selections,
+           calling ``_run_pygidfit_for_selection`` which needs
+           ``viewer._frame_source.is_open``. The QProgressDialog
+           ticks per fit and respects Cancel.
+        2. **Write phase** (single ``_detached_silx_tree`` scope):
+           append a ``fitted_peaks`` row for every successful fit.
+           h5py detach is expensive; doing it once for the whole
+           batch keeps the run snappy.
+        """
+        if self.session is None or self._pipe_thread is not None:
+            return
+        sels = [
+            s for s in self.viewer.selected_peaks() if s.kind == "detected"
+        ]
+        if not sels:
+            self.statusBar().showMessage(
+                "Fit selected (2D): select detected peaks first", 4000
+            )
+            return
+        entry = self.entry_combo.currentText()
+        if not entry:
+            return
+        n = len(sels)
+        dialog = QProgressDialog(
+            f"Fitting {n} peak(s) (2D)…", "Cancel", 0, n, self,
+        )
+        dialog.setWindowTitle("Fit selected (2D)")
+        dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setValue(0)
+
+        # Phase 1: fits. Each ``_run_pygidfit_for_selection`` call
+        # reads ``viewer._frame_source.get_cartesian(frame)``, so the
+        # silx tree must stay attached here (the detach in phase 2
+        # closes the frame source).
+        fit_results: list[tuple[SelectedPeak, object, str | None]] = []
+        cancelled = False
+        for i, sel in enumerate(sels):
+            if dialog.wasCanceled():
+                cancelled = True
+                break
+            dialog.setLabelText(
+                f"Fitting peak {i + 1}/{n} (id={sel.peak_id})…"
+            )
+            QApplication.processEvents()
+            fit_2d, err = self._run_pygidfit_for_selection(
+                sel, entry, int(sel.frame),
+            )
+            fit_results.append((sel, fit_2d, err))
+            dialog.setValue(i + 1)
+            QApplication.processEvents()
+
+        # Phase 2: writes. One ``_detached_silx_tree`` scope for the
+        # whole batch — h5py detach is the expensive bit.
+        added_ids: list[int] = []
+        added_kwargs: list[dict] = []
+        failures: list[tuple[int, str]] = []
+        with self._detached_silx_tree():
+            for sel, fit_2d, err in fit_results:
+                if fit_2d is None:
+                    failures.append((int(sel.peak_id), err or "fit failed"))
+                    continue
+                row = {
+                    "radius": float(fit_2d.radius),
+                    "radius_width": float(fit_2d.radius_width),
+                    "angle": float(fit_2d.angle),
+                    "angle_width": float(fit_2d.angle_width),
+                    "amplitude": float(fit_2d.amplitude),
+                    "is_ring": False,
+                    "theta": float(fit_2d.theta),
+                    "A": float(fit_2d.A),
+                    "B": float(fit_2d.B),
+                    "C": float(fit_2d.C),
+                }
+                try:
+                    new_id = file_model.add_fitted_peak_row(
+                        self.session.temp_path, entry, int(sel.frame),
+                        **row,
+                    )
+                except Exception as exc:
+                    failures.append((int(sel.peak_id), f"write failed: {exc}"))
+                    continue
+                added_ids.append(int(new_id))
+                added_kwargs.append({**row, "frame": int(sel.frame)})
+        dialog.close()
+
+        if not added_ids:
+            QMessageBox.warning(
+                self, "Fit selected (2D)",
+                "No peaks were fitted successfully.\n\n"
+                + "\n".join(f"id={pid}: {msg}" for pid, msg in failures),
+            )
+            return
+
+        self.session.mark_dirty()
+        self._update_title()
+        self.viewer.clear_history()
+        self._load_entry_into_viewer(entry, preserve_view=True)
+        # Multi-select the newly-added fitted rows. They may span
+        # multiple frames if the original detected selection did
+        # (rare — multi-select today is per-frame — but kept correct
+        # for future when cross-frame multi-select lands).
+        frames_touched = sorted({kw["frame"] for kw in added_kwargs})
+        if frames_touched:
+            # Select on the first touched frame; the user can navigate.
+            self._select_fitted_ids(
+                entry, frames_touched[0],
+                [
+                    new_id for new_id, kw in zip(added_ids, added_kwargs)
+                    if kw["frame"] == frames_touched[0]
+                ],
+            )
+        self._push_batch_fit_undo(
+            entry=entry, added_ids=added_ids, added_kwargs=added_kwargs,
+        )
+
+        summary = (
+            f"Fit {len(added_ids)}/{n} selected peaks "
+            f"({len(failures)} failed"
+            + (", cancelled" if cancelled else "")
+            + ")"
+        )
+        self.statusBar().showMessage(summary, 6000)
+        self.pipeline_panel.append_log(summary)
+        for pid, msg in failures:
+            self.pipeline_panel.append_log(f"  fit failed: id={pid} — {msg}")
+
+    def _select_fitted_ids(
+        self, entry: str, frame: int, ids: list[int],
+    ) -> None:
+        """Multi-select the fitted rows with the given ids on ``frame``."""
+        if not ids:
+            return
+        tables = self.viewer._frame_peaks.get(int(frame)) or {}
+        fit = tables.get("fitted")
+        if fit is None:
+            return
+        id_set = {int(x) for x in ids}
+        sels = []
+        for i in range(len(fit)):
+            if int(fit.ids[i]) in id_set:
+                sels.append(SelectedPeak(
+                    kind="fitted", frame=int(frame),
+                    peak_id=int(fit.ids[i]),
+                    radius=float(fit.radius[i]),
+                    angle=float(fit.angle[i]),
+                    radius_width=float(fit.radius_width[i]),
+                    angle_width=float(fit.angle_width[i]),
+                    is_ring=bool(fit.is_ring[i]),
+                    score=float(fit.score[i]),
+                    amplitude=float(fit.amplitude[i]),
+                ))
+        if not sels:
+            return
+        # Fitted is not currently in the extras allowlist (extras are
+        # detected-only this iteration), so set the primary alone here.
+        # Multi-selection of fitted peaks lands when fitted copy/paste
+        # is enabled in a follow-up.
+        self.viewer._set_selected(sels[0], preserve_manual=True)
+
+    def _push_batch_fit_undo(
+        self, *, entry: str, added_ids: list[int], added_kwargs: list[dict],
+    ) -> None:
+        """Undo / redo for a batch-fit run — one grouped action.
+
+        Mirrors ``_push_fitted_add_undo`` extended to N rows. The
+        rotating ``state["ids"]`` keeps undo correct after a redo
+        re-assigns ids (one per redo'd row).
+        """
+        state = {"ids": list(added_ids)}
+        snapshot_kwargs = [dict(kw) for kw in added_kwargs]
+
+        def _undo() -> None:
+            if self.session is None or self._pipe_thread is not None:
+                return
+            if self.entry_combo.currentText() != entry:
+                self.entry_combo.setCurrentText(entry)
+            with self._detached_silx_tree():
+                try:
+                    for kw, peak_id in zip(snapshot_kwargs, state["ids"]):
+                        file_model.delete_peak_row(
+                            self.session.temp_path, entry,
+                            frame=int(kw["frame"]), kind="fitted",
+                            peak_id=int(peak_id),
+                        )
+                    # Cascading clear on every touched frame mirrors
+                    # the single-fitted-delete behaviour.
+                    for f in sorted({int(kw["frame"]) for kw in snapshot_kwargs}):
+                        file_model.clear_peaks(
+                            self.session.temp_path, entry,
+                            kind="matched", frame=f,
+                        )
+                except Exception as exc:
+                    QMessageBox.critical(
+                        self, "Undo batch fit", str(exc)
+                    )
+                    return
+            self.session.mark_dirty()
+            self._update_title()
+            self._load_entry_into_viewer(entry, preserve_view=True)
+            self.pipeline_panel.append_log(
+                f"Undo batch fit: removed {len(state['ids'])} fitted "
+                f"row(s) on {entry}"
+            )
+
+        def _redo() -> None:
+            if self.session is None or self._pipe_thread is not None:
+                return
+            if self.entry_combo.currentText() != entry:
+                self.entry_combo.setCurrentText(entry)
+            new_ids: list[int] = []
+            with self._detached_silx_tree():
+                try:
+                    for kw in snapshot_kwargs:
+                        write_kw = {k: v for k, v in kw.items() if k != "frame"}
+                        new_id = file_model.add_fitted_peak_row(
+                            self.session.temp_path, entry, int(kw["frame"]),
+                            **write_kw,
+                        )
+                        new_ids.append(int(new_id))
+                except Exception as exc:
+                    QMessageBox.critical(
+                        self, "Redo batch fit", str(exc)
+                    )
+                    return
+            state["ids"] = new_ids
+            self.session.mark_dirty()
+            self._update_title()
+            self._load_entry_into_viewer(entry, preserve_view=True)
+            self.pipeline_panel.append_log(
+                f"Redo batch fit: re-added {len(new_ids)} fitted "
+                f"row(s) on {entry}"
             )
 
         self.viewer._push_undo(_CallbackAction(_undo, _redo))
