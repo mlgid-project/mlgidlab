@@ -67,7 +67,6 @@ from silx.gui.hdf5 import Hdf5TreeModel, Hdf5TreeView
 from silx.gui.hdf5.NexusSortFilterProxyModel import NexusSortFilterProxyModel
 
 from mlgidlab import file_model
-from mlgidlab.fit import fit_gaussian_anchored
 from mlgidlab.image_viewer import (
     GIWAXSImageViewer,
     MATCHED_STYLE,
@@ -85,7 +84,7 @@ from mlgidlab.pipeline import (
     is_mlgidbase_available,
 )
 from mlgidlab.pipeline_panel import PipelinePanel
-from mlgidlab.profile_viewer import FITTED_FIT_REGION_FACTOR, ProfileViewer
+from mlgidlab.profile_viewer import ProfileViewer
 from mlgidlab.conversion_panel import ConversionPanel
 from mlgidlab.session import BaseSession, NexusSession, RawSession, Session
 from mlgidlab.workers import (
@@ -117,6 +116,53 @@ def _make_pen_swatch(style: dict, width: int = 26, height: int = 12) -> QPixmap:
     painter.drawLine(2, height // 2, width - 2, height // 2)
     painter.end()
     return pix
+
+
+def _pygidfit_to_fit_like(fit_2d):
+    """Adapter exposing ``.center`` / ``.fwhm`` / ``.amplitude`` over a
+    pygidfit ``ManualFitResult`` so ``ParameterPanel.set_fits`` can
+    consume it interchangeably with scipy ``GaussianFit``s.
+
+    pygidfit stores box widths as ``2σ`` (pipeline convention; see
+    ``manual_fit.fit_one_peak``), so ``fwhm = 2σ × √(2 ln 2) =
+    radius_width × √(2 ln 2) ≈ 1.177 × radius_width``. Used when
+    the parameter readout is showing the 2D-mode preview of what
+    Add-to-fitted (2D) will save.
+    """
+    from types import SimpleNamespace
+    width_to_fwhm = float(np.sqrt(2.0 * np.log(2.0)))
+    rfit = SimpleNamespace(
+        center=float(fit_2d.radius),
+        fwhm=float(fit_2d.radius_width) * width_to_fwhm,
+        amplitude=float(fit_2d.amplitude),
+    )
+    afit = SimpleNamespace(
+        center=float(fit_2d.angle),
+        fwhm=float(fit_2d.angle_width) * width_to_fwhm,
+        amplitude=float(fit_2d.amplitude),
+    )
+    return rfit, afit
+
+
+class _CallbackAction:
+    """Generic ``_Action`` (per the image_viewer protocol) that
+    delegates ``undo`` / ``redo`` to caller-supplied callables.
+
+    Lets host-level operations participate in the viewer's undo
+    stack without dragging file-mutation code across the viewer
+    abstraction. Used by ``_on_add_to_fitted`` so Ctrl+Z reverts a
+    just-committed fitted row.
+    """
+
+    def __init__(self, undo_fn, redo_fn) -> None:
+        self._undo_fn = undo_fn
+        self._redo_fn = redo_fn
+
+    def undo(self, _viewer) -> None:
+        self._undo_fn()
+
+    def redo(self, _viewer) -> None:
+        self._redo_fn()
 
 
 def _make_color_swatch(color: str, width: int = 26, height: int = 12) -> QPixmap:
@@ -2424,9 +2470,13 @@ class MainWindow(QMainWindow):
         # the selection changes away from a manual peak.
         self.profile_viewer.fitParamsChanged.connect(self._update_fitted_preview)
         self.viewer.selectionChanged.connect(self._on_selection_for_preview)
-        # Live readout of the same 1D fits in the parameter panel so the
-        # user can see the fitted-peak parameters next to the detected ones.
-        self.profile_viewer.fitParamsChanged.connect(self.parameter_panel.set_fits)
+        # Live readout in the parameter panel — routed through a
+        # host dispatcher (instead of straight to ``set_fits``) so
+        # 2D mode can substitute pygidfit's refined values for
+        # scipy's 1D fits. The dispatcher matches what
+        # Add-to-fitted (2D) will actually save, so the readout no
+        # longer claims to commit scipy-derived numbers in 2D mode.
+        self.profile_viewer.fitParamsChanged.connect(self._dispatch_fit_params)
 
         # Parameter readout — both selection and geometry changes feed the same slot.
         self.viewer.selectionChanged.connect(self.parameter_panel.set_peak)
@@ -2478,6 +2528,42 @@ class MainWindow(QMainWindow):
         self.viewer.peakGeometryDragFinished.connect(
             lambda _sel: self._refresh_2d_preview()
         )
+        # Live 2D preview during drag: debounce pygidfit runs so the
+        # cyan preview + parameter readout track the user's drag.
+        # Per-tick refits would freeze the GUI (pygidfit is ~100-
+        # 500 ms); a single-shot timer that restarts on every drag
+        # tick collapses bursts into one fit every ~150 ms while
+        # idle, then a final fit on drag-end via the existing
+        # ``peakGeometryDragFinished`` wiring. While the timer is
+        # pending, ``_current_pygidfit_box_for_selection`` returns
+        # the *cached* refined box (ignoring the geometry fingerprint
+        # mismatch) so the cyan box stays at pygidfit's last known
+        # result instead of falling through to scipy 1D widths.
+        self._drag_pygidfit_timer = QTimer(self)
+        self._drag_pygidfit_timer.setSingleShot(True)
+        self._drag_pygidfit_timer.setInterval(150)
+        self._drag_pygidfit_timer.timeout.connect(self._refresh_2d_preview)
+        self.viewer.peakGeometryChanged.connect(
+            self._schedule_drag_2d_preview
+        )
+        # Pink fit curves on the profile plots are hidden only when
+        # a manual / detected peak is selected in 2D mode (the
+        # source-of-fit case where the 2D-projected pink preview
+        # was misleading). Selection changes also re-evaluate so
+        # switching to a fitted peak immediately restores its
+        # overlay — see ``_apply_fit_curve_visibility``.
+        self.parameter_panel.fitModeChanged.connect(
+            lambda _m: self._apply_fit_curve_visibility()
+        )
+        self.parameter_panel.saveAsRingChanged.connect(
+            lambda _r: self._apply_fit_curve_visibility()
+        )
+        self.viewer.selectionChanged.connect(
+            lambda _s: self._apply_fit_curve_visibility()
+        )
+        # Apply the initial state so a cold-start GUI reflects the
+        # parameter panel's default mode + no selection.
+        self._apply_fit_curve_visibility()
         self.parameter_panel.deletePeakRequested.connect(
             lambda: self._on_delete_peak_requested(self.viewer.selected_peak)
         )
@@ -3878,34 +3964,66 @@ class MainWindow(QMainWindow):
             self.viewer.set_fitted_preview(None, None, None, None)
         self._refresh_2d_preview()
 
+    def _apply_fit_curve_visibility(self) -> None:
+        """Decide whether to show the pink fit overlay on the profile plots.
+
+        Hide only when the selection is a *source* peak about to be
+        committed via Add-to-fitted (kind ``manual`` or ``detected``)
+        AND the active fit mode is 2D — that is the case where the
+        pink curve mismatch was misleading (pygidfit's projected 1D
+        Gaussian doesn't perfectly match the integrated 1D profile,
+        and the image-side cyan box already previews what gets
+        saved).
+
+        Show in every other case:
+        * 1D mode (the pink curves are the scipy fits
+          Add-to-fitted (1D) actually persists)
+        * Fitted / matched selections (the curves represent the
+          *already-saved* fit and stay informative regardless of
+          the panel's mode radio — switching the radio shouldn't
+          erase a fitted peak's overlay)
+
+        Wired to ``parameter_panel.fitModeChanged``,
+        ``parameter_panel.saveAsRingChanged``, and
+        ``viewer.selectionChanged`` so the visibility re-evaluates
+        whenever any of those three change.
+        """
+        sel = self.viewer.selected_peak
+        is_source_kind = (
+            sel is not None and sel.kind in ("manual", "detected")
+        )
+        is_2d = (
+            self.parameter_panel.fit_mode() == ParameterPanel.FIT_MODE_2D
+        )
+        visible = not (is_source_kind and is_2d)
+        self.profile_viewer.set_fit_curves_visible(visible)
+
     def _refresh_2d_preview(self) -> None:
-        """Run pygidfit on the active selection (in 2D mode) and push
-        pygidfit's refined box + projected 1D Gaussians to the
-        profile viewer as a single coherent override.
+        """Run pygidfit on the active selection (in 2D mode) and cache
+        the result so ``_update_fitted_preview`` can paint the cyan
+        image-side preview box at pygidfit's refined geometry.
 
-        In 2D mode the user wants the radial / angular profile fit
-        curves AND the underlying grey integrated trace AND the
-        cyan dashed preview box to all reflect pygidfit's refined
-        box — same centre, same widths, one coherent view of what
-        ``_build_fitted_row_2d`` will save. We achieve this by
-        passing three pieces of state into
-        ``profile_viewer.set_2d_preview(box, rfit, afit)``:
-
-        * ``box`` controls the integration slicing in
-          ``_recompute_curves`` (grey trace).
-        * ``rfit`` / ``afit`` control the projected-Gaussian pink
-          curves and downstream consumers via ``fitParamsChanged``
-          (parameter panel readout, cyan image-side preview box).
+        The profile viewer is intentionally NOT updated from here
+        anymore: in 2D mode the pink fit curves are hidden (see
+        ``_apply_fit_curve_visibility``) and the grey integrated
+        trace stays sliced over the user's ROI, so the only
+        consumer of the cached pygidfit result is the image-side
+        cyan box driven by ``_update_fitted_preview`` →
+        ``_current_pygidfit_box_for_selection``.
 
         Wired to ``viewer.selectionChanged``,
         ``viewer.frameChanged``, ``parameter_panel.fitModeChanged``,
-        ``parameter_panel.saveAsRingChanged``. The pygidfit result
-        is cached by ``(file, entry, frame, sel geometry)`` so
-        repeated triggers don't re-pay the ~100-500 ms cost.
+        ``parameter_panel.saveAsRingChanged``, and
+        ``viewer.peakGeometryDragFinished``. The cache fingerprint
+        is ``(file, entry, frame, sel geometry)`` so repeated
+        triggers don't re-pay the ~100-500 ms pygidfit cost.
 
-        Cleared (``set_2d_preview(None, None, None)``) when 2D mode
-        doesn't apply or pygidfit fails — profile viewer reverts to
-        scipy 1D + user-box integration + draggable regions.
+        Every exit path calls ``_repaint_fitted_preview`` so a cache
+        update propagates to the cyan box on the same tick.
+        Otherwise the cyan box would render from whatever stale
+        rfit/afit ``fitParamsChanged`` last carried — typically the
+        scipy 1D fits, which is exactly the "1D preview painted in
+        2D mode" symptom on first entry into 2D after a selection.
         """
         sel = self.viewer.selected_peak
         save_as_ring = self.parameter_panel.save_as_ring()
@@ -3922,12 +4040,14 @@ class MainWindow(QMainWindow):
             and self._pipe_thread is None
         )
         if not applies:
-            self.profile_viewer.set_2d_preview(None, None, None)
+            self._2d_preview_cache = None
+            self._repaint_fitted_preview()
             return
 
         entry = self.entry_combo.currentText()
         if not entry:
-            self.profile_viewer.set_2d_preview(None, None, None)
+            self._2d_preview_cache = None
+            self._repaint_fitted_preview()
             return
         frame = self.viewer.current_frame
 
@@ -3946,90 +4066,93 @@ class MainWindow(QMainWindow):
             float(sel.angle), float(sel.angle_width),
         )
         if self._2d_preview_cache is not None and self._2d_preview_cache[0] == fp:
-            fit_2d = self._2d_preview_cache[1]
-        else:
-            fit_2d, _err = self._run_pygidfit_for_selection(sel, entry, frame)
-            self._2d_preview_cache = (fp, fit_2d)
-        if fit_2d is None:
-            # pygidfit failed for this box — clear the override so
-            # the scipy 1D fit shows up (still useful for the user
-            # to see *something*) and let the eventual Add-to-fitted
-            # click surface the failure reason.
-            self.profile_viewer.set_2d_preview(None, None, None)
+            # Cache hit — still repaint so the cyan box catches up if
+            # a prior selectionChanged firing painted from scipy
+            # fits before this cache entry was visible.
+            self._repaint_fitted_preview()
             return
+        fit_2d, _err = self._run_pygidfit_for_selection(sel, entry, frame)
+        self._2d_preview_cache = (fp, fit_2d) if fit_2d is not None else None
+        self._repaint_fitted_preview()
 
-        # pygidfit's ``radius_width`` / ``angle_width`` are ``2σ``
-        # (pipeline convention) — divide by 2 to recover σ.
-        sigma_r = float(fit_2d.radius_width) / 2.0
-        sigma_a = float(fit_2d.angle_width) / 2.0
+    def _schedule_drag_2d_preview(self, _sel) -> None:
+        """Debounced ``_refresh_2d_preview`` while a manual / detected
+        ROI is being dragged in 2D mode.
 
-        # Render + fit the pink curves over a window scaled to the
-        # FITTED box (``FITTED_FIT_REGION_FACTOR / 2 × 2σ``), not the
-        # user-drawn ROI. Keeps the Gaussian's tails visible even
-        # when pygidfit refines the box much narrower than the user
-        # drew, and gives the linear-bg term enough context to
-        # converge.
-        render_r = (
-            float(fit_2d.radius)
-            - 0.5 * FITTED_FIT_REGION_FACTOR * float(fit_2d.radius_width),
-            float(fit_2d.radius)
-            + 0.5 * FITTED_FIT_REGION_FACTOR * float(fit_2d.radius_width),
-        )
-        render_a = (
-            float(fit_2d.angle)
-            - 0.5 * FITTED_FIT_REGION_FACTOR * float(fit_2d.angle_width),
-            float(fit_2d.angle)
-            + 0.5 * FITTED_FIT_REGION_FACTOR * float(fit_2d.angle_width),
-        )
+        Per-tick ``peakGeometryChanged`` callbacks fan in here; the
+        single-shot timer collapses bursts so pygidfit runs at most
+        once every ~150 ms during a drag. The drag-end firing of
+        ``peakGeometryDragFinished`` triggers a final synchronous
+        ``_refresh_2d_preview`` that overrides whatever the timer
+        was about to do.
+        """
+        if not self.viewer.is_dragging:
+            return
+        if self.parameter_panel.fit_mode() != ParameterPanel.FIT_MODE_2D:
+            return
+        if self.parameter_panel.save_as_ring():
+            return
+        # Restart the single-shot timer; bursts collapse into one
+        # fire 150 ms after the last drag tick (or the timer is
+        # superseded by the drag-end refresh).
+        self._drag_pygidfit_timer.start()
 
-        radius_axis = self.profile_viewer.radius_axis()
-        angle_axis = self.profile_viewer.angle_axis()
-        # Integrate the polar image over pygidfit's refined box —
-        # the SAME box ``_recompute_curves`` will use once
-        # ``set_2d_preview`` runs below. Reading the previously-
-        # cached trace (still sliced over the user's ROI) would
-        # fit the pink curve to a different dataset than the user
-        # sees, which was the visible undershoot.
-        box = (
-            float(fit_2d.radius), float(fit_2d.radius_width),
-            float(fit_2d.angle), float(fit_2d.angle_width),
-        )
-        radial_data, angular_data = self.profile_viewer.integrate_over_box(
-            box,
-        )
+    def _repaint_fitted_preview(self) -> None:
+        """Re-run the cyan-box painter and the parameter readout
+        against the freshest fit state.
 
-        # Anchored fit: centre and sigma allowed to drift within a
-        # bounded neighbourhood of pygidfit's values, amplitude +
-        # linear background fit freely. The bounded drift lets the
-        # pink curve realign on the 1D-projected data peak when
-        # pygidfit's 2D centroid differs (theta ≠ 0, asymmetric
-        # peaks, mlgidlab/pygidfit polar-grid interpolation
-        # mismatch). Cyan box width may differ from the saved blue
-        # box by up to the chosen tolerance; the user accepted that
-        # trade-off for a visually clean overlay.
-        rfit = None
-        if radius_axis is not None and radial_data is not None:
-            rfit = fit_gaussian_anchored(
-                radius_axis, radial_data,
-                center=float(fit_2d.radius),
-                sigma=sigma_r,
-                center_drift=0.5 * sigma_r,
-                sigma_factor=1.2,
-                fit_range=render_r,
-                render_range=render_r,
-            )
-        afit = None
-        if angle_axis is not None and angular_data is not None:
-            afit = fit_gaussian_anchored(
-                angle_axis, angular_data,
-                center=float(fit_2d.angle),
-                sigma=sigma_a,
-                center_drift=0.5 * sigma_a,
-                sigma_factor=1.2,
-                fit_range=render_a,
-                render_range=render_a,
-            )
-        self.profile_viewer.set_2d_preview(box, rfit, afit)
+        Re-reads the profile viewer's cached scipy 1D fits and
+        feeds them through ``_update_fitted_preview`` (which
+        prefers pygidfit cache in 2D mode) and
+        ``_dispatch_fit_params`` (which routes pygidfit values to
+        the parameter panel in 2D mode for the same reason). This
+        is how a fresh pygidfit result reaches both the cyan box
+        and the parameter readout without waiting for the next
+        ``fitParamsChanged`` emission — the source for the debounced
+        live update during drag.
+        """
+        fits = self.profile_viewer.last_fit_params()
+        rfit = fits.get("radial")
+        afit = fits.get("angular")
+        self._update_fitted_preview(rfit, afit)
+        self._dispatch_fit_params(rfit, afit)
+
+    def _dispatch_fit_params(self, rfit, afit) -> None:
+        """Pick the right fit source for the parameter-panel readout.
+
+        In 2D mode with a manual / detected selection that has a
+        cached pygidfit result, the panel should reflect pygidfit's
+        refined values (the truth Add-to-fitted (2D) will save), not
+        scipy's 1D fits. Outside that case, scipy values pass
+        through unchanged.
+
+        When no pygidfit cache exists yet for a 2D-mode source
+        selection, the panel is blanked rather than backfilled
+        with scipy values — showing scipy numbers in 2D mode would
+        misrepresent what the next commit would save.
+        """
+        sel = self.viewer.selected_peak
+        is_source_kind = (
+            sel is not None and sel.kind in ("manual", "detected")
+        )
+        is_2d_mode = (
+            self.parameter_panel.fit_mode() == ParameterPanel.FIT_MODE_2D
+            and not self.parameter_panel.save_as_ring()
+        )
+        if not (is_source_kind and is_2d_mode):
+            self.parameter_panel.set_fits(rfit, afit)
+            return
+        # 2D mode + source kind: feed pygidfit-derived values when
+        # the cache has them; blank otherwise.
+        if (
+            self._2d_preview_cache is None
+            or self._current_pygidfit_box_for_selection(sel) is None
+        ):
+            self.parameter_panel.set_fits(None, None)
+            return
+        fit_2d = self._2d_preview_cache[1]
+        pyg_rfit, pyg_afit = _pygidfit_to_fit_like(fit_2d)
+        self.parameter_panel.set_fits(pyg_rfit, pyg_afit)
 
     def _update_fitted_preview(self, rfit, afit) -> None:
         """Sync the viewer's fitted-preview box to the latest fit params.
@@ -4131,6 +4254,15 @@ class MainWindow(QMainWindow):
         ``ManualFitResult``, return its ``(r, dr, a, da)``. Otherwise
         return None — caller falls back to the rfit/afit-driven cyan
         box (the 1D-mode / no-pygidfit-yet path).
+
+        While the viewer reports an active ROI drag, the geometry
+        fields of ``sel`` change per tick faster than pygidfit can
+        keep up, so this method matches on the *peak identity*
+        only (file / entry / frame / kind / peak_id) and returns
+        the cached refined box from the last completed pygidfit
+        run. That keeps the cyan preview tracking pygidfit's
+        output through the drag instead of flickering into the
+        scipy 1D fallback between debounced refits.
         """
         if self._2d_preview_cache is None:
             return None
@@ -4140,18 +4272,25 @@ class MainWindow(QMainWindow):
         if not entry:
             return None
         frame = self.viewer.current_frame
-        fp = (
-            self.session.temp_path,
-            entry,
-            int(frame),
-            sel.kind,
-            int(sel.peak_id) if sel.peak_id is not None else -1,
+        peak_id = int(sel.peak_id) if sel.peak_id is not None else -1
+        identity = (
+            self.session.temp_path, entry, int(frame), sel.kind, peak_id,
+        )
+        full_fp = identity + (
             float(sel.radius), float(sel.radius_width),
             float(sel.angle), float(sel.angle_width),
         )
         cache_fp, fit_2d = self._2d_preview_cache
-        if cache_fp != fp or fit_2d is None:
+        if fit_2d is None:
             return None
+        if self.viewer.is_dragging:
+            # During drag: match on identity only so the last
+            # cached refined box survives geometry mismatches.
+            if cache_fp[:5] != identity:
+                return None
+        else:
+            if cache_fp != full_fp:
+                return None
         return (
             float(fit_2d.radius), float(fit_2d.radius_width),
             float(fit_2d.angle), float(fit_2d.angle_width),
@@ -4733,9 +4872,6 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Add to fitted", str(exc))
                 return
 
-        # Selection is left alone so the user can keep editing or commit
-        # again; the cyan fitted overlay simply appears alongside the
-        # original box.
         self.session.mark_dirty()
         self._update_title()
         # File-level mutation invalidates pending FileGeomActions whose ids
@@ -4744,6 +4880,55 @@ class MainWindow(QMainWindow):
         # Pull the fresh fitted_peaks (and matched, which references it) back
         # into the viewer — same entry, so preserve the user's zoom + frame.
         self._load_entry_into_viewer(entry, preserve_view=True)
+        # In 2D mode the user committed without seeing pygidfit's actual
+        # result on the profile plots (the pink curves are hidden in
+        # 2D mode — see ``_apply_fit_curve_visibility``). Auto-switch
+        # the selection to the new fitted peak so the result is
+        # immediately visible (cyan box + profile fits both update to
+        # the fitted-kind selection). 1D mode is unchanged because the
+        # pink curves already previewed what was saved.
+        if mode == ParameterPanel.FIT_MODE_2D:
+            fitted_sel = SelectedPeak(
+                kind="fitted",
+                frame=int(frame),
+                peak_id=int(new_id),
+                radius=float(row["radius"]),
+                angle=float(row["angle"]),
+                radius_width=float(row["radius_width"]),
+                angle_width=float(row["angle_width"]),
+                is_ring=bool(save_as_ring),
+                amplitude=(
+                    float(row["amplitude"])
+                    if row.get("amplitude") is not None else None
+                ),
+            )
+            # ``preserve_manual=True`` so the source manual peak
+            # is not auto-removed by the away-from-manual side
+            # effect on _set_selected. Without this, the silent
+            # ManualRemoveAction it pushes would sit on the undo
+            # stack alongside our FittedRowAction and the user
+            # would need TWO Ctrl+Z presses to revert the commit.
+            self.viewer._set_selected(fitted_sel, preserve_manual=True)
+        # Ctrl+Z support for Add-to-fitted: the file mutation is
+        # reversible (delete the just-added row + restore the source
+        # selection). The action is pushed AFTER ``clear_history``
+        # above so the just-committed row is the only thing on the
+        # undo stack — matches the existing pattern where file-level
+        # commits start a fresh history.
+        self._push_fitted_add_undo(
+            entry=entry, frame=int(frame), new_id=int(new_id),
+            add_kwargs={
+                "radius": row["radius"],
+                "radius_width": row["radius_width"],
+                "angle": row["angle"],
+                "angle_width": row["angle_width"],
+                "amplitude": row["amplitude"],
+                "is_ring": save_as_ring,
+                "theta": row["theta"],
+                "A": row["A"], "B": row["B"], "C": row["C"],
+            },
+            source_sel=sel,
+        )
         # Ring toggle is sticky across selections but reset on commit so
         # the next Add-to-fitted defaults back to segment unless the user
         # explicitly opts in again.
@@ -4753,6 +4938,156 @@ class MainWindow(QMainWindow):
             f"({'ring' if save_as_ring else 'segment'} from {sel.kind}) on "
             f"{entry}/frame{frame:05d}"
         )
+
+    def _push_fitted_add_undo(
+        self, *, entry: str, frame: int, new_id: int,
+        add_kwargs: dict, source_sel: SelectedPeak,
+    ) -> None:
+        """Push a Ctrl+Z entry for an Add-to-fitted commit.
+
+        ``undo`` deletes the just-added fitted row (and cascades
+        ``clear_peaks(matched)`` on the frame, mirroring the
+        existing fitted-delete handler), then reselects the source
+        peak so the user is back where they started visually. For
+        a manual source, the manual peak still exists in
+        ``viewer._manual_peaks`` (Add-to-fitted leaves it alone),
+        so reselecting it surfaces the yellow ROI again — exactly
+        the "let the manual selection reappear" behaviour from the
+        feature spec. For a detected source, the detected row is
+        located by id in the freshly-reloaded peaks table.
+
+        ``redo`` re-adds the row with the original kwargs.
+        ``file_model.add_fitted_peak_row`` assigns a fresh id on
+        each call (``max(id)+1``), so the post-redo id may differ
+        from the original; ``state["current_id"]`` is updated so
+        a follow-on undo deletes the correct row.
+
+        On either side, any file error surfaces a QMessageBox and
+        leaves the stack alone — the caller's downstream slot
+        (``undo_last_action`` / ``redo_last_action``) is tolerant
+        of no-op actions.
+        """
+        # Closure state for the rotating fitted-row id across
+        # repeated undo/redo cycles.
+        state = {"current_id": int(new_id)}
+        source_kind = source_sel.kind
+        source_peak_id = (
+            int(source_sel.peak_id)
+            if source_sel.peak_id is not None else None
+        )
+
+        def _undo() -> None:
+            if self.session is None or self._pipe_thread is not None:
+                return
+            if self.entry_combo.currentText() != entry:
+                self.entry_combo.setCurrentText(entry)
+            if int(self.viewer.current_frame) != int(frame):
+                self.viewer.set_frame(int(frame))
+            with self._detached_silx_tree():
+                try:
+                    removed = file_model.delete_peak_row(
+                        self.session.temp_path, entry,
+                        frame=int(frame), kind="fitted",
+                        peak_id=int(state["current_id"]),
+                    )
+                    if removed > 0:
+                        file_model.clear_peaks(
+                            self.session.temp_path, entry,
+                            kind="matched", frame=int(frame),
+                        )
+                except Exception as exc:
+                    QMessageBox.critical(
+                        self, "Undo Add to fitted", str(exc)
+                    )
+                    return
+            if removed == 0:
+                self.pipeline_panel.append_log(
+                    f"Undo Add-to-fitted: fitted id="
+                    f"{state['current_id']} already gone on "
+                    f"{entry}/frame{int(frame):05d}"
+                )
+                return
+            self.session.mark_dirty()
+            self._update_title()
+            self._load_entry_into_viewer(entry, preserve_view=True)
+            # Reselect the source peak so the visual state matches
+            # what the user had before Add-to-fitted.
+            if source_kind == "manual":
+                manuals = self.viewer._manual_peaks.get(int(frame), [])
+                if manuals:
+                    self.viewer._set_selected(
+                        SelectedPeak.from_manual(manuals[0], int(frame))
+                    )
+            elif source_kind == "detected" and source_peak_id is not None:
+                tables = self.viewer._frame_peaks.get(int(frame)) or {}
+                det = tables.get("detected")
+                if det is not None:
+                    for i in range(len(det)):
+                        if int(det.ids[i]) == source_peak_id:
+                            self._select_table_row(
+                                int(frame), "detected", det, i
+                            )
+                            break
+            self.pipeline_panel.append_log(
+                f"Undo Add-to-fitted: removed fitted id="
+                f"{state['current_id']} on "
+                f"{entry}/frame{int(frame):05d}"
+            )
+
+        def _redo() -> None:
+            if self.session is None or self._pipe_thread is not None:
+                return
+            if self.entry_combo.currentText() != entry:
+                self.entry_combo.setCurrentText(entry)
+            if int(self.viewer.current_frame) != int(frame):
+                self.viewer.set_frame(int(frame))
+            with self._detached_silx_tree():
+                try:
+                    readded_id = file_model.add_fitted_peak_row(
+                        self.session.temp_path, entry, int(frame),
+                        **add_kwargs,
+                    )
+                except Exception as exc:
+                    QMessageBox.critical(
+                        self, "Redo Add to fitted", str(exc)
+                    )
+                    return
+            state["current_id"] = int(readded_id)
+            self.session.mark_dirty()
+            self._update_title()
+            self._load_entry_into_viewer(entry, preserve_view=True)
+            # Re-select the re-added fitted peak if the user is
+            # currently in 2D mode (mirrors the original commit's
+            # auto-select). In 1D mode leave selection alone, also
+            # mirroring the original.
+            if self.parameter_panel.fit_mode() == ParameterPanel.FIT_MODE_2D:
+                # Same ``preserve_manual=True`` rationale as the
+                # original commit's auto-switch: keep the manual
+                # source intact across the redo so a subsequent
+                # Ctrl+Z still has the manual peak to reselect.
+                self.viewer._set_selected(
+                    SelectedPeak(
+                        kind="fitted", frame=int(frame),
+                        peak_id=int(readded_id),
+                        radius=float(add_kwargs["radius"]),
+                        angle=float(add_kwargs["angle"]),
+                        radius_width=float(add_kwargs["radius_width"]),
+                        angle_width=float(add_kwargs["angle_width"]),
+                        is_ring=bool(add_kwargs["is_ring"]),
+                        amplitude=(
+                            float(add_kwargs["amplitude"])
+                            if add_kwargs.get("amplitude") is not None
+                            else None
+                        ),
+                    ),
+                    preserve_manual=True,
+                )
+            self.pipeline_panel.append_log(
+                f"Redo Add-to-fitted: re-added fitted id="
+                f"{readded_id} on {entry}/frame{int(frame):05d}"
+            )
+
+        self.viewer._push_undo(_CallbackAction(_undo, _redo))
 
     def _run_pygidfit_for_selection(
         self, sel: SelectedPeak, entry: str, frame: int,

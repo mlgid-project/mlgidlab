@@ -311,6 +311,22 @@ class ProfileViewer(QWidget):
         # Re-render so the curve appears / disappears immediately.
         self._recompute_curves()
 
+    def set_fit_curves_visible(self, visible: bool) -> None:
+        """Show or hide the pink Gaussian-fit overlay on both plots.
+
+        Driven by the host from the fit-mode radio: in 2D mode the
+        projected 1D Gaussian from pygidfit's 2D fit does not
+        perfectly match the integrated 1D profile (the 2D centroid +
+        integration-window choice differ enough to be visible). The
+        mismatch was misleading, so 2D mode hides the pink overlay
+        entirely and lets the cyan image-side preview box be the
+        single source of truth for "what the next Add-to-fitted will
+        save". 1D mode shows the pink curves again because those are
+        the scipy fits Add-to-fitted (1D) actually stores.
+        """
+        self._radial_fit_curve.setVisible(visible)
+        self._angular_fit_curve.setVisible(visible)
+
     def _on_log_y_toggled(self, log: bool) -> None:
         """Apply the Log-y toggle to both profile plots.
 

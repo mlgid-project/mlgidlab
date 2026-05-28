@@ -1717,6 +1717,17 @@ class GIWAXSImageViewer(QWidget):
     def selected_peak(self) -> SelectedPeak | None:
         return self._selected
 
+    @property
+    def is_dragging(self) -> bool:
+        """True while an image-side ROI handle drag is in progress.
+
+        Exposed so the host can decide whether per-tick
+        ``peakGeometryChanged`` signals come from a live drag (and
+        deserve debounced expensive recompute) or a settled
+        programmatic update.
+        """
+        return self._roi_drag_before is not None
+
     # -- Action helpers (used by both public API and undo/redo) --
 
     def _push_undo(self, action: _Action) -> None:
@@ -2154,6 +2165,19 @@ class GIWAXSImageViewer(QWidget):
                 pass
 
         manual_list = list(self._manual_peaks.get(frame, []))
+        # Manual boxes are scratch labels — keep them invisible
+        # unless they are the active selection. The ManualPeak
+        # instances stay in ``_manual_peaks`` so things like the
+        # post-Add-to-fitted Ctrl+Z (FittedRowAction.undo) can
+        # reselect the source manual and bring its yellow ROI
+        # back. Hit-testing in ``_on_select_at`` still operates on
+        # ``_manual_peaks`` directly, so the user can click the
+        # invisible region to re-select / reveal the peak.
+        selected_is_manual = (
+            self._selected is not None and self._selected.kind == "manual"
+        )
+        if not selected_is_manual:
+            manual_list = []
         # When an ROI is active the selected peak is shown via the ROI handles —
         # exclude the manual peak from the manual-overlay path so it doesn't
         # render twice. (Detected/fitted overlays still draw the underlying
@@ -2606,7 +2630,9 @@ class GIWAXSImageViewer(QWidget):
         if self._selected is not None:
             self._set_selected(None)
 
-    def _set_selected(self, sel: SelectedPeak | None) -> None:
+    def _set_selected(
+        self, sel: SelectedPeak | None, *, preserve_manual: bool = False,
+    ) -> None:
         """Update the selection and sync the ROI + emit selectionChanged once.
 
         Side effect: if we're transitioning **away** from a
@@ -2623,6 +2649,16 @@ class GIWAXSImageViewer(QWidget):
         method (they set ``self._selected = None`` directly), which
         preserves the manual peak across pipeline resets and other
         non-user-driven selection clears.
+
+        ``preserve_manual``: when True, the manual-removal side
+        effect is suppressed. Used by host flows that intentionally
+        keep the manual peak around across a programmatic
+        switch — currently ``MainWindow._on_add_to_fitted`` (so the
+        manual source survives the auto-switch to the new fitted
+        peak; without this, the silent ``ManualRemoveAction`` push
+        would force the user to press Ctrl+Z twice to fully revert
+        an Add-to-fitted commit) and the matching redo closure in
+        ``_push_fitted_add_undo``.
         """
         if sel is None and self._selected is None:
             return
@@ -2637,7 +2673,8 @@ class GIWAXSImageViewer(QWidget):
             return
         prev = self._selected
         transitioning_away_from_manual = (
-            prev is not None
+            not preserve_manual
+            and prev is not None
             and prev.kind == "manual"
             and prev.manual_ref is not None
             and (sel is None or sel.manual_ref is not prev.manual_ref)

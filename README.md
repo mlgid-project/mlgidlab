@@ -156,16 +156,23 @@ A working sample is bundled at `example/BA2PbI4.h5` plus
   Gaussian regardless of which mode produced it.
 - **Live preview.** While a manual or detected peak is selected, a
   cyan dashed box on the image previews exactly where the next
-  Add-to-fitted commit will land. In 2D mode the preview runs
-  pygidfit live as you reposition the ROI — the profile plots'
-  pink fit curves and the cyan box both follow the actual 2D fit,
-  so what you see is what you save. Tick **Save fitted as ring**
-  for full-azimuthal peaks: the cyan preview switches to a
-  full-quadrant ring and ring storage forces 1D (pygidfit doesn't
-  model rings).
+  Add-to-fitted commit will land. In **1D mode** the pink fit
+  curves on the profile plots track what Add-to-fitted (1D) will
+  save. In **2D mode** the pink curves are hidden while a manual
+  or detected box is selected (pygidfit's projected 1D Gaussian
+  doesn't perfectly match the integrated profile, so the cyan
+  image-side box is the single preview); clicking Add-to-fitted
+  then auto-switches the selection to the new fitted peak, whose
+  pink overlay appears immediately — fitted and matched peaks
+  always show their overlay regardless of mode. Tick **Save
+  fitted as ring** for full-azimuthal peaks: the cyan preview
+  switches to a full-quadrant ring and ring storage forces 1D
+  (pygidfit doesn't model rings).
 - **Undo / redo** with `Ctrl+Z` / `Ctrl+Shift+Z` covers manual
-  add / remove / geometry edits and detected / fitted geometry
-  edits. Pipeline ops that re-index peak ids clear the history.
+  add / remove / geometry edits, detected / fitted geometry
+  edits, and Add-to-fitted commits (undoing one deletes the new
+  fitted row and reselects the source peak). Pipeline ops that
+  re-index peak ids clear the history.
 - The **Display dock** carries a master Matched-peaks toggle that
   cascades to every per-structure row; ticking a single structure
   while the master is off promotes it exclusively.
