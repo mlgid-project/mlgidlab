@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -67,6 +68,7 @@ from silx.gui.hdf5 import Hdf5TreeModel, Hdf5TreeView
 from silx.gui.hdf5.NexusSortFilterProxyModel import NexusSortFilterProxyModel
 
 from mlgidlab import file_model
+from mlgidlab import frame_range
 from mlgidlab import peak_clipboard
 from mlgidlab.image_viewer import (
     GIWAXSImageViewer,
@@ -750,6 +752,28 @@ class MainWindow(QMainWindow):
         )
         self.action_paste_peaks.triggered.connect(self._on_paste_peaks)
         edit_menu.addAction(self.action_paste_peaks)
+
+        # Ctrl+Shift+V: paste the clipboard to every frame in a typed
+        # range (e.g. "0-34,37"). One grouped undo reverses the whole
+        # range. Out-of-range frames are filtered with a confirmation
+        # dialog; duplicates in the input dedup silently.
+        self.action_paste_peaks_to_range = QAction(
+            "Paste detected peak(s) to &frames…", self,
+        )
+        self.action_paste_peaks_to_range.setShortcut(
+            QKeySequence("Ctrl+Shift+V")
+        )
+        self.action_paste_peaks_to_range.setShortcutContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
+        self.action_paste_peaks_to_range.setToolTip(
+            "Paste copied detected peak(s) to a typed frame range "
+            "(e.g. 0-34,37). Same-entry only."
+        )
+        self.action_paste_peaks_to_range.triggered.connect(
+            self._on_paste_peaks_to_range
+        )
+        edit_menu.addAction(self.action_paste_peaks_to_range)
 
         edit_menu.addSeparator()
         # Find peak by ID. Opens a modal asking for the kind + numeric
@@ -5487,6 +5511,250 @@ class MainWindow(QMainWindow):
             self.pipeline_panel.append_log(
                 f"Redo paste: re-added {len(new_ids)} detected "
                 f"peak(s) on {entry}/frame{int(frame):05d}"
+            )
+
+        self.viewer._push_undo(_CallbackAction(_undo, _redo))
+
+    def _on_paste_peaks_to_range(self) -> None:
+        """Paste the clipboard onto every frame in a typed range.
+
+        Ctrl+Shift+V entry point. Mirrors ``_on_paste_peaks`` but
+        loops the frame set produced by ``frame_range.parse_frame_range``.
+        ``take_items`` is non-draining, so the same snapshot is replayed
+        on every target frame and remains available for further pastes.
+
+        UX rules (confirmed with the user):
+          * Out-of-range frames are filtered with a confirmation dialog
+            naming the count + compact range list.
+          * Duplicates in the input deduplicate silently.
+          * After a successful paste, only the current frame's rows
+            (if it landed in the range) get added to the multi-selection.
+          * Cancel mid-loop keeps already-written frames.
+          * One grouped ``_CallbackAction`` reverses the entire batch.
+        """
+        if self.session is None or self._pipe_thread is not None:
+            return
+        entry = self.entry_combo.currentText()
+        if not entry:
+            return
+        items = peak_clipboard.take_items(target_entry=entry)
+        if not items:
+            self.statusBar().showMessage(
+                "Paste: clipboard empty or copied from a different entry",
+                4000,
+            )
+            return
+        n_frames = int(self.viewer.n_frames)
+        if n_frames <= 0:
+            return
+        text, ok = QInputDialog.getText(
+            self, "Paste to frames",
+            f"Frames (e.g. 0-{max(n_frames - 1, 0)},37):",
+            text=str(int(self.viewer.current_frame)),
+        )
+        if not ok:
+            return
+        try:
+            valid, dropped = frame_range.parse_frame_range(
+                text, n_frames=n_frames,
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Paste to frames", str(exc))
+            return
+        if dropped:
+            reply = QMessageBox.question(
+                self, "Paste to frames",
+                f"Pasting to {len(valid)} frame(s). "
+                f"{len(dropped)} frame(s) outside the {n_frames}-frame "
+                f"stack will be skipped: "
+                f"{frame_range.compact_repr(dropped)}.\n\nContinue?",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        if not valid:
+            self.statusBar().showMessage(
+                "Paste to frames: nothing to do — no frames in range",
+                4000,
+            )
+            return
+
+        n_frames_to_write = len(valid)
+        dialog = QProgressDialog(
+            f"Pasting to {n_frames_to_write} frame(s)…",
+            "Cancel", 0, n_frames_to_write, self,
+        )
+        dialog.setWindowTitle("Paste to frames")
+        dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setValue(0)
+
+        per_frame_ids: dict[int, list[int]] = {}
+        cancelled = False
+        with self._detached_silx_tree():
+            try:
+                for i, target_frame in enumerate(valid):
+                    if dialog.wasCanceled():
+                        cancelled = True
+                        break
+                    dialog.setLabelText(
+                        f"Pasting frame {i + 1}/{n_frames_to_write} "
+                        f"(frame {target_frame:05d})…"
+                    )
+                    QApplication.processEvents()
+                    frame_ids: list[int] = []
+                    for item in items:
+                        new_id = file_model.add_detected_peak_row(
+                            self.session.temp_path, entry,
+                            int(target_frame),
+                            radius=item.radius,
+                            angle=item.angle,
+                            radius_width=item.radius_width,
+                            angle_width=item.angle_width,
+                            is_ring=item.is_ring,
+                        )
+                        frame_ids.append(int(new_id))
+                    per_frame_ids[int(target_frame)] = frame_ids
+                    dialog.setValue(i + 1)
+                    QApplication.processEvents()
+            except KeyError as exc:
+                dialog.close()
+                QMessageBox.warning(self, "Paste to frames", str(exc))
+                return
+            except Exception as exc:
+                dialog.close()
+                QMessageBox.critical(self, "Paste to frames", str(exc))
+                return
+        dialog.close()
+
+        if not per_frame_ids:
+            return
+
+        self.session.mark_dirty()
+        self._update_title()
+        self.viewer.clear_history()
+        self._load_entry_into_viewer(entry, preserve_view=True)
+        # Only the current frame's pasted rows get added to the
+        # selection (per confirmed UX). Off-frame selections would
+        # be pruned on frame switch anyway.
+        current_frame = int(self.viewer.current_frame)
+        if current_frame in per_frame_ids:
+            self._add_detected_to_selection(
+                entry, current_frame, per_frame_ids[current_frame],
+            )
+        self._push_paste_to_range_undo(
+            entry=entry, items=items, per_frame_ids=per_frame_ids,
+        )
+
+        n_rows = sum(len(v) for v in per_frame_ids.values())
+        n_frames_written = len(per_frame_ids)
+        summary = (
+            f"Pasted {n_rows} detected peak(s) across "
+            f"{n_frames_written} frame(s) on {entry}"
+        )
+        if dropped:
+            summary += f" ({len(dropped)} out-of-range frame(s) skipped)"
+        if cancelled:
+            summary += " (cancelled)"
+        self.statusBar().showMessage(summary, 6000)
+        self.pipeline_panel.append_log(summary)
+
+    def _push_paste_to_range_undo(
+        self, *, entry: str, items: list,
+        per_frame_ids: dict[int, list[int]],
+    ) -> None:
+        """Undo / redo for a range paste — one grouped action.
+
+        ``state["per_frame_ids"]`` rotates on every redo so a follow-on
+        undo deletes the correct (freshly-assigned) ids. Same idea as
+        ``_push_paste_undo`` extended from a single frame to a frame
+        dict; frames the original Cancel skipped never enter the dict
+        so they're left alone on undo/redo.
+        """
+        state: dict[str, dict[int, list[int]]] = {
+            "per_frame_ids": {
+                int(f): [int(i) for i in ids]
+                for f, ids in per_frame_ids.items()
+            },
+        }
+        snapshot = list(items)
+
+        def _undo() -> None:
+            if self.session is None or self._pipe_thread is not None:
+                return
+            if self.entry_combo.currentText() != entry:
+                self.entry_combo.setCurrentText(entry)
+            current_frame = int(self.viewer.current_frame)
+            with self._detached_silx_tree():
+                try:
+                    for f, ids in state["per_frame_ids"].items():
+                        for peak_id in ids:
+                            file_model.delete_peak_row(
+                                self.session.temp_path, entry,
+                                frame=int(f), kind="detected",
+                                peak_id=int(peak_id),
+                            )
+                except Exception as exc:
+                    QMessageBox.critical(
+                        self, "Undo paste to frames", str(exc)
+                    )
+                    return
+            self.session.mark_dirty()
+            self._update_title()
+            self._load_entry_into_viewer(entry, preserve_view=True)
+            if current_frame in state["per_frame_ids"]:
+                self._drop_detected_from_selection(
+                    current_frame, state["per_frame_ids"][current_frame],
+                )
+            n_rows = sum(len(v) for v in state["per_frame_ids"].values())
+            n_frames_written = len(state["per_frame_ids"])
+            self.pipeline_panel.append_log(
+                f"Undo paste to frames: removed {n_rows} detected "
+                f"peak(s) across {n_frames_written} frame(s) on {entry}"
+            )
+
+        def _redo() -> None:
+            if self.session is None or self._pipe_thread is not None:
+                return
+            if self.entry_combo.currentText() != entry:
+                self.entry_combo.setCurrentText(entry)
+            current_frame = int(self.viewer.current_frame)
+            new_per_frame_ids: dict[int, list[int]] = {}
+            with self._detached_silx_tree():
+                try:
+                    for f in sorted(state["per_frame_ids"].keys()):
+                        frame_ids: list[int] = []
+                        for item in snapshot:
+                            new_id = file_model.add_detected_peak_row(
+                                self.session.temp_path, entry, int(f),
+                                radius=item.radius,
+                                angle=item.angle,
+                                radius_width=item.radius_width,
+                                angle_width=item.angle_width,
+                                is_ring=item.is_ring,
+                            )
+                            frame_ids.append(int(new_id))
+                        new_per_frame_ids[int(f)] = frame_ids
+                except Exception as exc:
+                    QMessageBox.critical(
+                        self, "Redo paste to frames", str(exc)
+                    )
+                    return
+            state["per_frame_ids"] = new_per_frame_ids
+            self.session.mark_dirty()
+            self._update_title()
+            self._load_entry_into_viewer(entry, preserve_view=True)
+            if current_frame in new_per_frame_ids:
+                self._add_detected_to_selection(
+                    entry, current_frame, new_per_frame_ids[current_frame],
+                )
+            n_rows = sum(len(v) for v in new_per_frame_ids.values())
+            n_frames_written = len(new_per_frame_ids)
+            self.pipeline_panel.append_log(
+                f"Redo paste to frames: re-added {n_rows} detected "
+                f"peak(s) across {n_frames_written} frame(s) on {entry}"
             )
 
         self.viewer._push_undo(_CallbackAction(_undo, _redo))
