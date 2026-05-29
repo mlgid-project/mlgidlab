@@ -13,7 +13,7 @@ requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [
-    { name = "Nico Lerch", email = "nicolerch23@gmail.com" },
+    { name = "Nico Lerch", email = "nico.lerch@uni-tuebingen.de" },
 ]
 keywords = ["GIWAXS", "GISAXS", "diffraction", "NeXus", "HDF5", "PySide6", "silx"]
 classifiers = [
@@ -62,7 +62,7 @@ dev = ["pytest>=8.0", "pytest-qt>=4.4"]
 # the detection/fitting/matching numerics or the on-disk schema, so a
 # bump must be a deliberate, test-rechecked change rather than something
 # pip silently picks up. The versions below are the verified-good set
-# (all 167 tests pass against them — see Documentation/backend_compatibility.md).
+# (all tests pass against them — see docs/backend_compatibility.md).
 # To move up: bump here, re-run the full suite + the end-to-end demo
 # loop, then commit the new pins.
 pipeline = [
