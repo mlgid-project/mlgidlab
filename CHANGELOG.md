@@ -84,10 +84,10 @@ The `[pipeline]` extra pins the verified-good backend set:
 `mlgidbase==0.1.3`, `pygid==0.2.10`, `pygidfit==0.1.3`,
 `mlgidmatch==0.1.3`, `pygidsim==0.1.4`. The GUI runs without them in
 view-only mode (Run buttons disabled). See
-[`Documentation/00_getting_started.md`](Documentation/00_getting_started.md)
-for per-OS install detail and a first-file walkthrough, and
-[`Documentation/backend_compatibility.md`](Documentation/backend_compatibility.md)
-for the backend version policy.
+[`docs/getting_started.md`](docs/getting_started.md) for per-OS install
+detail and a first-file walkthrough, and
+[`docs/backend_compatibility.md`](docs/backend_compatibility.md) for the
+backend version policy.
 
 ### Known limitations
 
@@ -100,9 +100,13 @@ for the backend version policy.
   a derived work).
 - Some error paths in the calibration dialog and background workers
   log rather than surface to the UI; if an operation seems to do
-  nothing, check the Logs dock. See
-  [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md).
+  nothing, check the Logs dock.
+- mlgidlab's fitted-peak add/delete touches `fitted_peaks` only, not
+  the paired `fitted_peaks_errors`; re-run Matching after editing
+  fitted peaks (matched indices reference the fitted-row ordering).
 
-### License
+### License & contact
 
-MIT — see [`LICENSE`](LICENSE).
+MIT — see [`LICENSE`](LICENSE). Maintainer: Nico Lerch
+(<nico.lerch@uni-tuebingen.de>); issues via
+https://github.com/mlgid-project/mlgidLAB/issues.
