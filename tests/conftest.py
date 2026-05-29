@@ -34,6 +34,13 @@ import sys  # noqa: E402
 
 import pytest  # noqa: E402
 
+import pytestqt.qtbot as _qtbot_mod  # noqa: E402
+_PIN=[]
+_oaw=_qtbot_mod._add_widget
+def _paw(item,widget,**kw):
+    _PIN.append(widget); _oaw(item,widget,**kw)
+_qtbot_mod._add_widget=_paw
+
 # Real pytest exit status, captured at session end and used by
 # pytest_unconfigure to hard-exit before the crashy native teardown.
 _PYTEST_EXIT_STATUS = 0

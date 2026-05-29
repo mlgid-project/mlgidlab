@@ -123,6 +123,24 @@ def _reset_clipboard():
     peak_clipboard.clear()
 
 
+@pytest.fixture(autouse=True)
+def _no_blocking_modals(monkeypatch):
+    """A modal ``QMessageBox.warning/critical`` calls ``exec()``, which
+    spins a local event loop and waits for a button click. In headless
+    / offscreen mode (local ``-q`` runs and CI alike) there is no
+    clicker, so it blocks forever — the test never finishes and CI
+    hangs. Convert the two fire-and-forget modals the paste handler can
+    raise into loud failures so a mis-set test fails fast and visibly
+    instead of hanging. (``question`` is patched per-test where a
+    confirmation is expected.)"""
+    def _boom(*args, **kwargs):
+        raise AssertionError(
+            f"unexpected blocking QMessageBox in test: {args[1:3]!r}"
+        )
+    monkeypatch.setattr(QMessageBox, "warning", staticmethod(_boom))
+    monkeypatch.setattr(QMessageBox, "critical", staticmethod(_boom))
+
+
 def _n_detected(path, entry, frame) -> int:
     table = file_model.load_peaks(path, entry, frame)["detected"]
     return 0 if table is None else len(table)
@@ -132,11 +150,15 @@ def test_paste_to_range_writes_one_clipboard_per_frame(
     main_window, synthetic_nexus_with_peaks, monkeypatch,
 ):
     """Range '0-2' writes the clipboard to each of frames 0, 1, 2."""
-    _open(main_window, synthetic_nexus_with_peaks)
+    # Seed BEFORE open: NexusSession.open copies the file to a temp
+    # path and the GUI only touches that copy, so groups must exist in
+    # the original before the copy is made. Seeding after open would
+    # leave the temp copy's frames empty -> add_detected_peak_row
+    # KeyError -> a modal warning that hangs headless.
     _seed_analysis_groups(
         synthetic_nexus_with_peaks, "entry_0000", [1, 2],
     )
-    main_window._load_entry_into_viewer("entry_0000", preserve_view=True)
+    _open(main_window, synthetic_nexus_with_peaks)
 
     _copy_n_detected(main_window, 0, n=2)
     n0_before = _n_detected(main_window.session.temp_path, "entry_0000", 0)
@@ -159,11 +181,11 @@ def test_paste_to_range_dedup(
 ):
     """Range '0,0-1' dedups to {0, 1} — frame 0 grows by exactly
     len(items), not 2 * len(items)."""
-    _open(main_window, synthetic_nexus_with_peaks)
+    # Seed BEFORE open (see note in the per-frame test above).
     _seed_analysis_groups(
         synthetic_nexus_with_peaks, "entry_0000", [1],
     )
-    main_window._load_entry_into_viewer("entry_0000", preserve_view=True)
+    _open(main_window, synthetic_nexus_with_peaks)
 
     _copy_n_detected(main_window, 0, n=2)
     n0_before = _n_detected(main_window.session.temp_path, "entry_0000", 0)
@@ -184,11 +206,15 @@ def test_paste_to_range_filters_out_of_range(
 ):
     """Range '0-100' on a 3-frame stack: confirmation Yes filters to
     frames 0, 1, 2 only. Out-of-range frames neither write nor crash."""
-    _open(main_window, synthetic_nexus_with_peaks)
+    # Seed BEFORE open: NexusSession.open copies the file to a temp
+    # path and the GUI only touches that copy, so groups must exist in
+    # the original before the copy is made. Seeding after open would
+    # leave the temp copy's frames empty -> add_detected_peak_row
+    # KeyError -> a modal warning that hangs headless.
     _seed_analysis_groups(
         synthetic_nexus_with_peaks, "entry_0000", [1, 2],
     )
-    main_window._load_entry_into_viewer("entry_0000", preserve_view=True)
+    _open(main_window, synthetic_nexus_with_peaks)
 
     _copy_n_detected(main_window, 0, n=1)
     monkeypatch.setattr(
@@ -233,11 +259,15 @@ def test_paste_to_range_undo_removes_all_appended(
 ):
     """One Ctrl+Z reverses the whole range paste across every touched
     frame."""
-    _open(main_window, synthetic_nexus_with_peaks)
+    # Seed BEFORE open: NexusSession.open copies the file to a temp
+    # path and the GUI only touches that copy, so groups must exist in
+    # the original before the copy is made. Seeding after open would
+    # leave the temp copy's frames empty -> add_detected_peak_row
+    # KeyError -> a modal warning that hangs headless.
     _seed_analysis_groups(
         synthetic_nexus_with_peaks, "entry_0000", [1, 2],
     )
-    main_window._load_entry_into_viewer("entry_0000", preserve_view=True)
+    _open(main_window, synthetic_nexus_with_peaks)
 
     _copy_n_detected(main_window, 0, n=1)
     n_before = {
@@ -266,11 +296,15 @@ def test_paste_to_range_progress_cancel_keeps_partial(
 ):
     """Cancel after the first frame's setValue keeps frame 0's rows
     but not frames 1 or 2."""
-    _open(main_window, synthetic_nexus_with_peaks)
+    # Seed BEFORE open: NexusSession.open copies the file to a temp
+    # path and the GUI only touches that copy, so groups must exist in
+    # the original before the copy is made. Seeding after open would
+    # leave the temp copy's frames empty -> add_detected_peak_row
+    # KeyError -> a modal warning that hangs headless.
     _seed_analysis_groups(
         synthetic_nexus_with_peaks, "entry_0000", [1, 2],
     )
-    main_window._load_entry_into_viewer("entry_0000", preserve_view=True)
+    _open(main_window, synthetic_nexus_with_peaks)
 
     _copy_n_detected(main_window, 0, n=1)
     n_before = {
@@ -359,11 +393,15 @@ def test_paste_to_range_selection_only_for_current_frame(
     """Current frame = 2; paste range '0-2' adds only frame 2's pasted
     rows to the multi-selection. The off-frame rows on 0 and 1 are
     not in selected_peaks()."""
-    _open(main_window, synthetic_nexus_with_peaks)
+    # Seed BEFORE open: NexusSession.open copies the file to a temp
+    # path and the GUI only touches that copy, so groups must exist in
+    # the original before the copy is made. Seeding after open would
+    # leave the temp copy's frames empty -> add_detected_peak_row
+    # KeyError -> a modal warning that hangs headless.
     _seed_analysis_groups(
         synthetic_nexus_with_peaks, "entry_0000", [1, 2],
     )
-    main_window._load_entry_into_viewer("entry_0000", preserve_view=True)
+    _open(main_window, synthetic_nexus_with_peaks)
 
     _copy_n_detected(main_window, 0, n=1)
     # Clear selection so post-paste sel count reflects only the new
