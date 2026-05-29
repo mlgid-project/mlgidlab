@@ -30,13 +30,29 @@ dependencies = [
 # QT_QPA_PLATFORM=offscreen set in tests/conftest.py (no xvfb needed).
 dev = ["pytest>=8.0", "pytest-qt>=4.4"]
 # Pipeline backend (heavy: pulls torch + the mlgid analysis stack).
-# Install when you actually want to run detection/fitting/matching from the GUI.
-# pygid is required for the raw → NeXus conversion path; it's transitively
-# pulled by mlgidbase but listing it explicitly makes the dependency
-# obvious to anyone reading the project metadata.
+# Install when you actually want to run detection/fitting/matching from
+# the GUI. The GUI imports mlgidbase, pygid, pygidfit, mlgidmatch and
+# pygidsim *directly*, so all five are declared here rather than relying
+# on mlgidbase's transitive closure — a future mlgidbase that drops one
+# then surfaces as a clear resolver error, not a runtime ImportError.
+# mlgiddetect is omitted on purpose: the GUI never imports it; it arrives
+# transitively via mlgidbase (which run_detection needs). Floors are the
+# verified-good baseline (see Documentation/backend_compatibility.md);
+# they stay '>=' because mlgidbase pins its own backends with '==', and a
+# floor at-or-below that pin never conflicts.
+# Exact ('==') pins, not floors: each in-house backend release can shift
+# the detection/fitting/matching numerics or the on-disk schema, so a
+# bump must be a deliberate, test-rechecked change rather than something
+# pip silently picks up. The versions below are the verified-good set
+# (all 167 tests pass against them — see Documentation/backend_compatibility.md).
+# To move up: bump here, re-run the full suite + the end-to-end demo
+# loop, then commit the new pins.
 pipeline = [
-    "mlgidbase>=0.1",
-    "pygid>=0.2",
+    "mlgidbase==0.1.3",
+    "pygid==0.2.10",
+    "pygidfit==0.1.3",
+    "mlgidmatch==0.1.3",
+    "pygidsim==0.1.4",
     "PyYAML",
 ]
 

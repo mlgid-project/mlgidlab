@@ -30,9 +30,27 @@ os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 _CONFIG_ROOT = tempfile.mkdtemp(prefix="mlgidlab-test-config-")
 os.environ["XDG_CONFIG_HOME"] = _CONFIG_ROOT
 
+import gc  # noqa: E402
 import sys  # noqa: E402
 
 import pytest  # noqa: E402
+
+# --- disable the cyclic garbage collector for the whole session ------
+# A cyclic-GC pass that fires *while* PySide6/shiboken is mid-way
+# through constructing a Qt object reenters that half-built C++ wrapper
+# and SIGSEGVs. We observed it on CI (PySide6 6.11.1, Python 3.13)
+# crashing inside MainWindow() -> pyqtgraph ImageView -> ROI
+# construction, with the faulting thread reported as "Garbage-
+# collecting"; it does not reproduce on the dev box (PySide6 6.11.0,
+# Python 3.12), so it is a teardown-order / GC-timing crash, not a
+# logic bug. The ``_PIN`` shim below keeps *test-owned* widgets alive,
+# but the crash is during construction — before the widget ever reaches
+# qtbot — so reference-pinning can't reach it. Disabling automatic
+# collection removes the only thing that can run mid-construction;
+# refcounting still frees objects promptly, and the os._exit in
+# pytest_unconfigure means leaked reference cycles never matter for this
+# short-lived process. No test depends on gc (verified by grep).
+gc.disable()
 
 import pytestqt.qtbot as _qtbot_mod  # noqa: E402
 _PIN=[]
