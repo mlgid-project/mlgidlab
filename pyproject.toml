@@ -1,12 +1,33 @@
 [build-system]
-requires = ["setuptools>=65", "wheel"]
+# setuptools >= 77 for PEP 639 license metadata (the SPDX `license`
+# string + `license-files`).
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlgidlab"
-version = "0.0.1"
+version = "0.1.0a1"
 description = "mlgidLAB: graphical interface for the mlgidBASE GIWAXS analysis pipeline"
+readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Nico Lerch", email = "nicolerch23@gmail.com" },
+]
+keywords = ["GIWAXS", "GISAXS", "diffraction", "NeXus", "HDF5", "PySide6", "silx"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Visualization",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
 dependencies = [
     "PySide6>=6.6",
     # silx[full] pulls in matplotlib, dateutil, qtawesome, PyOpenGL — all
@@ -36,10 +57,7 @@ dev = ["pytest>=8.0", "pytest-qt>=4.4"]
 # on mlgidbase's transitive closure — a future mlgidbase that drops one
 # then surfaces as a clear resolver error, not a runtime ImportError.
 # mlgiddetect is omitted on purpose: the GUI never imports it; it arrives
-# transitively via mlgidbase (which run_detection needs). Floors are the
-# verified-good baseline (see Documentation/backend_compatibility.md);
-# they stay '>=' because mlgidbase pins its own backends with '==', and a
-# floor at-or-below that pin never conflicts.
+# transitively via mlgidbase (which run_detection needs).
 # Exact ('==') pins, not floors: each in-house backend release can shift
 # the detection/fitting/matching numerics or the on-disk schema, so a
 # bump must be a deliberate, test-rechecked change rather than something
@@ -58,6 +76,11 @@ pipeline = [
 
 [project.gui-scripts]
 mlgidlab = "mlgidlab:main"
+
+[project.urls]
+Homepage = "https://github.com/mlgid-project/mlgidLAB"
+Repository = "https://github.com/mlgid-project/mlgidLAB"
+Issues = "https://github.com/mlgid-project/mlgidLAB/issues"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

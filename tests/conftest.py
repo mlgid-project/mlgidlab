@@ -141,7 +141,24 @@ def main_window(qtbot):
     try:
         yield window
     finally:
-        window.close()
+        try:
+            window.close()
+        except RuntimeError as exc:
+            # PySide6 can raise "Internal C++ object (<widget>) already
+            # deleted" while closeEvent tears down pyqtgraph widgets
+            # (viewer / profile-viewer clear()) — the C++ half of a
+            # child is freed before a Python-side close handler touches
+            # it. With gc.disable() (see top of file) the dead wrapper
+            # lingers instead of being collected, so the access raises
+            # instead of being skipped. It is timing-dependent shutdown
+            # noise in this many-windows-per-process test run (observed
+            # on CI py3.12 + PySide6 6.11.1, never locally or on 3.14),
+            # not a product fault: the real app closes once, with a
+            # display, and the process exits immediately after. Swallow
+            # only that specific message; re-raise anything else so a
+            # genuine teardown regression still fails the suite.
+            if "already deleted" not in str(exc):
+                raise
 
 
 @pytest.fixture

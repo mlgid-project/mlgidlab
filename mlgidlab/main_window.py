@@ -7150,6 +7150,16 @@ class MainWindow(QMainWindow):
         self._open_paths(paths)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        # Idempotent: close() can be delivered more than once (Qt can
+        # re-emit a close event, and pytest-qt's teardown calls close()
+        # again on every registered widget after our own close). Running
+        # the teardown twice would re-clear already-destroyed pyqtgraph
+        # widgets — on some PySide6 builds that raises
+        # "Internal C++ object already deleted" during shutdown. Skip a
+        # second pass.
+        if getattr(self, "_closed", False):
+            event.accept()
+            return
         # Each loaded file may have unsaved changes — prompt per dirty
         # session in load order so the user gets the same per-file save
         # dialog they would on _action_close_file.
@@ -7157,6 +7167,9 @@ class MainWindow(QMainWindow):
             if not self._confirm_discard_changes(s):
                 event.ignore()
                 return
+        # Past the point of no return — mark closed so a re-entrant or
+        # pytest-qt second close() short-circuits above.
+        self._closed = True
         # Stop frame playback so the timer doesn't fire one last tick
         # against a torn-down viewer during shutdown.
         self._pause_playback()

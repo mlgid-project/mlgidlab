@@ -96,3 +96,23 @@ def test_save_writes_back_and_clears_dirty(main_window, synthetic_nexus):
     # the original, so the out-of-band marker is gone.
     with h5py.File(synthetic_nexus, "r") as f:
         assert "stale_marker" not in f["entry_0000/data"].attrs
+
+
+def test_close_event_is_idempotent(main_window, synthetic_nexus):
+    """closeEvent must be safe to deliver more than once.
+
+    pytest-qt's teardown calls close() again on every registered
+    widget after our own close, and Qt itself can re-emit a close
+    event. A second pass used to re-clear already-destroyed pyqtgraph
+    widgets, raising "Internal C++ object already deleted" on some
+    PySide6 builds during shutdown (seen on CI py3.12 + PySide6
+    6.11.1). The second close() is now a no-op.
+    """
+    _open(main_window, synthetic_nexus)
+    main_window.close()
+    assert getattr(main_window, "_closed", False) is True
+    # Second + third close() must not raise (the fixture teardown will
+    # call it once more, also harmlessly).
+    main_window.close()
+    main_window.close()
+    assert main_window._closed is True
