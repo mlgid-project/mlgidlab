@@ -1163,6 +1163,63 @@ def normalize_for_pygid(file_path: Path) -> dict[str, list[str]]:
     return {"angle": patched_angle, "frames": patched_frames}
 
 
+def read_peak_rows(
+    file_path: Path,
+    entry: str,
+    frame: int,
+    kind: str,
+    peak_ids: list[int],
+) -> list[dict]:
+    """Snapshot full field dicts for the given peak ids on one frame.
+
+    Returns one dict per id that exists (in the order of ``peak_ids``),
+    carrying every writable column — including the 2D-fit params
+    (``theta``/``A``/``B``/``C``/``amplitude``) that ``PeakTable``
+    doesn't surface. This lets a delete be undone by re-creating the
+    rows verbatim via ``add_detected_peak_row`` / ``add_fitted_peak_row``
+    (``id`` and ``q_xy``/``q_z`` are intentionally omitted: the add
+    helpers assign a fresh id and recompute the q-fields from polar).
+    Ids not present in the dataset are skipped. ``kind`` is
+    ``"detected"`` or ``"fitted"``; read-only (mode ``"r"``).
+    """
+    if kind not in ("detected", "fitted"):
+        raise ValueError(
+            f"read_peak_rows: kind must be detected or fitted, got {kind!r}"
+        )
+    ds_name = f"{kind}_peaks"
+    frame_key = FRAME_KEY_FMT.format(int(frame))
+    wanted = (
+        "amplitude", "angle", "angle_width", "radius", "radius_width",
+        "theta", "score", "A", "B", "C",
+        "is_ring", "is_cut_qz", "is_cut_qxy", "visibility",
+    )
+    out: list[dict] = []
+    with h5py.File(file_path, "r") as f:
+        ds_path = f"{entry}/{ANALYSIS_REL}/{frame_key}/{ds_name}"
+        if ds_path not in f:
+            return out
+        arr = f[ds_path][()]
+        names = set(arr.dtype.names or ())
+        by_id = {int(row["id"]): row for row in arr}
+        for pid in peak_ids:
+            row = by_id.get(int(pid))
+            if row is None:
+                continue
+            d: dict = {}
+            for nm in wanted:
+                if nm not in names:
+                    continue
+                val = row[nm]
+                if nm in ("is_ring", "is_cut_qz", "is_cut_qxy"):
+                    d[nm] = bool(val)
+                elif nm == "visibility":
+                    d[nm] = int(val)
+                else:
+                    d[nm] = float(val)
+            out.append(d)
+    return out
+
+
 def delete_peak_row(
     file_path: Path,
     entry: str,

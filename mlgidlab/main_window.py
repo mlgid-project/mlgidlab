@@ -2647,6 +2647,8 @@ class MainWindow(QMainWindow):
         self.viewer.peakRowWriteRequested.connect(self._on_peak_row_write_requested)
         # Delete keypress on file-resident peaks.
         self.viewer.deletePeakRequested.connect(self._on_delete_peak_requested)
+        # Delete keypress with >= 2 detected peaks selected → bulk delete.
+        self.viewer.deletePeaksRequested.connect(self._on_delete_peaks_requested)
 
         # Keep _ring_pre_geom in sync with the manual peak it points at.
         # When the user replaces the box (single-box policy) while ring
@@ -5324,18 +5326,19 @@ class MainWindow(QMainWindow):
         )
 
     def _build_detected_sels(
-        self, frame: int, ids: list[int],
+        self, frame: int, ids: list[int], kind: str = "detected",
     ) -> list[SelectedPeak]:
-        """Look up the freshly-loaded detected rows with the given ids
+        """Look up the freshly-loaded ``kind`` rows with the given ids
         on ``frame`` and return them as ``SelectedPeak`` snapshots.
 
-        Silently skips ids that aren't present in the table (e.g. after
-        a follow-on pipeline rerun). Used by both the paste handler
-        (to extend the multi-selection) and the redo path (same)."""
+        ``kind`` is ``"detected"`` (default) or ``"fitted"``. Silently
+        skips ids that aren't present in the table (e.g. after a
+        follow-on pipeline rerun). Used by the paste / bulk-delete
+        handlers and their undo/redo paths to (re)build a selection."""
         if not ids:
             return []
         tables = self.viewer._frame_peaks.get(int(frame)) or {}
-        det = tables.get("detected")
+        det = tables.get(kind)
         if det is None:
             return []
         id_set = {int(x) for x in ids}
@@ -5343,7 +5346,7 @@ class MainWindow(QMainWindow):
         for i in range(len(det)):
             if int(det.ids[i]) in id_set:
                 sels.append(SelectedPeak(
-                    kind="detected", frame=int(frame),
+                    kind=kind, frame=int(frame),
                     peak_id=int(det.ids[i]),
                     radius=float(det.radius[i]),
                     angle=float(det.angle[i]),
@@ -5356,27 +5359,27 @@ class MainWindow(QMainWindow):
         return sels
 
     def _add_detected_to_selection(
-        self, entry: str, frame: int, ids: list[int],
+        self, entry: str, frame: int, ids: list[int], kind: str = "detected",
     ) -> None:
-        """Add the given detected rows to the existing multi-selection.
+        """Add the given ``kind`` rows to the existing multi-selection.
 
-        Behaviour mirrors a sequence of Ctrl+clicks: if the current
-        primary is a detected peak, all ``ids`` are appended to
-        ``_selected_extras``; otherwise the first id becomes the new
-        primary (so the multi-selection can grow) and the rest go to
-        extras. Replaces the previous "always replace the selection"
-        behaviour so paste / redo grow the user's selection instead
-        of wiping it.
+        ``kind`` is ``"detected"`` (default) or ``"fitted"``. Behaviour
+        mirrors a sequence of Ctrl+clicks: if the current primary is the
+        same kind, all ``ids`` are appended to ``_selected_extras``;
+        otherwise the first id becomes the new primary (so the
+        multi-selection can grow) and the rest go to extras. Lets
+        paste / delete-undo grow the user's selection instead of
+        wiping it.
         """
-        sels = self._build_detected_sels(frame, ids)
+        sels = self._build_detected_sels(frame, ids, kind=kind)
         if not sels:
             return
         v = self.viewer
-        if v._selected is None or v._selected.kind != "detected":
+        if v._selected is None or v._selected.kind != kind:
             # ``preserve_manual`` so a previously-selected manual
-            # peak isn't auto-removed when we promote a detected
-            # peak to primary (matches the post-Add-to-fitted
-            # auto-select pattern at ``_on_add_to_fitted``).
+            # peak isn't auto-removed when we promote a peak to
+            # primary (matches the post-Add-to-fitted auto-select
+            # pattern at ``_on_add_to_fitted``).
             v._set_selected(sels[0], preserve_manual=True)
             v._selected_extras = list(sels[1:])
         else:
@@ -5396,15 +5399,15 @@ class MainWindow(QMainWindow):
         v.selectionsChanged.emit(v.selected_peaks())
 
     def _drop_detected_from_selection(
-        self, frame: int, ids: list[int],
+        self, frame: int, ids: list[int], kind: str = "detected",
     ) -> None:
-        """Remove the given detected rows from the multi-selection.
+        """Remove the given ``kind`` rows from the multi-selection.
 
-        Used by the undo path so the highlight overlay tracks the
-        on-disk state — without this, the just-deleted rows would
-        keep painting white selection boxes at their old positions
-        (the SelectedPeak holds its own geometry independent of the
-        peak table).
+        ``kind`` is ``"detected"`` (default) or ``"fitted"``. Used by
+        the undo/redo paths so the highlight overlay tracks the on-disk
+        state — without this, just-deleted rows would keep painting
+        white selection boxes at their old positions (the SelectedPeak
+        holds its own geometry independent of the peak table).
         """
         v = self.viewer
         if v._selected is None and not v._selected_extras:
@@ -5413,7 +5416,7 @@ class MainWindow(QMainWindow):
 
         def _hit(s: SelectedPeak) -> bool:
             return (
-                s.kind == "detected"
+                s.kind == kind
                 and (int(s.frame), int(s.peak_id)) in id_set
             )
 
@@ -6274,47 +6277,109 @@ class MainWindow(QMainWindow):
     def _delete_file_peak_scoped(
         self, sel: SelectedPeak, entry: str,
     ) -> None:
-        """Delete only the selected kind's row, no cross-kind cascade.
+        """Delete one detected/fitted row — kind-scoped, undoable.
 
-        For fitted: also clears ``matched_*`` on the frame because
+        Fitted deletes also clear ``matched_*`` on the frame, because
         ``peak_list`` integer indices into ``fitted_peaks`` go stale
-        when the row ordering changes. Mirrors the F-04 invalidation
-        the pipeline ``run_fitting`` path uses.
+        when the row ordering changes (F-04 invalidation). Delegates to
+        the shared ``_delete_peaks_scoped`` so single and bulk delete
+        share one undoable path.
         """
-        kind = sel.kind  # "detected" or "fitted"
+        self._delete_peaks_scoped([sel], entry)
+
+    def _on_delete_peaks_requested(self, sels: list[SelectedPeak]) -> None:
+        """Bulk-delete an all-detected OR all-fitted multi-selection.
+
+        Triggered by Delete when >= 2 same-kind peaks are selected
+        (``deletePeaksRequested``). One confirmation, one grouped,
+        undoable action — see ``_delete_peaks_scoped``.
+        """
+        kinds = {s.kind for s in sels}
+        if len(sels) < 2 or len(kinds) != 1:
+            return
+        if next(iter(kinds)) not in ("detected", "fitted"):
+            return
+        entry = self.entry_combo.currentText()
+        if not entry:
+            return
+        self._delete_peaks_scoped(list(sels), entry)
+
+    def _delete_peaks_scoped(
+        self, sels: list[SelectedPeak], entry: str,
+    ) -> None:
+        """Shared, undoable delete for 1..N same-kind detected/fitted peaks.
+
+        Confirms once, snapshots the full rows (so undo can re-create
+        them verbatim — including the 2D-fit params PeakTable doesn't
+        surface), deletes them in one ``_detached_silx_tree`` scope,
+        clears ``matched_*`` on the frame for fitted deletes, and pushes
+        one grouped ``_CallbackAction`` so a single Ctrl+Z restores
+        every row. The matched cascade is intentionally *not* restored
+        on undo: re-added rows get fresh ids, so the prior matched
+        solutions (indexing the old fitted ordering) would be stale —
+        re-run Matching to regenerate.
+        """
+        if self.session is None or self._pipe_thread is not None:
+            return
+        if not sels or not entry:
+            return
+        kind = sels[0].kind
+        if kind not in ("detected", "fitted"):
+            return
+        frame = int(self.viewer.current_frame)
+        on_frame = [
+            s for s in sels if s.kind == kind and int(s.frame) == frame
+        ]
+        if not on_frame:
+            return
+        ids = [int(s.peak_id) for s in on_frame]
+        n = len(ids)
         kind_human = "detected" if kind == "detected" else "fitted"
-        siblings_msg = (
-            "The fitted row (and any matched solutions on this frame) "
-            "will stay intact."
-            if kind == "detected"
-            else "The detected row will stay intact; matched solutions "
-            "on this frame will be cleared (their peak indices into "
-            "fitted_peaks would otherwise go stale)."
+        if kind == "detected":
+            siblings_msg = (
+                "Fitted and matched rows stay intact."
+            )
+        else:
+            siblings_msg = (
+                "Detected rows stay intact; matched solutions on this "
+                "frame will be cleared (their indices into fitted_peaks "
+                "would otherwise go stale — re-run Matching to regenerate)."
+            )
+        noun = f"{kind_human} peak" + ("s" if n > 1 else "")
+        target = (
+            f"id={ids[0]} on frame {frame}" if n == 1
+            else f"{n} {kind_human} peaks on frame {frame}"
         )
         reply = QMessageBox.question(
             self,
-            f"Delete {kind_human} peak",
-            (
-                f"Delete {kind_human} peak id={sel.peak_id} on frame "
-                f"{sel.frame}?\n\n{siblings_msg} This cannot be undone."
-            ),
+            f"Delete {kind_human} peak" + ("s" if n > 1 else ""),
+            f"Delete {target}?\n\n{siblings_msg} This can be undone "
+            "with Ctrl+Z.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
+
+        removed = 0
+        snapshot: list[dict] = []
         with self._detached_silx_tree():
             try:
-                removed = file_model.delete_peak_row(
-                    self.session.temp_path, entry,
-                    frame=int(sel.frame),
-                    kind=kind,
-                    peak_id=int(sel.peak_id),
+                # Snapshot full rows (incl. theta/A/B/C for fitted) so
+                # undo can re-create them. Read inside the detached
+                # scope so no handle contends with silx.
+                snapshot = file_model.read_peak_rows(
+                    self.session.temp_path, entry, frame, kind, ids,
                 )
+                for peak_id in ids:
+                    removed += file_model.delete_peak_row(
+                        self.session.temp_path, entry,
+                        frame=frame, kind=kind, peak_id=peak_id,
+                    )
                 if kind == "fitted" and removed > 0:
                     file_model.clear_peaks(
                         self.session.temp_path, entry,
-                        kind="matched", frame=int(sel.frame),
+                        kind="matched", frame=frame,
                     )
             except Exception as exc:
                 QMessageBox.critical(
@@ -6323,22 +6388,133 @@ class MainWindow(QMainWindow):
                 return
         if removed == 0:
             self.pipeline_panel.append_log(
-                f"Delete {kind_human}: no peak with id={sel.peak_id} on "
-                f"{entry}/frame{int(sel.frame):05d} (already gone?)"
+                f"Delete {kind_human}: no matching rows on "
+                f"{entry}/frame{frame:05d} (already gone?)"
             )
             return
+
         self.session.mark_dirty()
         self._update_title()
-        # Bulk row delete invalidates pending FileGeomActions whose ids
-        # may have referenced the dropped peak.
+        # Wipe stale geom-edit history (its ids may reference deleted
+        # rows), then push our own grouped action so one Ctrl+Z undoes
+        # the whole delete.
         self.viewer.clear_history()
         self.viewer.clear_selection()
         self._load_entry_into_viewer(entry, preserve_view=True)
-        self.pipeline_panel.append_log(
-            f"Deleted {kind_human} peak id={sel.peak_id} on "
-            f"{entry}/frame{int(sel.frame):05d}"
-            + (" (matched_* on this frame cleared)" if kind == "fitted" else "")
+        self._push_delete_undo(
+            entry=entry, frame=frame, kind=kind, snapshot=snapshot,
+            cascade_matched=(kind == "fitted"),
         )
+        msg = (
+            f"Deleted {removed} {kind_human} peak(s) on "
+            f"{entry}/frame{frame:05d}"
+            + (" (matched_* cleared)" if kind == "fitted" else "")
+        )
+        self.statusBar().showMessage(msg, 4000)
+        self.pipeline_panel.append_log(msg)
+
+    def _readd_peak_row(self, entry: str, frame: int, kind: str, d: dict) -> int:
+        """Re-create one detected/fitted row from a ``read_peak_rows``
+        snapshot dict. Returns the new (freshly-assigned) id."""
+        if kind == "detected":
+            return file_model.add_detected_peak_row(
+                self.session.temp_path, entry, int(frame),
+                radius=d["radius"], angle=d["angle"],
+                radius_width=d["radius_width"], angle_width=d["angle_width"],
+                score=d.get("score", 0.0), is_ring=d.get("is_ring", False),
+            )
+        return file_model.add_fitted_peak_row(
+            self.session.temp_path, entry, int(frame),
+            angle=d["angle"], angle_width=d["angle_width"],
+            radius=d["radius"], radius_width=d["radius_width"],
+            amplitude=d.get("amplitude", 0.0), is_ring=d.get("is_ring", False),
+            theta=d.get("theta", 0.0), score=d.get("score", 0.0),
+            A=d.get("A", 0.0), B=d.get("B", 0.0), C=d.get("C", 0.0),
+            is_cut_qz=d.get("is_cut_qz", False),
+            is_cut_qxy=d.get("is_cut_qxy", False),
+            visibility=d.get("visibility", 0),
+        )
+
+    def _push_delete_undo(
+        self, *, entry: str, frame: int, kind: str,
+        snapshot: list[dict], cascade_matched: bool,
+    ) -> None:
+        """Undo / redo for a (single or bulk) detected/fitted delete.
+
+        The delete already happened, so ``undo`` re-adds the rows (fresh
+        ids) and ``redo`` deletes them again. ``state["ids"]`` rotates:
+        populated by ``undo`` with the re-assigned ids so a following
+        ``redo`` deletes the right rows. For fitted, ``redo`` re-clears
+        ``matched_*`` (undo never restores matched — see
+        ``_delete_peaks_scoped``).
+        """
+        snap = [dict(d) for d in snapshot]
+        state: dict[str, list[int]] = {"ids": []}
+
+        def _undo() -> None:
+            if self.session is None or self._pipe_thread is not None:
+                return
+            if self.entry_combo.currentText() != entry:
+                self.entry_combo.setCurrentText(entry)
+            if int(self.viewer.current_frame) != int(frame):
+                self.viewer.set_frame(int(frame))
+            new_ids: list[int] = []
+            with self._detached_silx_tree():
+                try:
+                    for d in snap:
+                        new_ids.append(
+                            int(self._readd_peak_row(entry, frame, kind, d))
+                        )
+                except Exception as exc:
+                    QMessageBox.critical(self, "Undo delete", str(exc))
+                    return
+            state["ids"] = new_ids
+            self.session.mark_dirty()
+            self._update_title()
+            self._load_entry_into_viewer(entry, preserve_view=True)
+            self._add_detected_to_selection(
+                entry, int(frame), new_ids, kind=kind,
+            )
+            self.pipeline_panel.append_log(
+                f"Undo delete: restored {len(new_ids)} {kind} "
+                f"peak(s) on {entry}/frame{int(frame):05d}"
+            )
+
+        def _redo() -> None:
+            if self.session is None or self._pipe_thread is not None:
+                return
+            if self.entry_combo.currentText() != entry:
+                self.entry_combo.setCurrentText(entry)
+            if int(self.viewer.current_frame) != int(frame):
+                self.viewer.set_frame(int(frame))
+            with self._detached_silx_tree():
+                try:
+                    for peak_id in state["ids"]:
+                        file_model.delete_peak_row(
+                            self.session.temp_path, entry,
+                            frame=int(frame), kind=kind,
+                            peak_id=int(peak_id),
+                        )
+                    if cascade_matched and state["ids"]:
+                        file_model.clear_peaks(
+                            self.session.temp_path, entry,
+                            kind="matched", frame=int(frame),
+                        )
+                except Exception as exc:
+                    QMessageBox.critical(self, "Redo delete", str(exc))
+                    return
+            self.session.mark_dirty()
+            self._update_title()
+            self._load_entry_into_viewer(entry, preserve_view=True)
+            self._drop_detected_from_selection(
+                int(frame), state["ids"], kind=kind,
+            )
+            self.pipeline_panel.append_log(
+                f"Redo delete: removed {len(state['ids'])} {kind} "
+                f"peak(s) on {entry}/frame{int(frame):05d}"
+            )
+
+        self.viewer._push_undo(_CallbackAction(_undo, _redo))
 
     def _on_peak_row_write_requested(
         self, frame: int, kind: str, peak_id: int, polar: dict

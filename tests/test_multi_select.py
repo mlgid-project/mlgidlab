@@ -1,12 +1,15 @@
 """Multi-selection on the image viewer (Ctrl+click toggle, Ctrl+A).
 
-Five scenarios:
+Multi-select covers detected AND fitted peaks (single-kind only):
 
 * Ctrl+click toggles a detected peak in / out of the extras list.
-* Ctrl+click on a non-detected peak falls back to single-select
-  replacement (existing UX preserved for fitted / manual / matched).
-* Ctrl+A on a frame with N detected peaks selects them all (primary
-  + N-1 extras).
+* Ctrl+click hit-test is kind-aware: it prefers the current
+  multi-selection's kind (so detected stays reachable under a fitted
+  overlay), and with no multi-kind primary fitted wins over detected.
+* A lone fitted peak is reachable by Ctrl+click (no detected under it).
+* Ctrl+click on a manual / matched peak (or a cross-kind peak) falls
+  back to single-select replacement.
+* Ctrl+A selects every peak of the current kind on the frame.
 * The selection-highlight overlay renders one row per selected peak.
 * ``selectionsChanged`` fires with the full list every mutation.
 """
@@ -65,41 +68,15 @@ def test_ctrl_click_toggles_detected(main_window, synthetic_nexus_with_peaks):
     assert v.selected_peaks() == []
 
 
-def test_ctrl_click_hit_tests_detected_only(
-    main_window, synthetic_nexus_with_peaks,
-):
-    """``_on_select_at`` with Ctrl modifier skips the manual / fitted
-    / matched overlays — Ctrl+click means 'multi-select detected',
-    so a click whose position is covered by a fitted box must still
-    pick the detected peak underneath.
-
-    Regression: before the fix, the default priority ``manual >
-    fitted > detected > matched`` won and Ctrl+click ended up
-    selecting the fitted peak on top, falling back to single-select
-    replacement.
-    """
-    from PySide6.QtCore import QPointF, Qt
-    _open(main_window, synthetic_nexus_with_peaks)
-    v = main_window.viewer
-    # The fixture's fitted peak #1 sits at (radius=2.5, angle=60.0)
-    # with width 0.3 / 4.0 — so position (2.5, 60.0) is inside both
-    # the fitted box AND a detected box (the fixture's detected
-    # peaks are at angle 80 and radius 3.0 with width 0.2 / 5.0,
-    # which covers (3.0, 80) — we need overlap. Build a detected
-    # row at the same position to exercise the priority overlap.)
-    tables = v._frame_peaks.get(0) or {}
-    fit = tables["fitted"]
-    # Find a position that hits BOTH a fitted and a detected row.
-    # In the fixture detected row 1 is at (r=2.0, a=45.0, dr=0.2, da=5.0)
-    # and fitted row 0 is at (r=1.5, a=20.0, dr=0.3, da=4.0). They
-    # don't overlap. Inject a detected row at the fitted row 0
-    # centre so both overlays hit at that point.
-    from mlgidlab.image_viewer import ManualPeak
+def _inject_detected_at_fitted0(v):
+    """Add a detected row at fitted row 0's centre so the two overlays
+    overlap at one point. Returns (radius, angle) of that point."""
     import numpy as np
     from mlgidlab.file_model import PeakTable
+    tables = v._frame_peaks.get(0) or {}
+    fit = tables["fitted"]
     det = tables["detected"]
     fr, fa = float(fit.radius[0]), float(fit.angle[0])
-    # Add a synthetic detected row at the fitted centre.
     new_det = PeakTable(
         q_xy=np.append(det.q_xy, det.q_xy[0]),
         q_z=np.append(det.q_z, det.q_z[0]),
@@ -113,12 +90,65 @@ def test_ctrl_click_hit_tests_detected_only(
         amplitude=np.append(det.amplitude, 10.0),
     )
     v._frame_peaks[0] = {**tables, "detected": new_det}
+    return fr, fa
 
-    # Now Ctrl+click at the overlap point — the detected row wins.
+
+def test_ctrl_click_prefers_fitted_when_no_primary(
+    main_window, synthetic_nexus_with_peaks,
+):
+    """With no multi-kind primary, Ctrl+click at an overlapping
+    detected+fitted point picks fitted (same priority as a bare
+    click). Fitted is the post-Run-Fitting refinement, so it's the
+    sensible default."""
+    from PySide6.QtCore import QPointF, Qt
+    _open(main_window, synthetic_nexus_with_peaks)
+    v = main_window.viewer
+    fr, fa = _inject_detected_at_fitted0(v)
+
     v._on_select_at(QPointF(fr, fa), Qt.KeyboardModifier.ControlModifier)
     sels = v.selected_peaks()
     assert len(sels) == 1
-    assert sels[0].kind == "detected"
+    assert sels[0].kind == "fitted"
+
+
+def test_ctrl_click_prefers_current_kind(
+    main_window, synthetic_nexus_with_peaks,
+):
+    """With a detected peak already the primary, Ctrl+click at an
+    overlapping detected+fitted point extends the *detected*
+    selection — the gesture keeps building one kind even where a
+    fitted box covers the detected peak."""
+    from PySide6.QtCore import QPointF, Qt
+    _open(main_window, synthetic_nexus_with_peaks)
+    v = main_window.viewer
+    fr, fa = _inject_detected_at_fitted0(v)
+    # Make a detected peak the primary first.
+    v._set_selected(_detected_sel(main_window, 0, 0))
+
+    v._on_select_at(QPointF(fr, fa), Qt.KeyboardModifier.ControlModifier)
+    sels = v.selected_peaks()
+    assert len(sels) == 2
+    assert all(s.kind == "detected" for s in sels)
+
+
+def test_ctrl_click_selects_lone_fitted(
+    main_window, synthetic_nexus_with_peaks,
+):
+    """Ctrl+click on a fitted peak with no detected underneath selects
+    it (the reported bug: Ctrl+click on fitted did nothing because the
+    hit-test was detected-only)."""
+    from PySide6.QtCore import QPointF, Qt
+    _open(main_window, synthetic_nexus_with_peaks)
+    v = main_window.viewer
+    fit = (v._frame_peaks.get(0) or {})["fitted"]
+    # Fitted row 0 (r=1.5, a=20.0) has no detected peak at its centre.
+    fr, fa = float(fit.radius[0]), float(fit.angle[0])
+
+    v._on_select_at(QPointF(fr, fa), Qt.KeyboardModifier.ControlModifier)
+    sels = v.selected_peaks()
+    assert len(sels) == 1
+    assert sels[0].kind == "fitted"
+    assert sels[0].peak_id == int(fit.ids[0])
 
 
 def test_ctrl_click_on_empty_space_is_noop(
@@ -181,6 +211,19 @@ def test_ctrl_a_selects_all_detected_on_frame(
     sels = v.selected_peaks()
     assert len(sels) == 3
     assert all(s.kind == "detected" for s in sels)
+
+
+def test_ctrl_a_selects_all_fitted_when_fitted_primary(
+    main_window, synthetic_nexus_with_peaks,
+):
+    """Ctrl+A keys off the current kind: with a fitted peak as primary
+    it grabs all fitted rows (the fixture has 2 on frame 0)."""
+    _open(main_window, synthetic_nexus_with_peaks)
+    v = main_window.viewer
+    v._select_all_of_kind_on_frame("fitted")
+    sels = v.selected_peaks()
+    assert len(sels) == 2
+    assert all(s.kind == "fitted" for s in sels)
 
 
 def test_multi_selection_renders_n_highlight_rows(

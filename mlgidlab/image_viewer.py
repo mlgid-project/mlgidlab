@@ -825,8 +825,12 @@ class GIWAXSImageViewer(QWidget):
     # polar_kwargs). MainWindow drives the actual h5py mutation since it
     # owns the silx tree handle that needs releasing first.
     peakRowWriteRequested = Signal(int, str, int, dict)
-    # Emitted when the user presses Delete on a non-manual peak.
+    # Emitted when the user presses Delete on a single non-manual peak.
     deletePeakRequested = Signal(object)      # SelectedPeak
+    # Emitted when Delete is pressed with >= 2 detected peaks selected:
+    # carries the full multi-selection so the host can bulk-delete them
+    # in one grouped, undoable action.
+    deletePeaksRequested = Signal(list)       # list[SelectedPeak]
     # Emitted whenever the *current* frame's matched-structure list might be
     # different from what the UI showed last (frame change, fresh load,
     # re-render after pipeline run). Args: (frame, list[MatchedStructure]).
@@ -2709,14 +2713,15 @@ class GIWAXSImageViewer(QWidget):
         # * Bare click (no modifiers): walks the full priority list
         #   ``manual > fitted > detected > matched`` and routes the
         #   first hit through ``_set_selected``.
-        # * Ctrl+click: hit-tests *only* the detected overlay and
-        #   routes through ``_toggle_selected``. Skipping manual /
-        #   fitted / matched is intentional — Ctrl+click means
-        #   "multi-select detected", and the user otherwise can't
-        #   reach a detected peak that has a fitted box drawn on
-        #   top of it (which happens after every Run Fitting). If
-        #   no detected peak is under the cursor, Ctrl+click is a
-        #   no-op (the existing single selection stays put).
+        # * Ctrl+click: multi-select. Hit-tests the detected and fitted
+        #   overlays (only — manual / matched stay single-select) and
+        #   routes through ``_toggle_selected``. The search prefers the
+        #   *current* multi-selection's kind so the user keeps extending
+        #   one kind: e.g. a detected multi-select still reaches detected
+        #   peaks that have a fitted box drawn on top (post-Run Fitting),
+        #   and a fitted multi-select reaches fitted. With no multi-kind
+        #   primary yet, fitted wins over detected (same priority as a
+        #   bare click). No hit under the cursor → no-op.
         # * Ctrl+Alt never reaches here (press branch consumed it
         #   as a draw gesture).
         if self._mode not in (MODE_POLAR, MODE_CARTESIAN) or self._busy:
@@ -2739,32 +2744,44 @@ class GIWAXSImageViewer(QWidget):
                 else _polar_table_row_contains(tbl, i, x, y)
             )
 
-        # Ctrl+click is restricted to the detected overlay so the
-        # gesture does what the user expects even when fitted /
-        # matched overlays cover the detected peak.
+        # Ctrl+click multi-selects detected OR fitted peaks. Search the
+        # current multi-selection's kind first (so the user keeps
+        # building one kind even where detected/fitted overlap), then
+        # the other; with no multi-kind primary, fitted wins over
+        # detected (bare-click priority). Manual / matched are never
+        # multi-selected.
         if ctrl_only:
-            if not self._visibility.get("detected", True):
-                return
-            table = peaks_for_frame.get("detected")
-            if table is None or len(table) == 0:
-                return
-            for i in reversed(range(len(table))):
-                if hit_table(table, i):
-                    self._toggle_selected(SelectedPeak(
-                        kind="detected",
-                        frame=frame,
-                        peak_id=int(table.ids[i]),
-                        radius=float(table.radius[i]),
-                        angle=float(table.angle[i]),
-                        radius_width=float(table.radius_width[i]),
-                        angle_width=float(table.angle_width[i]),
-                        is_ring=bool(table.is_ring[i]),
-                        score=float(table.score[i]),
-                        amplitude=float(table.amplitude[i]),
-                    ))
-                    return
-            # Ctrl+click on empty space (or only-non-detected hits) =
-            # no-op; the existing multi-selection stays put.
+            primary = self._selected
+            if primary is not None and primary.kind in ("detected", "fitted"):
+                order = (
+                    ["detected", "fitted"] if primary.kind == "detected"
+                    else ["fitted", "detected"]
+                )
+            else:
+                order = ["fitted", "detected"]
+            for kind in order:
+                if not self._visibility.get(kind, True):
+                    continue
+                table = peaks_for_frame.get(kind)
+                if table is None or len(table) == 0:
+                    continue
+                for i in reversed(range(len(table))):
+                    if hit_table(table, i):
+                        self._toggle_selected(SelectedPeak(
+                            kind=kind,
+                            frame=frame,
+                            peak_id=int(table.ids[i]),
+                            radius=float(table.radius[i]),
+                            angle=float(table.angle[i]),
+                            radius_width=float(table.radius_width[i]),
+                            angle_width=float(table.angle_width[i]),
+                            is_ring=bool(table.is_ring[i]),
+                            score=float(table.score[i]),
+                            amplitude=float(table.amplitude[i]),
+                        ))
+                        return
+            # Ctrl+click on empty space (or only manual/matched under
+            # the cursor) = no-op; the existing selection stays put.
             return
 
         # Priority order: manual > fitted > detected > matched. Matched is
@@ -2916,10 +2933,13 @@ class GIWAXSImageViewer(QWidget):
     def _toggle_selected(self, sel: SelectedPeak) -> None:
         """Add / remove ``sel`` to/from the multi-selection (Ctrl+click).
 
-        Detected-only in this iteration: if ``sel.kind`` isn't
-        ``"detected"`` or the current primary is a non-detected kind,
-        fall back to ``_set_selected`` so the existing single-select
-        UX is preserved for manual / fitted / matched peaks.
+        Multi-select covers ``detected`` and ``fitted`` peaks, but only
+        within a single kind: a multi-selection is all-detected or
+        all-fitted (the bulk ops downstream — delete cascade, batch
+        fit — are kind-specific). If ``sel`` is manual / matched, or it
+        is a different kind than the current primary, fall back to
+        ``_set_selected`` (single-select replace), which starts a fresh
+        selection of the new kind.
 
         Toggle semantics:
           * No primary yet → ``sel`` becomes the primary.
@@ -2928,10 +2948,10 @@ class GIWAXSImageViewer(QWidget):
           * ``sel`` matches an extra → drop from extras.
           * Otherwise → append to extras.
         """
-        if sel.kind != "detected":
+        if sel.kind not in ("detected", "fitted"):
             self._set_selected(sel)
             return
-        if self._selected is not None and self._selected.kind != "detected":
+        if self._selected is not None and self._selected.kind != sel.kind:
             self._set_selected(sel)
             return
         if self._selected is None:
@@ -2971,6 +2991,18 @@ class GIWAXSImageViewer(QWidget):
             and self._selected is not None
             and not self._busy
         ):
+            sels = self.selected_peaks()
+            kinds = {s.kind for s in sels}
+            if (
+                len(sels) >= 2
+                and len(kinds) == 1
+                and next(iter(kinds)) in ("detected", "fitted")
+            ):
+                # All-detected OR all-fitted multi-selection → bulk
+                # delete in one grouped, undoable action on the host.
+                self.deletePeaksRequested.emit(list(sels))
+                ev.accept()
+                return
             sel = self._selected
             if sel.kind == "manual" and sel.manual_ref is not None:
                 self.remove_manual_peak(self.current_frame, sel.manual_ref)
@@ -2994,36 +3026,46 @@ class GIWAXSImageViewer(QWidget):
             self.remove_manual_peak(self.current_frame, self._selected.manual_ref)
             ev.accept()
             return
-        # Ctrl+A: select every detected peak on the current frame as
-        # the multi-selection. First detected row becomes primary; the
-        # rest become extras. Cheap pre-flight if the frame has no
-        # detected_peaks dataset.
+        # Ctrl+A: select every peak of the *current kind* on the current
+        # frame. If a fitted peak is the primary, select all fitted;
+        # otherwise (detected primary, or nothing selected) select all
+        # detected. First row becomes primary; the rest become extras.
         if (
             ev.key() == Qt.Key.Key_A
             and ev.modifiers() == Qt.KeyboardModifier.ControlModifier
             and not self._busy
         ):
-            self._select_all_detected_on_frame()
+            kind = (
+                self._selected.kind
+                if self._selected is not None
+                and self._selected.kind in ("detected", "fitted")
+                else "detected"
+            )
+            self._select_all_of_kind_on_frame(kind)
             ev.accept()
             return
         super().keyPressEvent(ev)
 
     def _select_all_detected_on_frame(self) -> None:
-        """Replace the selection with every detected peak on the current frame.
+        """Back-compat shim: select all detected peaks on the frame."""
+        self._select_all_of_kind_on_frame("detected")
 
-        No-op if the frame has no detected table or zero rows. Emits
-        both ``selectionChanged`` (primary) and ``selectionsChanged``
-        (full list) once.
+    def _select_all_of_kind_on_frame(self, kind: str) -> None:
+        """Replace the selection with every ``kind`` peak on the current frame.
+
+        ``kind`` is ``"detected"`` or ``"fitted"``. No-op if the frame
+        has no such table or zero rows. Emits both ``selectionChanged``
+        (primary) and ``selectionsChanged`` (full list) once.
         """
         frame = self.current_frame
         peaks_for_frame = self._frame_peaks.get(frame) or {}
-        table = peaks_for_frame.get("detected")
+        table = peaks_for_frame.get(kind)
         if table is None or len(table) == 0:
             return
 
         def _sel(i: int) -> SelectedPeak:
             return SelectedPeak(
-                kind="detected",
+                kind=kind,
                 frame=frame,
                 peak_id=int(table.ids[i]),
                 radius=float(table.radius[i]),
