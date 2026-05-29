@@ -64,7 +64,7 @@ install, a first-file walkthrough, and shortcuts are in
   shortcuts, troubleshooting.
 - **[Backend compatibility](docs/backend_compatibility.md)** — pipeline
   version policy + how to verify a backend bump.
-- **[Changelog](CHANGELOG.md)** — release highlights + known limitations.
+- **[Changelog](CHANGELOG.md)** — release highlights.
 
 (For Contributor-facing architecture / module reference docs please contact me.)
 
