@@ -106,6 +106,8 @@ def test_copy_then_paste_round_trip_appends_row(
     assert float(after_table.angle[new_idx]) == pytest.approx(sel.angle)
     assert float(after_table.radius_width[new_idx]) == pytest.approx(sel.radius_width)
     assert float(after_table.angle_width[new_idx]) == pytest.approx(sel.angle_width)
+    # Copy preserves the source peak's confidence score verbatim.
+    assert float(after_table.score[new_idx]) == pytest.approx(sel.score)
 
 
 def test_paste_lands_on_current_frame_not_source_frame(

@@ -24,6 +24,10 @@ class ClipboardItem:
     and the new peak gets a fresh id from ``add_detected_peak_row``.
     Kind is implicit (always detected in this iteration; expand the
     dataclass if other kinds become copyable).
+
+    ``score`` carries the source peak's mlgidDETECT confidence so a paste
+    reproduces it verbatim (copy must not change the score). Defaulted so
+    older call sites / tests that omit it still construct.
     """
 
     radius: float
@@ -33,6 +37,7 @@ class ClipboardItem:
     is_ring: bool
     source_frame: int
     source_peak_id: int
+    score: float = 0.0
 
 
 # Module-level state — at most one snapshot at a time.

@@ -328,6 +328,75 @@ def test_fitted_delete_undo_preserves_fit_params(
     assert full["amplitude"] == pytest.approx(77.0)
 
 
+# --- multi-level undo / redo across consecutive ops -----------------
+
+def test_consecutive_deletes_undo_redo_all_levels(
+    main_window, synthetic_nexus_with_peaks, monkeypatch,
+):
+    """Two separate single deletes must both be undoable AND redoable.
+
+    Regression: each delete used to ``clear_history()`` before pushing
+    its own action, so the undo stack never held more than the latest
+    op -- a second Ctrl+Z was a no-op and redo only ever replayed the
+    most recent delete. Now history accumulates: undo twice restores
+    both peaks, redo twice removes both again.
+    """
+    _open(main_window, synthetic_nexus_with_peaks)
+    path = main_window.session.temp_path
+    v = main_window.viewer
+    _yes(monkeypatch)
+    assert _n_detected(path, "entry_0000", 0) == 3
+
+    # Delete the first detected peak, then (after the reload) the next.
+    # _select_detected sets the viewer's primary selection as a side effect.
+    sel1 = _select_detected(main_window, 0, 1)[0]
+    main_window._on_delete_peak_requested(sel1)
+    assert _n_detected(path, "entry_0000", 0) == 2
+    sel2 = _select_detected(main_window, 0, 1)[0]
+    main_window._on_delete_peak_requested(sel2)
+    assert _n_detected(path, "entry_0000", 0) == 1
+    assert len(v._undo_stack) == 2  # both ops on the stack, not just one
+
+    v.undo_last_action()
+    assert _n_detected(path, "entry_0000", 0) == 2
+    v.undo_last_action()
+    assert _n_detected(path, "entry_0000", 0) == 3  # multi-level undo
+
+    v.redo_last_action()
+    assert _n_detected(path, "entry_0000", 0) == 2
+    v.redo_last_action()
+    assert _n_detected(path, "entry_0000", 0) == 1  # multi-level redo
+
+
+def test_paste_then_delete_both_undoable(
+    main_window, synthetic_nexus_with_peaks, monkeypatch,
+):
+    """A paste followed by a bulk delete: undoing the delete then the
+    paste walks back through both, proving append-only paste no longer
+    wipes the paste's own (or any prior) undo entry."""
+    _open(main_window, synthetic_nexus_with_peaks)
+    path = main_window.session.temp_path
+    v = main_window.viewer
+    _yes(monkeypatch)
+
+    # Copy the 3 detected, paste them back onto the same frame -> 6.
+    sels = _select_detected(main_window, 0, 3)
+    main_window._on_copy_peaks()
+    main_window._on_paste_peaks()
+    assert _n_detected(path, "entry_0000", 0) == 6
+
+    # Bulk-delete 3 of them -> 3, with the paste still on the stack.
+    dels = _select_detected(main_window, 0, 3)
+    main_window._on_delete_peaks_requested(dels)
+    assert _n_detected(path, "entry_0000", 0) == 3
+    assert len(v._undo_stack) == 2
+
+    v.undo_last_action()  # undo delete -> 6
+    assert _n_detected(path, "entry_0000", 0) == 6
+    v.undo_last_action()  # undo paste -> 3
+    assert _n_detected(path, "entry_0000", 0) == 3
+
+
 def test_read_peak_rows_skips_missing_ids(synthetic_nexus_with_peaks):
     """read_peak_rows returns only the ids that exist, in request order."""
     rows = file_model.read_peak_rows(

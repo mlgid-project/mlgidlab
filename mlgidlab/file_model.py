@@ -1072,6 +1072,11 @@ def add_detected_peak_row(
     2D-shape fields (A/B/C/theta) and ``amplitude`` default to zero
     since a detected row carries no fit context.
 
+    Callers pass ``score`` explicitly: paste forwards the source peak's
+    confidence verbatim (copy must not change it); the undo re-add
+    forwards the snapshot's stored value. The ``0.0`` default is only a
+    fallback for callers that have no score to carry.
+
     Returns the new peak's ``id``.
     """
     return _add_peak_row(

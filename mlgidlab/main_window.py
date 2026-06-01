@@ -10,6 +10,7 @@ import numpy as np
 
 from PySide6.QtCore import (
     QCoreApplication,
+    QEvent,
     QMetaObject,
     QSettings,
     QSignalBlocker,
@@ -83,7 +84,6 @@ from mlgidlab.parameter_panel import ParameterPanel
 from mlgidlab.peaks_table_panel import PeaksTablePanel
 from mlgidlab.pipeline import (
     PipelineCommand,
-    add_peak_kwargs_for,
     is_mlgidbase_available,
 )
 from mlgidlab.pipeline_panel import PipelinePanel
@@ -671,6 +671,10 @@ class MainWindow(QMainWindow):
         # works even when the viewer has unconventional focus
         # handling.
         self._install_frame_shortcuts()
+        # Make undo/redo fire even when a third-party widget registers the
+        # same standard shortcuts (see ``eventFilter``). Installed on the
+        # application so it sees key events regardless of focus.
+        QApplication.instance().installEventFilter(self)
         # Status bar depends on the viewer + entry combo existing; build
         # after central + docks.
         self._build_status_bar()
@@ -1750,6 +1754,64 @@ class MainWindow(QMainWindow):
     def _action_redo(self) -> None:
         if hasattr(self, "viewer"):
             self.viewer.redo_last_action()
+
+    def eventFilter(self, obj, ev):  # type: ignore[override]
+        """Drive undo / redo from the keyboard even when the chord is an
+        "ambiguous shortcut".
+
+        The embedded pyFAI calibration dialog pulls in silx's
+        ``MaskToolsWidget`` and pyFAI's peak-picking task, each of which
+        binds Undo/Redo to the standard sequences (``Ctrl+Z`` / ``Ctrl+Y``,
+        and on some silx/pyFAI versions the full standard Redo set, which
+        includes ``Ctrl+Shift+Z``). Those widgets outlive the dialog
+        (pyFAI's ``CalibrationContext`` is a singleton), so afterwards Qt
+        finds two actions claiming the redo chord, logs "Ambiguous
+        shortcut overload", and fires neither — the Edit-menu item still
+        works, but the keyboard doesn't.
+
+        We intercept the chord at the ``ShortcutOverride`` stage, before
+        Qt's shortcut map runs, and run our own handler. Guarded so the
+        calibration dialog's own mask undo/redo and text-field undo are
+        left alone: only act while this window holds focus and the focus
+        is not a text-editing widget.
+        """
+        # Once closed (or mid-teardown), do nothing — the filter may still
+        # be installed on the app and our child widgets may be gone. Pytest
+        # creates many windows per process; a stale filter touching a
+        # destroyed ``self`` would otherwise raise during shutdown.
+        if getattr(self, "_closed", False):
+            return super().eventFilter(obj, ev)
+        et = ev.type()
+        if et not in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress):
+            return super().eventFilter(obj, ev)
+        fw = QApplication.focusWidget()
+        if fw is not None:
+            if fw.window() is not self:
+                return super().eventFilter(obj, ev)  # a child dialog owns the key
+            if isinstance(fw, (QLineEdit, QSpinBox, QDoubleSpinBox, QPlainTextEdit)):
+                return super().eventFilter(obj, ev)  # native text undo/redo
+        elif not self.isActiveWindow():
+            return super().eventFilter(obj, ev)
+        mods = ev.modifiers()
+        if not (mods & Qt.KeyboardModifier.ControlModifier) or (
+            mods & Qt.KeyboardModifier.AltModifier
+        ):
+            return super().eventFilter(obj, ev)
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+        key = ev.key()
+        is_redo = (key == Qt.Key.Key_Z and shift) or (
+            key == Qt.Key.Key_Y and not shift
+        )
+        is_undo = key == Qt.Key.Key_Z and not shift
+        if not (is_redo or is_undo):
+            return super().eventFilter(obj, ev)
+        if et == QEvent.Type.ShortcutOverride:
+            # Claim the key so Qt skips (ambiguous) shortcut resolution and
+            # re-delivers it as a plain KeyPress, handled on the next pass.
+            ev.accept()
+            return True
+        (self._action_redo if is_redo else self._action_undo)()
+        return True
 
     def _action_find_peak(self) -> None:
         """Modal: pick Kind + ID, select the peak in the viewer.
@@ -4915,6 +4977,19 @@ class MainWindow(QMainWindow):
             self._update_title()
 
     def _on_add_to_detected(self) -> None:
+        """Commit the active manual box to detected_peaks at the chosen
+        confidence score.
+
+        Writes synchronously via ``file_model.add_detected_peak_row`` —
+        the same path copy/paste uses — so the score picked in the
+        Parameter panel's Score-row dropdown (High = 1.0 / Medium = 0.5 /
+        Low = 0.1) is stored verbatim. ``mlgidBASE.add_peak`` takes no
+        score argument, so it can't carry the choice; a hand-drawn box
+        has no model provenance anyway, so the user's pick is the
+        authority. The manual box is left in place so it can also be sent
+        to fitted_peaks or tweaked further. One grouped Ctrl+Z removes the
+        added row.
+        """
         if self.session is None or self._pipe_thread is not None:
             return
         sel = self.viewer.selected_peak
@@ -4922,18 +4997,108 @@ class MainWindow(QMainWindow):
         if sel is None or sel.kind != "manual" or sel.manual_ref is None or not entry:
             return
         manual_peak = sel.manual_ref
-        frame = self.viewer.current_frame
-        kwargs = {
-            "entry": entry,
-            "frame_num": frame,
-            **add_peak_kwargs_for(manual_peak),
+        frame = int(self.viewer.current_frame)
+        score = float(self.parameter_panel.confidence_score())
+        geom = {
+            "radius": float(manual_peak.radius),
+            "angle": float(manual_peak.angle),
+            "radius_width": float(manual_peak.radius_width),
+            "angle_width": float(manual_peak.angle_width),
+            "is_ring": bool(manual_peak.is_ring),
         }
-        # Manual peak is left in place after the run so it can also be
-        # committed to fitted_peaks or further tweaked. See the comment in
-        # _on_pipeline_finished for the rationale.
-        if self.session is None:
-            return
-        self._on_pipeline_run(self.session.temp_path, PipelineCommand("add_peak", kwargs))
+        with self._detached_silx_tree():
+            try:
+                new_id = int(file_model.add_detected_peak_row(
+                    self.session.temp_path, entry, frame,
+                    score=score, **geom,
+                ))
+            except KeyError as exc:
+                QMessageBox.warning(self, "Add to detected", str(exc))
+                return
+            except Exception as exc:
+                QMessageBox.critical(self, "Add to detected", str(exc))
+                return
+        self.session.mark_dirty()
+        self._update_title()
+        self._load_entry_into_viewer(entry, preserve_view=True)
+        self._add_detected_to_selection(entry, frame, [new_id])
+        self._push_add_detected_undo(
+            entry=entry, frame=frame, peak_id=new_id, score=score, geom=geom,
+        )
+        msg = (
+            f"Added detected peak (score {score:.2f}) on "
+            f"{entry}/frame{frame:05d}"
+        )
+        self.statusBar().showMessage(msg, 4000)
+        self.pipeline_panel.append_log(msg)
+
+    def _push_add_detected_undo(
+        self, *, entry: str, frame: int, peak_id: int,
+        score: float, geom: dict,
+    ) -> None:
+        """Undo / redo for one 'Add to detected' commit.
+
+        ``undo`` deletes the added row; ``redo`` re-adds it with the same
+        geometry + score (fresh id). ``state["id"]`` rotates with each
+        re-add so a follow-on undo deletes the right row — same pattern as
+        ``_push_paste_undo`` / ``_push_delete_undo``.
+        """
+        state = {"id": int(peak_id)}
+        g = dict(geom)
+
+        def _undo() -> None:
+            if self.session is None or self._pipe_thread is not None:
+                return
+            if self.entry_combo.currentText() != entry:
+                self.entry_combo.setCurrentText(entry)
+            if int(self.viewer.current_frame) != int(frame):
+                self.viewer.set_frame(int(frame))
+            with self._detached_silx_tree():
+                try:
+                    file_model.delete_peak_row(
+                        self.session.temp_path, entry,
+                        frame=int(frame), kind="detected",
+                        peak_id=int(state["id"]),
+                    )
+                except Exception as exc:
+                    QMessageBox.critical(self, "Undo add to detected", str(exc))
+                    return
+            self.session.mark_dirty()
+            self._update_title()
+            self._load_entry_into_viewer(entry, preserve_view=True)
+            self._drop_detected_from_selection(int(frame), [state["id"]])
+            self.pipeline_panel.append_log(
+                f"Undo add to detected: removed peak on "
+                f"{entry}/frame{int(frame):05d}"
+            )
+
+        def _redo() -> None:
+            if self.session is None or self._pipe_thread is not None:
+                return
+            if self.entry_combo.currentText() != entry:
+                self.entry_combo.setCurrentText(entry)
+            if int(self.viewer.current_frame) != int(frame):
+                self.viewer.set_frame(int(frame))
+            with self._detached_silx_tree():
+                try:
+                    new_id = int(file_model.add_detected_peak_row(
+                        self.session.temp_path, entry, int(frame),
+                        score=float(score), **g,
+                    ))
+                except Exception as exc:
+                    QMessageBox.critical(self, "Redo add to detected", str(exc))
+                    return
+            state["id"] = new_id
+            self.session.mark_dirty()
+            self._update_title()
+            self._load_entry_into_viewer(entry, preserve_view=True)
+            self._add_detected_to_selection(entry, int(frame), [new_id])
+            self.pipeline_panel.append_log(
+                f"Redo add to detected: re-added peak on "
+                f"{entry}/frame{int(frame):05d}"
+            )
+
+        self.viewer._push_undo(_CallbackAction(_undo, _redo))
 
     def _on_add_to_fitted(self) -> None:
         """Append a row to fitted_peaks for the active manual / detected box.
@@ -5005,9 +5170,8 @@ class MainWindow(QMainWindow):
 
         self.session.mark_dirty()
         self._update_title()
-        # File-level mutation invalidates pending FileGeomActions whose ids
-        # were ordered before the new row.
-        self.viewer.clear_history()
+        # Add-to-fitted only appends a fitted row (fresh id); no existing
+        # id is invalidated, so prior undo history is preserved.
         # Pull the fresh fitted_peaks (and matched, which references it) back
         # into the viewer — same entry, so preserve the user's zoom + frame.
         self._load_entry_into_viewer(entry, preserve_view=True)
@@ -5042,10 +5206,8 @@ class MainWindow(QMainWindow):
             self.viewer._set_selected(fitted_sel, preserve_manual=True)
         # Ctrl+Z support for Add-to-fitted: the file mutation is
         # reversible (delete the just-added row + restore the source
-        # selection). The action is pushed AFTER ``clear_history``
-        # above so the just-committed row is the only thing on the
-        # undo stack — matches the existing pattern where file-level
-        # commits start a fresh history.
+        # selection). Pushed onto the existing history so the commit
+        # stacks with any prior undoable edits.
         self._push_fitted_add_undo(
             entry=entry, frame=int(frame), new_id=int(new_id),
             add_kwargs={
@@ -5250,6 +5412,7 @@ class MainWindow(QMainWindow):
                 is_ring=bool(s.is_ring),
                 source_frame=int(s.frame),
                 source_peak_id=int(s.peak_id) if s.peak_id is not None else -1,
+                score=float(s.score) if s.score is not None else 0.0,
             )
             for s in sels
         ]
@@ -5292,6 +5455,7 @@ class MainWindow(QMainWindow):
                         radius_width=item.radius_width,
                         angle_width=item.angle_width,
                         is_ring=item.is_ring,
+                        score=item.score,
                     )
                     added_ids.append(int(new_id))
             except KeyError as exc:
@@ -5304,7 +5468,8 @@ class MainWindow(QMainWindow):
             return
         self.session.mark_dirty()
         self._update_title()
-        self.viewer.clear_history()
+        # Paste only appends rows (fresh ids); no existing id is
+        # invalidated, so prior undo history is preserved.
         self._load_entry_into_viewer(entry, preserve_view=True)
         # Add the pasted rows to the existing multi-selection so the
         # user immediately sees what landed without losing whatever
@@ -5497,6 +5662,7 @@ class MainWindow(QMainWindow):
                             radius_width=item.radius_width,
                             angle_width=item.angle_width,
                             is_ring=item.is_ring,
+                            score=item.score,
                         )
                         new_ids.append(int(new_id))
                 except Exception as exc:
@@ -5617,6 +5783,7 @@ class MainWindow(QMainWindow):
                             radius_width=item.radius_width,
                             angle_width=item.angle_width,
                             is_ring=item.is_ring,
+                            score=item.score,
                         )
                         frame_ids.append(int(new_id))
                     per_frame_ids[int(target_frame)] = frame_ids
@@ -5637,7 +5804,8 @@ class MainWindow(QMainWindow):
 
         self.session.mark_dirty()
         self._update_title()
-        self.viewer.clear_history()
+        # Append-only across the range (fresh ids per frame); prior undo
+        # history is preserved.
         self._load_entry_into_viewer(entry, preserve_view=True)
         # Only the current frame's pasted rows get added to the
         # selection (per confirmed UX). Off-frame selections would
@@ -5737,6 +5905,7 @@ class MainWindow(QMainWindow):
                                 radius_width=item.radius_width,
                                 angle_width=item.angle_width,
                                 is_ring=item.is_ring,
+                                score=item.score,
                             )
                             frame_ids.append(int(new_id))
                         new_per_frame_ids[int(f)] = frame_ids
@@ -5906,7 +6075,8 @@ class MainWindow(QMainWindow):
 
         self.session.mark_dirty()
         self._update_title()
-        self.viewer.clear_history()
+        # Batch fit only appends fitted rows (fresh ids); the detected
+        # ids it fit from are untouched, so prior undo history stays valid.
         self._load_entry_into_viewer(entry, preserve_view=True)
         # Multi-select the newly-added fitted rows. They may span
         # multiple frames if the original detected selection did
@@ -6395,10 +6565,10 @@ class MainWindow(QMainWindow):
 
         self.session.mark_dirty()
         self._update_title()
-        # Wipe stale geom-edit history (its ids may reference deleted
-        # rows), then push our own grouped action so one Ctrl+Z undoes
-        # the whole delete.
-        self.viewer.clear_history()
+        # Drop only the deleted ids' pending geom edits (they would key
+        # off rows that no longer exist); prior undoable ops stay on the
+        # stack so a run of deletes remains fully undoable / redoable.
+        self.viewer.prune_file_geom_history(frame, kind, ids)
         self.viewer.clear_selection()
         self._load_entry_into_viewer(entry, preserve_view=True)
         self._push_delete_undo(
@@ -7170,6 +7340,12 @@ class MainWindow(QMainWindow):
         # Past the point of no return — mark closed so a re-entrant or
         # pytest-qt second close() short-circuits above.
         self._closed = True
+        # Drop the app-wide undo/redo event filter so a closed window
+        # (which may linger under the test session's gc.disable) stops
+        # receiving key events.
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
         # Stop frame playback so the timer doesn't fire one last tick
         # against a torn-down viewer during shutdown.
         self._pause_playback()

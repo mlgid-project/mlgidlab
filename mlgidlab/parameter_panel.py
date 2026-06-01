@@ -13,12 +13,14 @@ from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
+    QComboBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QRadioButton,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -46,6 +48,12 @@ class ParameterPanel(QGroupBox):
     # (no enum import, no magic strings spread across files).
     FIT_MODE_1D = "scipy_1d"
     FIT_MODE_2D = "pygidfit_2d"
+
+    # Confidence presets offered when adding a fresh detected peak from a
+    # manual box: the "Score:" row becomes this dropdown while a manual
+    # peak is selected. (label, score) — the score is written verbatim to
+    # the new detected_peaks row. ``confidence_score()`` reads the choice.
+    CONFIDENCE_LEVELS = (("High", 1.0), ("Medium", 0.5), ("Low", 0.1))
 
     addToDetectedRequested = Signal()
     addToFittedRequested = Signal()
@@ -129,11 +137,24 @@ class ParameterPanel(QGroupBox):
         form.addRow("Δ radius:", self._radius_width_label)
         form.addRow("Angle:", self._angle_label)
         form.addRow("Δ angle:", self._angle_width_label)
-        # mlgidDETECT confidence score. Populated from the SelectedPeak
-        # for detected/fitted/matched rows; the row stays hidden for
-        # manual peaks (no model provenance, so showing 0.000 would
-        # be misleading).
-        form.addRow("Score:", self._score_label)
+        # mlgidDETECT confidence score. For detected/fitted/matched rows
+        # the row shows the read-only ``_score_label``. For a manual box
+        # (about to be committed via "Add to detected") the same row
+        # swaps to a confidence dropdown so the user picks the score the
+        # new detected peak will carry — a manual box has no model
+        # provenance, so the choice is theirs. A QStackedWidget holds
+        # both and shows exactly one (see set_peak).
+        self._confidence_combo = QComboBox()
+        for _lbl, _val in self.CONFIDENCE_LEVELS:
+            self._confidence_combo.addItem(_lbl, _val)
+        self._confidence_combo.setToolTip(
+            "Confidence saved with a detected peak added from this manual "
+            "box (High = 1.0, Medium = 0.5, Low = 0.1)."
+        )
+        self._score_stack = QStackedWidget()
+        self._score_stack.addWidget(self._score_label)       # page 0: readout
+        self._score_stack.addWidget(self._confidence_combo)  # page 1: picker
+        form.addRow("Score:", self._score_stack)
         self._row_score = form.rowCount() - 1
         self._detected_rows = list(range(
             self._row_detected_header, form.rowCount()
@@ -359,14 +380,20 @@ class ParameterPanel(QGroupBox):
             self._radius_width_label.setText(f"{peak.radius_width:.3f} Å⁻¹")
             self._angle_label.setText(f"{peak.angle:.2f}°")
             self._angle_width_label.setText(f"{peak.angle_width:.2f}°")
-        # Score is meaningful only for model-derived peaks. Manual
-        # peaks have no score; hide the row entirely so the user
-        # doesn't read "0.000" as an actual confidence. Detected /
-        # fitted / matched all carry score; the row is only visible
-        # when the Detected section is on (matched/fitted hide the
-        # whole Detected block).
-        has_score = peak.score is not None and peak.kind != "manual"
-        self._form.setRowVisible(self._row_score, show_detected and has_score)
+        # Score row. For a manual box it is the confidence dropdown (the
+        # score the new detected peak gets on "Add to detected"); for an
+        # existing detected peak it is the read-only model score. Hidden
+        # for fitted / matched (their Detected block is collapsed).
+        is_manual = peak.kind == "manual"
+        has_score = peak.score is not None and not is_manual
+        self._form.setRowVisible(
+            self._row_score, show_detected and (is_manual or has_score)
+        )
+        self._score_stack.setCurrentWidget(
+            self._confidence_combo
+            if (show_detected and is_manual)
+            else self._score_label
+        )
         if has_score and show_detected:
             self._score_label.setText(f"{peak.score:.3f}")
         else:
@@ -422,6 +449,13 @@ class ParameterPanel(QGroupBox):
     def save_as_ring(self) -> bool:
         """Whether the next Add-to-fitted should commit a ring row."""
         return self.chk_save_as_ring.isChecked()
+
+    def confidence_score(self) -> float:
+        """Score a freshly added detected peak should carry, per the
+        Score-row confidence dropdown (High = 1.0 / Medium = 0.5 /
+        Low = 0.1). Falls back to 1.0 if the combo is somehow empty."""
+        data = self._confidence_combo.currentData()
+        return float(data) if data is not None else 1.0
 
     def fit_mode(self) -> str:
         """Return the active Add-to-fitted dispatch mode.

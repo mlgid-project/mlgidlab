@@ -1632,10 +1632,43 @@ class GIWAXSImageViewer(QWidget):
 
     def clear_history(self) -> None:
         """Drop both undo and redo stacks. Called after pipeline ops that
-        reshuffle peak ids — pending FileGeomActions would key off stale ids.
+        regenerate peak ids — pending FileGeomActions would key off stale ids.
+
+        For ordinary peak edits (delete / paste / fit), prefer
+        ``prune_file_geom_history`` instead: file-resident ids are stable
+        (``add_*`` appends ``max(id)+1``, ``delete`` filters by id and
+        leaves the rest), so only the *removed* ids' geometry edits go
+        stale — wiping the whole history would needlessly break
+        multi-level undo/redo.
         """
         self._undo_stack.clear()
         self._redo_stack.clear()
+
+    def prune_file_geom_history(
+        self, frame: int, kind: str, peak_ids
+    ) -> None:
+        """Drop only the FileGeomActions that target ``(frame, kind, id)``
+        for ``id in peak_ids`` from both stacks, keeping everything else.
+
+        Used after a delete: the removed ids' pending geometry edits would
+        key off rows that no longer exist (and would otherwise raise a
+        stale-id KeyError on the deferred write). Unlike ``clear_history``
+        this preserves prior undoable operations, so a run of deletes (or
+        deletes interleaved with pastes / fits) stays fully undoable and
+        redoable.
+        """
+        targets = {int(p) for p in peak_ids}
+
+        def _stale(a: _Action) -> bool:
+            return (
+                isinstance(a, FileGeomAction)
+                and int(a.frame) == int(frame)
+                and a.kind == kind
+                and int(a.peak_id) in targets
+            )
+
+        self._undo_stack = [a for a in self._undo_stack if not _stale(a)]
+        self._redo_stack = [a for a in self._redo_stack if not _stale(a)]
 
     def clear_selection(self) -> None:
         if self._selected is None and not self._selected_extras:
