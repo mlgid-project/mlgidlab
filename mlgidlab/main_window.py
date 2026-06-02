@@ -6389,11 +6389,12 @@ class MainWindow(QMainWindow):
 
         * ``sel.kind == "detected"`` → delete only the detected row.
           Leaves fitted / matched alone.
-        * ``sel.kind == "fitted"`` → delete only the fitted row.
-          ``matched_*`` integer indices into ``fitted_peaks`` would
-          go stale, so we also clear ``matched_*`` on that frame
-          (same invalidate-on-refit cascade F-04 uses for
-          ``run_fitting``).
+        * ``sel.kind == "fitted"`` → delete only the fitted row, then
+          reindex ``matched_*`` ``peak_list`` so each surviving
+          structure keeps its other peaks (the deleted peak is dropped
+          from any structure that referenced it; structures that didn't
+          are untouched). Replaces the old blunt "clear every
+          ``matched_*`` on the frame" cascade.
         * ``sel.kind == "matched"`` → still routes through
           ``mlgidbase.delete_peak`` for now — matched live across
           per-solution datasets and a dedicated single-solution
@@ -6449,11 +6450,11 @@ class MainWindow(QMainWindow):
     ) -> None:
         """Delete one detected/fitted row — kind-scoped, undoable.
 
-        Fitted deletes also clear ``matched_*`` on the frame, because
-        ``peak_list`` integer indices into ``fitted_peaks`` go stale
-        when the row ordering changes (F-04 invalidation). Delegates to
-        the shared ``_delete_peaks_scoped`` so single and bulk delete
-        share one undoable path.
+        Fitted deletes also reindex ``matched_*`` ``peak_list`` on the
+        frame (positions into ``fitted_peaks`` shift when a row is
+        removed), keeping the surviving structures. Delegates to the
+        shared ``_delete_peaks_scoped`` so single and bulk delete share
+        one undoable path.
         """
         self._delete_peaks_scoped([sel], entry)
 
@@ -6482,12 +6483,14 @@ class MainWindow(QMainWindow):
         Confirms once, snapshots the full rows (so undo can re-create
         them verbatim — including the 2D-fit params PeakTable doesn't
         surface), deletes them in one ``_detached_silx_tree`` scope,
-        clears ``matched_*`` on the frame for fitted deletes, and pushes
-        one grouped ``_CallbackAction`` so a single Ctrl+Z restores
-        every row. The matched cascade is intentionally *not* restored
-        on undo: re-added rows get fresh ids, so the prior matched
-        solutions (indexing the old fitted ordering) would be stale —
-        re-run Matching to regenerate.
+        reindexes ``matched_*`` ``peak_list`` on the frame for fitted
+        deletes (dropping the deleted peaks from any structure that
+        referenced them, keeping every structure), and pushes one
+        grouped ``_CallbackAction`` so a single Ctrl+Z restores every
+        row. Undo re-adds the fitted rows with fresh ids appended at the
+        end; it does **not** re-add them to the matched structures they
+        were in (the structures already reference the surviving peaks
+        correctly — re-run Matching if a peak's membership matters).
         """
         if self.session is None or self._pipe_thread is not None:
             return
@@ -6511,9 +6514,9 @@ class MainWindow(QMainWindow):
             )
         else:
             siblings_msg = (
-                "Detected rows stay intact; matched solutions on this "
-                "frame will be cleared (their indices into fitted_peaks "
-                "would otherwise go stale — re-run Matching to regenerate)."
+                "Detected rows stay intact. Matched structures that "
+                "include the deleted peak(s) lose just those peaks; "
+                "structures that don't reference them are left unchanged."
             )
         noun = f"{kind_human} peak" + ("s" if n > 1 else "")
         target = (
@@ -6533,6 +6536,7 @@ class MainWindow(QMainWindow):
 
         removed = 0
         snapshot: list[dict] = []
+        matched_changed = 0
         with self._detached_silx_tree():
             try:
                 # Snapshot full rows (incl. theta/A/B/C for fitted) so
@@ -6541,15 +6545,29 @@ class MainWindow(QMainWindow):
                 snapshot = file_model.read_peak_rows(
                     self.session.temp_path, entry, frame, kind, ids,
                 )
+                # matched_* peak_list stores positions into fitted_peaks,
+                # not ids, and deleting compacts the array — capture the
+                # rows' positions BEFORE deleting so matched can be
+                # reindexed afterwards.
+                deleted_positions = (
+                    file_model.fitted_positions_for_ids(
+                        self.session.temp_path, entry, frame, ids,
+                    )
+                    if kind == "fitted" else []
+                )
                 for peak_id in ids:
                     removed += file_model.delete_peak_row(
                         self.session.temp_path, entry,
                         frame=frame, kind=kind, peak_id=peak_id,
                     )
                 if kind == "fitted" and removed > 0:
-                    file_model.clear_peaks(
-                        self.session.temp_path, entry,
-                        kind="matched", frame=frame,
+                    # Drop the deleted peaks from any matched structure
+                    # that referenced them and shift the surviving
+                    # indices down; structures are kept (the old code
+                    # wiped every matched_* on the frame instead).
+                    matched_changed = file_model.remap_matched_peak_lists(
+                        self.session.temp_path, entry, frame,
+                        deleted_positions,
                     )
             except Exception as exc:
                 QMessageBox.critical(
@@ -6578,7 +6596,10 @@ class MainWindow(QMainWindow):
         msg = (
             f"Deleted {removed} {kind_human} peak(s) on "
             f"{entry}/frame{frame:05d}"
-            + (" (matched_* cleared)" if kind == "fitted" else "")
+            + (
+                f" ({matched_changed} matched structure(s) updated)"
+                if matched_changed else ""
+            )
         )
         self.statusBar().showMessage(msg, 4000)
         self.pipeline_panel.append_log(msg)
@@ -6614,9 +6635,11 @@ class MainWindow(QMainWindow):
         The delete already happened, so ``undo`` re-adds the rows (fresh
         ids) and ``redo`` deletes them again. ``state["ids"]`` rotates:
         populated by ``undo`` with the re-assigned ids so a following
-        ``redo`` deletes the right rows. For fitted, ``redo`` re-clears
-        ``matched_*`` (undo never restores matched — see
-        ``_delete_peaks_scoped``).
+        ``redo`` deletes the right rows. For fitted, ``redo`` re-applies
+        the ``matched_*`` reindex (recomputing the deleted rows'
+        positions from the current ids first, since the re-added rows
+        sit at fresh positions); ``undo`` leaves ``matched_*`` as-is —
+        see ``_delete_peaks_scoped``.
         """
         snap = [dict(d) for d in snapshot]
         state: dict[str, list[int]] = {"ids": []}
@@ -6659,6 +6682,13 @@ class MainWindow(QMainWindow):
                 self.viewer.set_frame(int(frame))
             with self._detached_silx_tree():
                 try:
+                    deleted_positions = (
+                        file_model.fitted_positions_for_ids(
+                            self.session.temp_path, entry, int(frame),
+                            [int(p) for p in state["ids"]],
+                        )
+                        if cascade_matched else []
+                    )
                     for peak_id in state["ids"]:
                         file_model.delete_peak_row(
                             self.session.temp_path, entry,
@@ -6666,9 +6696,9 @@ class MainWindow(QMainWindow):
                             peak_id=int(peak_id),
                         )
                     if cascade_matched and state["ids"]:
-                        file_model.clear_peaks(
-                            self.session.temp_path, entry,
-                            kind="matched", frame=int(frame),
+                        file_model.remap_matched_peak_lists(
+                            self.session.temp_path, entry, int(frame),
+                            deleted_positions,
                         )
                 except Exception as exc:
                     QMessageBox.critical(self, "Redo delete", str(exc))

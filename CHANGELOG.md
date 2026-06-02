@@ -4,6 +4,39 @@ All notable changes to mlgidLAB are recorded here. Versions follow
 [PEP 440](https://peps.python.org/pep-0440/); `aN` suffixes are alpha
 pre-releases.
 
+## 0.1.0a3 — third alpha (2026-06-02)
+
+Bug-fix alpha on `0.1.0a2`. No on-disk schema or backend changes;
+the `[pipeline]` pins are unchanged.
+
+### Fixed
+
+- **Deleting a fitted peak no longer wipes all matched structures.**
+  Matched `peak_list` entries are positions into `fitted_peaks`, which
+  shift when a row is removed, so the previous code cleared every
+  `matched_*` solution on the frame as a blunt invalidation. It now
+  reindexes instead: the deleted peak is dropped from any structure
+  that referenced it, the surviving indices shift to keep pointing at
+  the same peaks, structures that didn't reference it are left intact,
+  and no structure is removed (one that loses its last peak is kept,
+  just no longer drawn).
+
+### Install
+
+```bash
+# GUI only (view + edit existing NeXus results, in-GUI pyFAI calibration)
+pip install "git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a3"
+
+# Full pipeline (adds detection / fitting / matching + raw conversion)
+pip install "mlgidlab[pipeline] @ git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a3"
+
+mlgidlab        # launch
+```
+
+The `[pipeline]` extra pins the same verified-good backend set as
+`0.1.0a1`: `mlgidbase==0.1.3`, `pygid==0.2.10`, `pygidfit==0.1.3`,
+`mlgidmatch==0.1.3`, `pygidsim==0.1.4`.
+
 ## 0.1.0a2 — second alpha (2026-06-02)
 
 Second evaluation alpha. Incremental on `0.1.0a1`: a crash fix on the

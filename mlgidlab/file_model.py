@@ -1287,10 +1287,110 @@ def delete_peak_row(
         # ``fitted_peaks`` row ordering changed → matched_* peak_list
         # integer indices into this frame's fitted_peaks may now be
         # stale. The caller is expected to invoke
-        # ``clear_peaks(..., "matched", frame=frame)`` after this
-        # helper for the fitted case; we don't do it here so the
-        # contract stays "this helper touches exactly one kind".
+        # ``remap_matched_peak_lists(...)`` (preferred — keeps the
+        # surviving structures) or ``clear_peaks(..., "matched",
+        # frame=frame)`` after this helper for the fitted case; we don't
+        # do it here so the contract stays "this helper touches exactly
+        # one kind".
         return int(arr.shape[0] - new_arr.shape[0])
+
+
+def fitted_positions_for_ids(
+    file_path: Path,
+    entry: str,
+    frame: int,
+    peak_ids: list[int],
+) -> list[int]:
+    """Positional indices of fitted rows whose ``id`` is in ``peak_ids``.
+
+    ``matched_*`` ``peak_list`` entries are **positional** indices into
+    the frame's ``fitted_peaks`` (file order — the same order
+    ``PeakTable.from_dataset`` / ``load_matched_peaks`` read), NOT peak
+    ids. mlgidLAB keeps fitted ids stable across deletes (it does not
+    reindex), so id and position diverge. A caller about to delete fitted
+    rows must capture their positions **before** deleting so it can hand
+    them to ``remap_matched_peak_lists``; this helper returns those
+    positions, sorted ascending. Ids not present are skipped.
+    """
+    wanted = {int(pid) for pid in peak_ids}
+    if not wanted:
+        return []
+    frame_key = FRAME_KEY_FMT.format(int(frame))
+    ds_path = f"{entry}/{ANALYSIS_REL}/{frame_key}/fitted_peaks"
+    with h5py.File(file_path, "r") as f:
+        if ds_path not in f:
+            return []
+        ids = np.asarray(f[ds_path][()]["id"], dtype=int)
+    return [pos for pos, pid in enumerate(ids) if int(pid) in wanted]
+
+
+def remap_matched_peak_lists(
+    file_path: Path,
+    entry: str,
+    frame: int,
+    deleted_positions: list[int],
+) -> int:
+    """Reindex every ``matched_*`` ``peak_list`` after fitted rows at
+    ``deleted_positions`` were removed, keeping the structures.
+
+    ``deleted_positions`` are positional indices (file order) into the
+    *pre-delete* ``fitted_peaks``, as returned by
+    ``fitted_positions_for_ids``. For each matched solution row's
+    ``peak_list`` (a vlen int array of fitted positions):
+
+    - a position equal to a deleted one is dropped (that peak left the
+      structure), and
+    - a position above a deleted one is shifted down by the count of
+      deleted positions below it (the fitted array compacted).
+
+    A solution row is **never removed**, even if its ``peak_list`` becomes
+    empty: deleting a fitted peak removes its membership in a structure,
+    not the structure itself (an empty one simply stops rendering, since
+    ``load_matched_peaks`` skips zero-length lists). Solutions that
+    reference none of the deleted peaks and sit entirely below them are
+    left byte-identical. Returns the number of solution rows changed.
+
+    Row count per ``matched_*`` dataset is unchanged, so each dataset is
+    rewritten in place (``ds[...] = arr``), preserving the vlen dtype +
+    attrs without a delete/recreate.
+    """
+    deleted = sorted({int(p) for p in deleted_positions})
+    if not deleted:
+        return 0
+    deleted_set = set(deleted)
+
+    def _shift(x: int) -> int:
+        # New position = old minus the number of deleted slots below it.
+        return x - sum(1 for d in deleted if d < x)
+
+    frame_key = FRAME_KEY_FMT.format(int(frame))
+    group_path = f"{entry}/{ANALYSIS_REL}/{frame_key}"
+    changed = 0
+    with h5py.File(file_path, "r+") as f:
+        if group_path not in f:
+            return 0
+        group = f[group_path]
+        for name in list(group.keys()):
+            if not name.startswith("matched_"):
+                continue
+            ds = group[name]
+            arr = ds[()]
+            row_changed = False
+            for i in range(len(arr)):
+                old = np.asarray(arr["peak_list"][i], dtype=int)
+                new = np.asarray(
+                    [_shift(int(x)) for x in old if int(x) not in deleted_set],
+                    dtype=np.int32,
+                )
+                if new.size != old.size or (
+                    new.size and not np.array_equal(new, old.astype(np.int32))
+                ):
+                    arr["peak_list"][i] = new
+                    row_changed = True
+                    changed += 1
+            if row_changed:
+                ds[...] = arr
+    return changed
 
 
 def clear_peaks(

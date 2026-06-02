@@ -112,7 +112,7 @@ def test_delete_preserves_unrelated_row_ids(tmp_path):
     the row with id=1 was deleted in front of it. Keeps matched_*
     peak_list references stable (their indices into the kept rows
     are unchanged, modulo positional shifts which the host's
-    matched_* clear handles)."""
+    matched_* remap handles via remap_matched_peak_lists)."""
     path = _seed_file_with_three_kinds(tmp_path / "scoped3.h5", with_matched=False)
     file_model.delete_peak_row(
         path, "entry_0000", frame=0, kind="fitted", peak_id=0,
