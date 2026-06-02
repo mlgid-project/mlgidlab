@@ -4,6 +4,66 @@ All notable changes to mlgidLAB are recorded here. Versions follow
 [PEP 440](https://peps.python.org/pep-0440/); `aN` suffixes are alpha
 pre-releases.
 
+## 0.1.0a2 — second alpha (2026-06-02)
+
+Second evaluation alpha. Incremental on `0.1.0a1`: a crash fix on the
+hot interaction path, more robust undo/redo, a small peak-editing
+addition, and repository slimming. No on-disk schema or backend
+changes: `0.1.0a1` files load unchanged and the `[pipeline]` pins are
+the same verified-good set.
+
+### Fixed
+
+- **Viewer no longer crashes during a write.** Moving the cursor over
+  the polar plot, or toggling the Cartesian/Polar view, while a write
+  was in flight (pipeline run, ROI commit, Add-to-fitted, clear-peaks,
+  Save As) raised `RuntimeError: FrameSource not acquired` on every
+  event, because the frame reader's file handle is closed for the
+  duration of that write. The cursor readout now degrades to a blank
+  intensity and the view toggle defers its render until the handle
+  reopens, instead of throwing.
+- **Undo/redo survives shortcut conflicts.** `Ctrl+Z` / `Ctrl+Shift+Z`
+  / `Ctrl+Y` are now intercepted before the ambiguous-shortcut
+  resolver, so they keep working even when silx mask-tools or pyFAI
+  peak-picking (pulled in by the calibration dialog) register the same
+  chords. Multi-level undo/redo across consecutive delete and paste
+  operations was also fixed; earlier ops are no longer dropped from
+  history.
+
+### Added
+
+- **Confidence level for Add-to-detected.** Committing a manual box to
+  `detected_peaks` now writes the score chosen in the Parameter panel
+  (High = 1.0 / Medium = 0.5 / Low = 0.1) instead of a fixed value; the
+  add stays undoable.
+
+### Changed
+
+- Removed the bundled `example/` dataset (~150 MB of HDF5 / mask /
+  prepared-CIF binaries) from the repository to keep clones small; the
+  getting-started guide walks through opening your own data.
+- README slimmed and reorganised; added
+  [`docs/getting_started.md`](docs/getting_started.md) (per-OS install +
+  first-file walkthrough) and
+  [`docs/backend_compatibility.md`](docs/backend_compatibility.md)
+  (backend version policy).
+
+### Install
+
+```bash
+# GUI only (view + edit existing NeXus results, in-GUI pyFAI calibration)
+pip install "git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a2"
+
+# Full pipeline (adds detection / fitting / matching + raw conversion)
+pip install "mlgidlab[pipeline] @ git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a2"
+
+mlgidlab        # launch
+```
+
+The `[pipeline]` extra pins the same verified-good backend set as
+`0.1.0a1`: `mlgidbase==0.1.3`, `pygid==0.2.10`, `pygidfit==0.1.3`,
+`mlgidmatch==0.1.3`, `pygidsim==0.1.4`.
+
 ## 0.1.0a1 — first alpha (2026-05-29)
 
 First public alpha of **mlgidLAB**, a desktop GUI for the

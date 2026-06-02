@@ -2110,7 +2110,20 @@ class GIWAXSImageViewer(QWidget):
             self._render_frame(self._frame_index, auto_range=auto_range)
             # No overlays in raw mode — nothing to render past _render_frame.
             return
-        if self._stack is None or self._frame_source is None:
+        # ``_build_*_params`` read frame 0 through the FrameSource to
+        # compute robust levels, so bail when the source is released by
+        # the silx detach/reattach dance. Without this, toggling the
+        # Cartesian/Polar radio during a write (pipeline run, ROI
+        # commit, Add-to-fitted, clear-peaks, save-as) drives
+        # ``get_cartesian(0)`` / ``get_polar(0)`` into a closed handle
+        # and raises ``RuntimeError("FrameSource not acquired")``. The
+        # new mode is still recorded; ``acquire_frame_source`` re-renders
+        # it once the handle reopens.
+        if (
+            self._stack is None
+            or self._frame_source is None
+            or not self._frame_source.is_open
+        ):
             return
         if self._mode == MODE_POLAR:
             self._display_params = self._build_polar_params()
@@ -2626,7 +2639,21 @@ class GIWAXSImageViewer(QWidget):
         r_val = float(x)
         theta_deg = float(y)
         intensity = float("nan")
-        if self._polar_cache is not None:
+        # The ``_polar_cache is None`` guard fires once
+        # ``release_frame_source`` runs, but the cursor can also move in
+        # the window where the cache tuple still exists yet the
+        # underlying FrameSource is released (e.g. ``clear()`` drops the
+        # source without nulling the cache first). Indexing the stack
+        # then delegates into ``FrameSource.get_polar`` and raises
+        # ``RuntimeError("FrameSource not acquired")``. Require the
+        # source to be open so the lookup falls through to the cartesian
+        # fallback (which returns NaN safely) instead. Mirror of the
+        # guard in ``_lookup_cartesian_intensity``.
+        if (
+            self._polar_cache is not None
+            and self._frame_source is not None
+            and self._frame_source.is_open
+        ):
             polar_stack, radius_axis, angle_axis = self._polar_cache
             if (
                 0 <= frame < polar_stack.shape[0]
