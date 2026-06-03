@@ -4,6 +4,37 @@ All notable changes to mlgidLAB are recorded here. Versions follow
 [PEP 440](https://peps.python.org/pep-0440/); `aN` suffixes are alpha
 pre-releases.
 
+## 0.1.0a4 — fourth alpha (2026-06-03)
+
+Bug-fix alpha on `0.1.0a3`. No on-disk schema or backend changes;
+the `[pipeline]` pins are unchanged.
+
+### Fixed
+
+- **Contrast no longer resets when you edit or run the pipeline.** The
+  contrast set with the histogram slider is now remembered and reused
+  across re-renders (adding a peak, running the pipeline, scrubbing
+  frames), instead of snapping back to the auto-computed default. It
+  still re-auto-contrasts when the data actually changes: opening a file,
+  switching entries, or toggling log/linear. Switching Cartesian/Polar
+  keeps it (same data, just resampled).
+
+### Install
+
+```bash
+# GUI only (view + edit existing NeXus results, in-GUI pyFAI calibration)
+pip install "git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a4"
+
+# Full pipeline (adds detection / fitting / matching + raw conversion)
+pip install "mlgidlab[pipeline] @ git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a4"
+
+mlgidlab        # launch
+```
+
+The `[pipeline]` extra pins the same verified-good backend set as
+`0.1.0a1`: `mlgidbase==0.1.3`, `pygid==0.2.10`, `pygidfit==0.1.3`,
+`mlgidmatch==0.1.3`, `pygidsim==0.1.4`.
+
 ## 0.1.0a3 — third alpha (2026-06-02)
 
 Bug-fix alpha on `0.1.0a2`. No on-disk schema or backend changes;

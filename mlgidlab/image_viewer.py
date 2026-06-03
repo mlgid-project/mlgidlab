@@ -922,6 +922,13 @@ class GIWAXSImageViewer(QWidget):
         # ViewBox pan / zoom — see _disable_viewport_scroll docstring.
         _disable_viewport_scroll(gv)
         outer.addWidget(self._view)
+        # Remember the user's contrast when they finish dragging the
+        # histogram region, so it survives operation re-renders. Connect
+        # to the LUT *item*; the widget forwards attribute access but not
+        # the Qt signal object itself.
+        self._view.getHistogramWidget().item.sigLevelChangeFinished.connect(
+            self._on_contrast_changed
+        )
 
         self._plot.invertY(False)
         self._plot.setAspectLocked(False)
@@ -1002,6 +1009,21 @@ class GIWAXSImageViewer(QWidget):
 
         self._mode = MODE_POLAR
         self._log_scale: bool = False
+        # The contrast (histogram) levels the user has dialed in with the
+        # slider, or None to auto-contrast from the data. When set, it is
+        # reused across operation re-renders (add-peak, pipeline reattach,
+        # frame scrubs) so editing or running the pipeline doesn't snap the
+        # contrast back to the robust default. Reset to None whenever the
+        # underlying data changes (new stack/entry, log/linear toggle) so
+        # those genuinely re-auto-contrast. Captured from the histogram's
+        # sigLevelChangeFinished signal; ``setImage(levels=...)`` does not
+        # fire that signal, so renders never masquerade as a user change.
+        self._user_levels: tuple[float, float] | None = None
+        # Guard: True while we push an image via ``setImage``, so the
+        # histogram's ``sigLevelChangeFinished`` (which can fire when the
+        # data range shifts, e.g. log toggle / new frame) is ignored and
+        # only genuine user drags update ``_user_levels``.
+        self._suppress_level_capture: bool = False
         self._stack: EntryStack | None = None
         # The FrameSource backing the active EntryStack. Owns the live
         # h5py handle + per-frame LRU; released across the silx detach
@@ -1151,6 +1173,11 @@ class GIWAXSImageViewer(QWidget):
             )
         self._polar_cache = None
         self._frame_peaks.clear()
+        # A fresh stack (entry change, file open) should re-auto-contrast;
+        # a preserve_view re-render (peak edits, pipeline reattach) keeps
+        # the user's slider contrast.
+        if not preserve_view:
+            self._user_levels = None
         # Clamp frame index to the new stack's range. Preserved when
         # the caller asked for it and the prior frame is still valid;
         # otherwise default to 0 so a fresh entry starts at the first
@@ -1450,6 +1477,7 @@ class GIWAXSImageViewer(QWidget):
         self._raw_image_stack = None
         self._polar_cache = None
         self._display_params = None
+        self._user_levels = None
         self._frame_index = 0
         if had_selection:
             self.selectionChanged.emit(None)
@@ -2089,6 +2117,35 @@ class GIWAXSImageViewer(QWidget):
 
     # -- Rendering --
 
+    def _current_levels(self) -> tuple[float, float] | None:
+        """The contrast levels currently on the histogram, or None when
+        unreadable / degenerate. Used to snapshot the user's slider."""
+        try:
+            lo, hi = self._view.getHistogramWidget().getLevels()
+        except Exception:
+            logger.debug("suppressed exception in GIWAXSImageViewer._current_levels", exc_info=True)
+            return None
+        if lo is None or hi is None:
+            return None
+        lo, hi = float(lo), float(hi)
+        if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
+            return None
+        return lo, hi
+
+    def _on_contrast_changed(self, *args) -> None:
+        """Histogram drag finished — remember the user's contrast so it
+        sticks across operation re-renders and frame scrubs.
+
+        ``setImage(levels=...)`` (every render) does NOT emit
+        ``sigLevelChangeFinished``, so this only fires on a genuine user
+        drag, never on our own renders — no suppression flag needed.
+        """
+        if self._suppress_level_capture:
+            return
+        lv = self._current_levels()
+        if lv is not None:
+            self._user_levels = lv
+
     def _render_active_mode(self, *, auto_range: bool = True) -> None:
         """Build per-mode axis state + first-frame levels, then render.
 
@@ -2244,15 +2301,28 @@ class GIWAXSImageViewer(QWidget):
 
         self._plot.setLabel("bottom", p.x_label[0], units=p.x_label[1])
         self._plot.setLabel("left", p.y_label[0], units=p.y_label[1])
-        image, levels = self._maybe_apply_log(frame, p.levels)
-        self._view.setImage(
-            image,
-            autoRange=auto_range,
-            autoLevels=False,
-            levels=levels,
-            pos=p.pos,
-            scale=p.scale,
+        # Prefer the user's dialled-in contrast over the per-build robust
+        # default so it survives re-renders; falls back to the cached
+        # robust levels when the user hasn't touched the slider.
+        base_levels = (
+            self._user_levels if self._user_levels is not None else p.levels
         )
+        image, levels = self._maybe_apply_log(frame, base_levels)
+        # The histogram can emit sigLevelChangeFinished while setImage
+        # re-fits the LUT to a new data range; suppress capture so that
+        # render doesn't overwrite the user's sticky contrast.
+        self._suppress_level_capture = True
+        try:
+            self._view.setImage(
+                image,
+                autoRange=auto_range,
+                autoLevels=False,
+                levels=levels,
+                pos=p.pos,
+                scale=p.scale,
+            )
+        finally:
+            self._suppress_level_capture = False
         # pyqtgraph's setImage internally calls roiClicked() which
         # force-shows the bottom timeline strip whenever the image has
         # a time axis. With single 2D frames there is no time axis so
@@ -2265,7 +2335,8 @@ class GIWAXSImageViewer(QWidget):
         self, image: np.ndarray, levels: tuple[float, float]
     ) -> tuple[np.ndarray, tuple[float, float]]:
         """If log-scale is on, return (log10(clip(image, floor)), levels')
-        with levels recomputed on the transformed first frame.
+        where levels' are the user's sticky contrast when set, else
+        recomputed robustly on the transformed first frame.
 
         Floor is the 1st percentile of strictly-positive finite values
         (or 1e-6 fallback) so the log transform is well-defined for
@@ -2283,6 +2354,11 @@ class GIWAXSImageViewer(QWidget):
         if floor <= 0:
             floor = 1e-6
         transformed = np.log10(np.clip(image, floor, None))
+        # Keep the user's contrast (already in the log domain — the
+        # histogram shows the transformed image) when they've set one;
+        # otherwise auto-contrast the transformed frame.
+        if self._user_levels is not None:
+            return transformed, levels
         ref = transformed[0] if transformed.ndim == 3 else transformed
         return transformed, _robust_levels(ref)
 
@@ -2295,6 +2371,10 @@ class GIWAXSImageViewer(QWidget):
         the stack shape is unchanged.
         """
         self._log_scale = bool(checked)
+        # Linear and log levels live in different domains, so a sticky
+        # linear contrast is meaningless once log is on (and vice versa);
+        # drop it and let the toggle re-auto-contrast.
+        self._user_levels = None
         saved: tuple[tuple[float, float], tuple[float, float]] | None = None
         try:
             xr, yr = self._plot.getViewBox().viewRange()
