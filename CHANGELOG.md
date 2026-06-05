@@ -4,6 +4,40 @@ All notable changes to mlgidLAB are recorded here. Versions follow
 [PEP 440](https://peps.python.org/pep-0440/); `aN` suffixes are alpha
 pre-releases.
 
+## 0.1.0a5 — fifth alpha (2026-06-05)
+
+Documentation-only alpha on `0.1.0a4`. No code, on-disk schema, or
+backend changes; the `[pipeline]` pins are unchanged. Cut to publish the
+alpha manual test plan and ship the example dataset as a release asset.
+
+### Added
+
+- **Public manual test plan** (`docs/manual_test_plan.html`) — a
+  self-contained, click-through checklist (13 areas, ~30-45 min) that
+  records pass/fail per step and copies an email-ready summary. Open it
+  in any browser; progress autosaves locally. Linked from the README.
+- **Example dataset as a release asset.** The reference files the test
+  plan uses (NeXus stacks, a raw Eiger frame + PONI/mask, the matching
+  CIF pickle) ship as `example.zip` attached to this release instead of
+  living in the repo, so the clone stays small. Download it and unzip
+  next to the test plan.
+
+### Install
+
+```bash
+# GUI only (view + edit existing NeXus results, in-GUI pyFAI calibration)
+pip install "git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a5"
+
+# Full pipeline (adds detection / fitting / matching + raw conversion)
+pip install "mlgidlab[pipeline] @ git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a5"
+
+mlgidlab        # launch
+```
+
+The `[pipeline]` extra pins the same verified-good backend set as
+`0.1.0a1`: `mlgidbase==0.1.3`, `pygid==0.2.10`, `pygidfit==0.1.3`,
+`mlgidmatch==0.1.3`, `pygidsim==0.1.4`.
+
 ## 0.1.0a4 — fourth alpha (2026-06-03)
 
 Bug-fix alpha on `0.1.0a3`. No on-disk schema or backend changes;

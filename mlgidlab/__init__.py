@@ -15,7 +15,7 @@ os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 
 from PySide6.QtWidgets import QApplication
 
-__version__ = "0.1.0a4"
+__version__ = "0.1.0a5"
 
 
 def main() -> int:
