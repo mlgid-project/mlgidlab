@@ -4,6 +4,56 @@ All notable changes to mlgidLAB are recorded here. Versions follow
 [PEP 440](https://peps.python.org/pep-0440/); `aN` suffixes are alpha
 pre-releases.
 
+## 0.1.0a6 — sixth alpha (2026-06-09)
+
+Feature alpha on `0.1.0a5`. New image-viewer and export controls plus a
+theme fix. No on-disk schema or backend changes; the `[pipeline]` pins
+are unchanged.
+
+### Added
+
+- **Image aspect-ratio control** in the viewer toolbar (`Fit` /
+  `Default` / `Custom`). `Default` (the startup choice) uses a per-mode
+  shape — 1:1 for Cartesian, 2:1 for polar — and follows mode switches;
+  `Custom` locks an on-screen width:height ratio; `Fit` stretches to
+  fill. Scrolling over a single axis switches to `Custom` and adjusts
+  the ratio live (x wider, y taller); double-clicking the image snaps
+  back to `Default`.
+- **Remove a file with `Delete`.** Pressing `Delete` with a row selected
+  in the file browser closes that file, mirroring `File → Close`
+  (`Ctrl+W`).
+- **SVG figure export.** Tools → Export figure now saves vector **SVG**
+  as well as raster PNG — the format follows the file extension you pick.
+
+### Changed
+
+- **Clear / Reset / delete-peak confirmations default to Yes**, so a
+  single Enter confirms.
+
+### Fixed
+
+- **Light theme is actually light.** Both themes now apply a real
+  qdarkstyle palette (dark / light) rather than falling back to the OS
+  palette, so light mode reads as light on every desktop. Switching
+  themes restyles the whole UI immediately — window chrome, plots, and
+  the contrast slider — instead of only after a restart.
+
+### Install
+
+```bash
+# GUI only (view + edit existing NeXus results, in-GUI pyFAI calibration)
+pip install "git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a6"
+
+# Full pipeline (adds detection / fitting / matching + raw conversion)
+pip install "mlgidlab[pipeline] @ git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a6"
+
+mlgidlab        # launch
+```
+
+The `[pipeline]` extra pins the same verified-good backend set as
+`0.1.0a1`: `mlgidbase==0.1.3`, `pygid==0.2.10`, `pygidfit==0.1.3`,
+`mlgidmatch==0.1.3`, `pygidsim==0.1.4`.
+
 ## 0.1.0a5 — fifth alpha (2026-06-05)
 
 Documentation-only alpha on `0.1.0a4`. No code, on-disk schema, or

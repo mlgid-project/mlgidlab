@@ -10,12 +10,23 @@ from typing import Protocol
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import (
+    QEvent,
+    QObject,
+    QPoint,
+    QPointF,
+    QRectF,
+    QSettings,
+    QSignalBlocker,
+    Qt,
+    Signal,
+)
 from PySide6.QtGui import QAction, QColor, QPainterPath
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -803,6 +814,12 @@ def _polar_rect_polygon(
 class GIWAXSImageViewer(QWidget):
     """Image viewer with Cartesian ↔ polar mode toggle + peak-box overlays."""
 
+    # QSettings key for the last Custom aspect ratio (the on-screen
+    # width:height). The mode itself is not persisted — the viewer always
+    # starts in Fit; only the ratio is remembered so re-entering Custom is
+    # sensible. Shares the global store with the theme / playback settings.
+    _ASPECT_RATIO_KEY = "viewerAspectRatio"
+
     frameChanged = Signal(int)
     modeChanged = Signal(str)
     # Cursor readout — emits a dict describing the data point under the
@@ -882,6 +899,34 @@ class GIWAXSImageViewer(QWidget):
         )
         self._log_check.toggled.connect(self._on_log_toggled)
         bar.addWidget(self._log_check)
+        bar.addSpacing(16)
+        # Aspect ratio of the shown image. "Fit" (default) stretches the
+        # frame to fill the panel (setAspectLocked(False)); "Custom" locks
+        # the y-to-x data-unit scale to the spin value — 1.00 is the
+        # undistorted view (equal Å⁻¹ per axis, so q-space rings stay
+        # round in Cartesian mode). The lock lives on the PlotItem and so
+        # survives mode switches and re-renders. See _on_aspect_changed.
+        bar.addWidget(QLabel("Aspect:"))
+        self._aspect_combo = QComboBox()
+        self._aspect_combo.addItems(["Fit", "Default", "Custom"])
+        self._aspect_combo.setToolTip(
+            "Fit fills the panel; Default uses a per-mode shape "
+            "(Cartesian 1:1, polar 2:1); Custom locks the width:height to "
+            "the ratio box. Scrolling over an axis switches to Custom."
+        )
+        self._aspect_combo.currentIndexChanged.connect(self._on_aspect_changed)
+        bar.addWidget(self._aspect_combo)
+        self._aspect_spin = QDoubleSpinBox()
+        self._aspect_spin.setRange(0.05, 20.0)
+        self._aspect_spin.setSingleStep(0.05)
+        self._aspect_spin.setDecimals(2)
+        self._aspect_spin.setValue(1.0)
+        self._aspect_spin.setToolTip(
+            "Custom on-screen width:height of the image: >1 wider than "
+            "tall, <1 taller than wide."
+        )
+        self._aspect_spin.valueChanged.connect(self._on_aspect_changed)
+        bar.addWidget(self._aspect_spin)
         # The frame-navigation controls (prev / play / next / slider /
         # label) used to live in the Display dock's Frame row. They
         # now sit here in the toolbar so the user can scrub frames
@@ -939,6 +984,14 @@ class GIWAXSImageViewer(QWidget):
         # the label guaranteed clearance and keeps the plot fitted
         # inside its tab.
         self._plot.layout.setContentsMargins(0, 0, 0, 12)
+        # Restore the persisted aspect choice now that both the toolbar
+        # widgets and the plot exist. Starts in Fit, leaving the
+        # setAspectLocked(False) baseline above untouched.
+        self._restore_aspect_from_settings()
+        # Route single-axis (axis-region) wheel events through our handler
+        # so scrolling one axis adjusts the Custom ratio. Must come after
+        # the viewbox exists.
+        self._install_axis_wheel_handler()
 
         self._detected = _PeakShapeItem(**OVERLAY_STYLE["detected"])
         self._fitted = _PeakShapeItem(**OVERLAY_STYLE["fitted"])
@@ -971,7 +1024,7 @@ class GIWAXSImageViewer(QWidget):
         self._label_filter.drawUpdated.connect(self._on_draw_updated)
         self._label_filter.drawFinished.connect(self._on_draw_finished)
         self._label_filter.selectAt.connect(self._on_select_at)
-        self._label_filter.doubleClicked.connect(self.reset_zoom)
+        self._label_filter.doubleClicked.connect(self._reset_view_to_default)
         self._label_filter.cursorPos.connect(self._on_cursor_pos)
         self._label_filter.cursorLeft.connect(self._on_cursor_left)
 
@@ -1247,6 +1300,238 @@ class GIWAXSImageViewer(QWidget):
         except Exception:
             logger.debug("suppressed exception in GIWAXSImageViewer.reset_zoom", exc_info=True)
             pass
+
+    def apply_theme_colors(self, background, foreground) -> None:
+        """Recolour the plot background + axes live for a theme switch.
+
+        pyqtgraph bakes the configured background/foreground into items at
+        creation (``pg.setConfigOption``), so an already-built plot keeps
+        the old theme's colours until told otherwise — this pushes them
+        immediately so a dark→light switch doesn't leave white axis text
+        on a white background.
+        """
+        try:
+            self._view.ui.graphicsView.setBackground(background)
+        except Exception:
+            logger.debug("suppressed exception setting viewer background", exc_info=True)
+        pen = pg.mkPen(foreground)
+        for name in ("left", "bottom", "right", "top"):
+            try:
+                ax = self._plot.getAxis(name)
+            except Exception:
+                ax = None
+            if ax is None:
+                continue
+            try:
+                ax.setPen(pen)
+                ax.setTextPen(pen)
+            except Exception:
+                logger.debug("suppressed exception recolouring axis", exc_info=True)
+        # The contrast/LUT histogram is its own GraphicsView (the
+        # "contrast slider"), so it keeps the construction-time background
+        # until told otherwise — recolour it and its level axis too.
+        try:
+            hist = self._view.getHistogramWidget()
+            hist.setBackground(background)
+            hist_axis = getattr(hist.item, "axis", None)
+            if hist_axis is not None:
+                hist_axis.setPen(pen)
+                hist_axis.setTextPen(pen)
+        except Exception:
+            logger.debug("suppressed exception recolouring histogram", exc_info=True)
+
+    # -- Aspect ratio (toolbar "Aspect:" Fit / Default / Custom) --
+
+    _ASPECT_RATIO_MIN = 0.05
+    _ASPECT_RATIO_MAX = 20.0
+    # Per-mode width:height used by the "Default" preset.
+    _ASPECT_DEFAULT_POLAR = 2.0
+    _ASPECT_DEFAULT_OTHER = 1.0   # Cartesian + raw
+
+    def aspect(self) -> tuple[str, float]:
+        """Return the current aspect choice as ``(mode, ratio)``.
+
+        ``mode`` is ``"fit"``, ``"default"`` or ``"custom"``; ``ratio`` is
+        the target on-screen **width:height** of the image (``2`` = twice
+        as wide as tall, the natural shape of a polar radius×angle map).
+        For Default the ratio reported is the per-mode preset value.
+        """
+        txt = self._aspect_combo.currentText()
+        mode = {"Default": "default", "Custom": "custom"}.get(txt, "fit")
+        if mode == "default":
+            return mode, self._default_ratio_for_mode()
+        return mode, float(self._aspect_spin.value())
+
+    def _default_ratio_for_mode(self) -> float:
+        """Width:height the "Default" preset uses for the active mode:
+        2:1 for polar (radius×angle), 1:1 for Cartesian / raw. Uses a
+        getattr fallback because the aspect control is restored in
+        ``__init__`` before ``_mode`` is assigned (the viewer starts
+        polar)."""
+        if getattr(self, "_mode", MODE_POLAR) == MODE_POLAR:
+            return self._ASPECT_DEFAULT_POLAR
+        return self._ASPECT_DEFAULT_OTHER
+
+    def set_aspect(self, mode: str, ratio: float | None = None) -> None:
+        """Programmatically set the aspect choice (tests / future wiring).
+        Seeds the toolbar widgets without retriggering their signals, then
+        applies + persists once via the shared path."""
+        mode = str(mode).lower()
+        label = {"default": "Default", "custom": "Custom"}.get(mode, "Fit")
+        with QSignalBlocker(self._aspect_combo), QSignalBlocker(self._aspect_spin):
+            self._aspect_combo.setCurrentText(label)
+            if ratio is not None:
+                self._aspect_spin.setValue(float(ratio))
+        self._on_aspect_changed()
+
+    def _data_extent(self) -> tuple[float, float] | None:
+        """Width/height of the current image in *data* units (x, y), from
+        the cached ``_DisplayParams``. None when no image is shown yet.
+
+        This is what makes the ratio pixel-based rather than q-based: the
+        lock value handed to pyqtgraph is derived from the image's actual
+        extent, so a polar map (radius ~0-3 Å⁻¹ vs angle ~0-360°) is not
+        collapsed into a sliver — see ``_apply_aspect``.
+        """
+        p = self._display_params
+        if p is None:
+            return None
+        img = getattr(p, "image_pg", None)
+        if img is None or getattr(img, "ndim", 0) < 2:
+            return None
+        nx, ny = img.shape[0], img.shape[1]   # pyqtgraph col-major: (x, y)
+        sx, sy = p.scale
+        dx = abs(nx * sx)
+        dy = abs(ny * sy)
+        if dx <= 0 or dy <= 0:
+            return None
+        return dx, dy
+
+    def _live_box_ratio(self) -> float | None:
+        """The image's *current* on-screen width:height, whatever the
+        view state. ViewBox.getAspectRatio() returns
+        ``a = (px per x-unit)/(px per y-unit)``; the image box is
+        ``(Dx/Dy) * a``. Used to seed Custom when the user starts
+        scrolling an axis so the number continues from what is shown."""
+        ext = self._data_extent()
+        if ext is None:
+            return None
+        try:
+            a = float(self._plot.getViewBox().getAspectRatio())
+        except Exception:
+            return None
+        if a <= 0:
+            return None
+        return (ext[0] / ext[1]) * a
+
+    def _lock_to_ratio(self, ratio: float) -> None:
+        """Lock the plot so the image box width:height == ``ratio``.
+
+        pyqtgraph's ``setAspectLocked(True, a)`` locks ``a = (px per
+        x-unit)/(px per y-unit)`` (see ViewBox.updateViewRange: "aspect is
+        (widget w/h) / (view range w/h)"); the box is ``(Dx/Dy) * a``, so
+        ``a = ratio * Dy / Dx`` from the current extent. Re-derived per
+        call because Dx/Dy differ between Cartesian and polar, so the same
+        ratio means the same on-screen shape in both. (The reciprocal
+        collapsed polar — where Dy >> Dx — to a sliver.)
+        """
+        ext = self._data_extent()
+        if ext is not None and ratio > 0:
+            dx, dy = ext
+            self._plot.setAspectLocked(True, ratio * dy / dx)
+        else:
+            # No image yet — defer; re-applied after the first render.
+            self._plot.setAspectLocked(False)
+
+    def _apply_aspect(self, refit: bool = False) -> None:
+        """Push the current toolbar choice onto the plot. Fit frees the
+        lock; Default and Custom lock to a width:height ratio (Default's is
+        per-mode, reflected read-only in the spin)."""
+        mode, ratio = self.aspect()
+        try:
+            if mode == "fit":
+                self._plot.setAspectLocked(False)
+            else:
+                if mode == "default":
+                    # Mirror the per-mode preset into the (disabled) spin.
+                    with QSignalBlocker(self._aspect_spin):
+                        self._aspect_spin.setValue(ratio)
+                self._lock_to_ratio(ratio)
+        except Exception:
+            logger.debug("suppressed exception in GIWAXSImageViewer._apply_aspect", exc_info=True)
+        if refit:
+            self.reset_zoom()
+
+    def _on_aspect_changed(self, *_: object) -> None:
+        """Toolbar slot: enable the ratio spin only in Custom mode, apply
+        the choice (refitting so the whole image is shown at the new
+        shape), and persist the Custom ratio."""
+        mode, ratio = self.aspect()
+        self._aspect_spin.setEnabled(mode == "custom")
+        self._apply_aspect(refit=True)
+        if mode == "custom":
+            QSettings().setValue(self._ASPECT_RATIO_KEY, ratio)
+
+    def _reset_view_to_default(self) -> None:
+        """Bare LMB double-click handler: snap the aspect to the per-mode
+        **Default** preset. ``set_aspect`` refits, so this also restores the
+        zoom to the full extent (replacing the old plain reset-zoom)."""
+        self.set_aspect("default")
+
+    def _restore_aspect_from_settings(self) -> None:
+        """Seed the toolbar widgets in ``__init__``. The mode starts at
+        **Default** (the per-mode preset); only the last Custom ratio is
+        remembered so re-entering Custom is sensible."""
+        s = QSettings()
+        try:
+            ratio = float(s.value(self._ASPECT_RATIO_KEY, 1.0))
+        except (TypeError, ValueError):
+            ratio = 1.0
+        if not (self._ASPECT_RATIO_MIN <= ratio <= self._ASPECT_RATIO_MAX):
+            ratio = 1.0
+        with QSignalBlocker(self._aspect_combo), QSignalBlocker(self._aspect_spin):
+            self._aspect_combo.setCurrentText("Default")
+            self._aspect_spin.setValue(ratio)
+            self._aspect_spin.setEnabled(False)
+        self._apply_aspect(refit=False)
+
+    def _install_axis_wheel_handler(self) -> None:
+        """Route single-axis (axis-region) wheels through our handler.
+
+        pyqtgraph forwards an axis-region wheel as
+        ``viewbox.wheelEvent(ev, axis=0|1)`` (see ``AxisItem.wheelEvent``);
+        a centre-of-image wheel reaches the ViewBox through Qt's C++ vtable
+        and is untouched here (it zooms both axes, honouring any lock).
+        """
+        vb = self._plot.getViewBox()
+        vb.wheelEvent = self._axis_wheel_event  # bound method; see docstring
+
+    def _axis_wheel_event(self, ev, axis=None) -> None:
+        """Scrolling over a single axis adjusts the aspect ratio and
+        switches the control to **Custom**, seeded with the live shown
+        ratio so the view continues smoothly. x widens (ratio up), y
+        heightens (ratio down); the spin tracks it live."""
+        vb = self._plot.getViewBox()
+        if axis in (0, 1):
+            base = self._live_box_ratio()
+            if base is None:
+                _, base = self.aspect()
+            try:
+                s = 1.02 ** (ev.delta() * vb.state["wheelScaleFactor"])
+            except Exception:
+                s = 1.0
+            new_ratio = base / s if axis == 0 else base * s
+            new_ratio = min(self._ASPECT_RATIO_MAX, max(self._ASPECT_RATIO_MIN, new_ratio))
+            with QSignalBlocker(self._aspect_combo), QSignalBlocker(self._aspect_spin):
+                self._aspect_combo.setCurrentText("Custom")
+                self._aspect_spin.setValue(new_ratio)
+                self._aspect_spin.setEnabled(True)
+            self._apply_aspect(refit=False)   # restretch around current view
+            QSettings().setValue(self._ASPECT_RATIO_KEY, new_ratio)
+            ev.accept()
+            return
+        # Centre wheel routed here (axis is None): default both-axis zoom.
+        pg.ViewBox.wheelEvent(vb, ev, axis)
 
     def _install_reset_zoom_action(self) -> None:
         vb = self._plot.getViewBox()
@@ -2164,6 +2449,9 @@ class GIWAXSImageViewer(QWidget):
             if self._raw_image_stack is None:
                 return
             self._display_params = self._build_raw_params()
+            # Re-derive the aspect lock for this mode's extents before the
+            # render's autoRange so the locked shape is honoured.
+            self._apply_aspect(refit=False)
             self._render_frame(self._frame_index, auto_range=auto_range)
             # No overlays in raw mode — nothing to render past _render_frame.
             return
@@ -2186,6 +2474,10 @@ class GIWAXSImageViewer(QWidget):
             self._display_params = self._build_polar_params()
         else:
             self._display_params = self._build_cartesian_params()
+        # Re-derive the aspect lock for this mode's extents before the
+        # render's autoRange so the locked shape is honoured (the same
+        # ratio means the same on-screen shape in Cartesian and polar).
+        self._apply_aspect(refit=False)
         self._render_frame(self._frame_index, auto_range=auto_range)
         self._render_overlays(self.current_frame)
 

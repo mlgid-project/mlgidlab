@@ -88,3 +88,54 @@ def test_reset_does_not_hang_and_clears(
     main_window._action_reset_analysis(scope)
 
     assert _n_detected(path, "entry_0000", 0) == 0
+
+
+def test_clear_dialogs_default_to_yes(
+    main_window, synthetic_nexus_with_peaks, monkeypatch
+):
+    """The Clear-peaks / Reset-all confirmations default to Yes, so a
+    single Enter confirms. Captures the ``defaultButton`` passed to
+    ``QMessageBox.question`` (signature: parent, title, text, buttons,
+    defaultButton) and returns Cancel so the action no-ops after."""
+    _open(main_window, synthetic_nexus_with_peaks)
+    captured: list = []
+
+    def _rec(*a, **k):
+        captured.append(a[4] if len(a) > 4 else k.get("defaultButton"))
+        return QMessageBox.StandardButton.Cancel
+
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(_rec))
+
+    main_window._action_reset_analysis("all")     # Reset all peaks
+    main_window._confirm_clear("detected", "")     # Clear detected
+
+    assert captured == [
+        QMessageBox.StandardButton.Yes,
+        QMessageBox.StandardButton.Yes,
+    ]
+
+
+def test_delete_dialog_defaults_to_yes(
+    main_window, synthetic_nexus_with_peaks, monkeypatch
+):
+    """The peak-delete confirmation defaults to Yes too (one Enter
+    confirms). Drives ``_delete_peaks_scoped`` with a detected selection
+    on frame 0 and returns Cancel so nothing is actually removed."""
+    from mlgidlab.image_viewer import SelectedPeak
+
+    _open(main_window, synthetic_nexus_with_peaks)
+    captured: list = []
+
+    def _rec(*a, **k):
+        captured.append(a[4] if len(a) > 4 else k.get("defaultButton"))
+        return QMessageBox.StandardButton.Cancel
+
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(_rec))
+
+    sel = SelectedPeak(
+        kind="detected", frame=0, peak_id=0,
+        radius=1.0, angle=10.0, radius_width=0.2, angle_width=5.0,
+    )
+    main_window._delete_peaks_scoped([sel], "entry_0000")
+
+    assert captured == [QMessageBox.StandardButton.Yes]

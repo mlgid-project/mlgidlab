@@ -312,7 +312,15 @@ class _MlgidHdf5TreeView(Hdf5TreeView):
     with no matching ``Session`` in our session list, and later
     queries (selection changes, pipeline detach/reattach) blow up
     against the orphan's stale h5py handle.
+
+    Emits ``deleteFileRequested`` when the user presses Delete with a
+    tree row selected, so MainWindow can close the file the selection
+    belongs to. Scoped to the tree's own ``keyPressEvent`` (fires only
+    when the browser holds focus), so it never collides with the image
+    viewer's Delete = "delete the selected peak" binding.
     """
+
+    deleteFileRequested = Signal()
 
     def createDefaultModel(self):
         model = _MlgidHdf5TreeModel(self)
@@ -320,6 +328,17 @@ class _MlgidHdf5TreeView(Hdf5TreeView):
         proxy = NexusSortFilterProxyModel(self)
         proxy.setSourceModel(model)
         return proxy
+
+    def keyPressEvent(self, ev) -> None:  # type: ignore[override]
+        if (
+            ev.key() == Qt.Key.Key_Delete
+            and self.selectionModel() is not None
+            and self.selectionModel().hasSelection()
+        ):
+            self.deleteFileRequested.emit()
+            ev.accept()
+            return
+        super().keyPressEvent(ev)
 
 
 class _ExportPeaksDialog(QDialog):
@@ -1098,7 +1117,7 @@ class MainWindow(QMainWindow):
             f"Remove every detected, fitted, matched, and manual peak "
             f"on {scope_label}?\n\nThis cannot be undone.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
@@ -1261,7 +1280,7 @@ class MainWindow(QMainWindow):
             f"Clear {title}",
             f"Remove {body}{scope_suffix}?\n\nThis cannot be undone.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes,
         )
         return reply == QMessageBox.StandardButton.Yes
 
@@ -1387,16 +1406,18 @@ class MainWindow(QMainWindow):
         """Apply ``"dark"`` or ``"light"`` immediately, then persist
         via QSettings so next launch starts the same way.
 
-        Re-runs ``apply_dark_theme`` / ``apply_light_theme`` against
-        the live QApplication, which swaps the stylesheet and pushes
-        new pyqtgraph defaults. Existing plot items are refreshed
-        opportunistically — pyqtgraph keeps a per-axis color cache
-        that doesn't always pick up the new global on its own, so
-        some widgets may need the next file open to fully re-paint.
+        Swaps the full qdarkstyle stylesheet on the live QApplication,
+        then **forces a re-polish of every widget** so the change is
+        visible right away (Qt does not reliably restyle already-built
+        widgets when the app stylesheet is replaced — without this the
+        chrome only updates on the next restart). Finally it recolours
+        the already-constructed pyqtgraph plots, whose colours are baked
+        in at creation from ``pg.setConfigOption`` and so would otherwise
+        stay on the old theme until the next render.
         """
         if theme not in ("dark", "light"):
             theme = "dark"
-        from mlgidlab.theme import apply_dark_theme, apply_light_theme
+        from mlgidlab.theme import apply_dark_theme, apply_light_theme, pg_colors
         from PySide6.QtWidgets import QApplication
         app = QApplication.instance()
         if app is not None:
@@ -1404,6 +1425,28 @@ class MainWindow(QMainWindow):
                 apply_light_theme(app)
             else:
                 apply_dark_theme(app)
+            # Force every existing widget to re-evaluate the new stylesheet.
+            for w in app.allWidgets():
+                try:
+                    w.style().unpolish(w)
+                    w.style().polish(w)
+                    w.update()
+                except Exception:
+                    logger.debug("suppressed exception repolishing widget", exc_info=True)
+        # Recolour the live pyqtgraph plots (config options only affect
+        # newly-created items, so existing axes/backgrounds need an
+        # explicit push).
+        background, foreground = pg_colors(theme)
+        for w in (
+            getattr(self, "viewer", None),
+            getattr(self, "profile_viewer", None),
+        ):
+            fn = getattr(w, "apply_theme_colors", None)
+            if fn is not None:
+                try:
+                    fn(background, foreground)
+                except Exception:
+                    logger.debug("suppressed exception in apply_theme_colors", exc_info=True)
         self._current_theme = theme
         # Persist.
         try:
@@ -1545,7 +1588,9 @@ class MainWindow(QMainWindow):
             ("Ctrl+Z  /  Ctrl+Shift+Z (or Ctrl+Y)",
              "Undo / redo manual + geometry edits"),
             ("Ctrl+F", "Find peak by ID…"),
-            ("Delete", "Delete the selected peak"),
+            ("Delete", "Delete the selected peak (image viewer) / "
+             "remove the selected file (file browser)"),
+            ("Ctrl+W", "Close (remove) the active file from the browser"),
             ("Esc", "Dismiss an in-progress manual draw"),
             ("F1", "Show this Controls reference"),
         ]
@@ -1557,7 +1602,7 @@ class MainWindow(QMainWindow):
             ("Drag ROI edges",
              "Resize the selected manual / detected / fitted peak"),
             ("LMB double-click on the image",
-             "Reset image zoom to full extent"),
+             "Reset aspect to Default (per-mode shape) and refit the zoom"),
             ("Mouse wheel on image",
              "Zoom in / out"),
             ("Click a row in the Peaks table",
@@ -1572,6 +1617,13 @@ class MainWindow(QMainWindow):
             ("Save fitted as ring",
              "Tick before Add to fitted to widen the angular extent "
              "to the full sweep — only meaningful for ring peaks."),
+            ("Aspect (toolbar)",
+             "<b>Default</b> (startup) uses a per-mode shape (Cartesian "
+             "1:1, polar 2:1); <b>Fit</b> fills the panel; <b>Custom</b> "
+             "locks a width:height ratio (e.g. <code>2</code> = twice as "
+             "wide as tall). Scrolling over an axis switches to Custom and "
+             "adjusts the ratio live (x wider, y taller); double-click the "
+             "image to snap back to Default."),
             ("Display dock filter",
              "Type a CIF substring above the matched-structures "
              "list to hide non-matching rows + their image overlays."),
@@ -2142,6 +2194,9 @@ class MainWindow(QMainWindow):
             self._on_tree_selection_changed
         )
         self.tree.activated.connect(self._on_tree_activated)
+        # Delete (browser-focused) removes the selected file from the tree,
+        # mirroring File → Close (Ctrl+W). See _remove_selected_file_from_browser.
+        self.tree.deleteFileRequested.connect(self._remove_selected_file_from_browser)
         self._tree_dock = QDockWidget("File browser", self)
         self._tree_dock.setWidget(self.tree)
         self._tree_dock.setObjectName("FileBrowserDock")
@@ -3998,27 +4053,25 @@ class MainWindow(QMainWindow):
                 return None
         return None
 
-    def _activate_session_for_node(self, node) -> None:
-        """If ``node`` lives in a non-active session's file, swap active.
+    def _session_for_node(self, node) -> BaseSession | None:
+        """Return the session whose file ``node`` was loaded from, or None.
 
         silx normalizes paths through the OS, so a literal ``Path`` equality
         with ``session.temp_path`` can fail when one side has a symlink,
-        dotfile component, or trailing slash that the other doesn't —
-        previously this silently left the wrong session active and the
-        pipeline ran on the most recently opened file regardless of which
-        tree the user clicked. ``Path.resolve()`` collapses both sides to
-        a canonical absolute form before the comparison.
+        dotfile component, or trailing slash that the other doesn't.
+        ``Path.resolve()`` collapses both sides to a canonical absolute form
+        before the comparison.
         """
         fname = self._node_filename(node)
         if fname is None:
-            return
+            return None
         try:
             target = fname.resolve()
         except OSError:
             target = fname
         for s in self._sessions:
             # Raw sessions own multiple files in the tree; any of them
-            # should activate the same RawSession. NeXus sessions own
+            # maps back to the same RawSession. NeXus sessions own
             # exactly one file (the temp working copy).
             if isinstance(s, RawSession):
                 candidate_paths = list(s.raw_paths)
@@ -4030,9 +4083,41 @@ class MainWindow(QMainWindow):
                 except OSError:
                     candidate_resolved = candidate
                 if candidate_resolved == target:
-                    if s is not self._active_session:
-                        self._set_active_session(s)
-                    return
+                    return s
+        return None
+
+    def _activate_session_for_node(self, node) -> None:
+        """If ``node`` lives in a non-active session's file, swap active.
+
+        Previously a path mismatch silently left the wrong session active
+        and the pipeline ran on the most recently opened file regardless
+        of which tree the user clicked. ``_session_for_node`` does the
+        resolve-and-match so the swap follows the clicked tree.
+        """
+        s = self._session_for_node(node)
+        if s is not None and s is not self._active_session:
+            self._set_active_session(s)
+
+    def _remove_selected_file_from_browser(self) -> None:
+        """Close the file the current tree selection belongs to.
+
+        Wired to the file browser's Delete key (``deleteFileRequested``).
+        Resolves the selected node back to its session and routes through
+        the same discard-confirm + ``_close_session`` path as File →
+        Close (Ctrl+W), so unsaved-change handling and tree teardown are
+        identical no matter which entry point removes the file. No-ops if
+        the selection can't be mapped to a live session (e.g. a stale or
+        orphan node), mirroring how a no-active-session Close no-ops.
+        """
+        nodes = self._safe_selected_h5_nodes()
+        if not nodes:
+            return
+        session = self._session_for_node(nodes[0])
+        if session is None:
+            return
+        if not self._confirm_discard_changes(session):
+            return
+        self._close_session(session)
 
     @staticmethod
     def _node_filename(node) -> Path | None:
@@ -6431,7 +6516,7 @@ class MainWindow(QMainWindow):
                 "intact. This cannot be undone."
             ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
@@ -6529,7 +6614,7 @@ class MainWindow(QMainWindow):
             f"Delete {target}?\n\n{siblings_msg} This can be undone "
             "with Ctrl+Z.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return

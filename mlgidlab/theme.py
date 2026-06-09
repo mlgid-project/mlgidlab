@@ -1,12 +1,15 @@
 """Application-wide theming.
 
-``apply_dark_theme`` is the default — uses qdarkstyle for the Qt widget
-chrome and aligns pyqtgraph's defaults so plots blend with the rest of
-the UI. ``apply_light_theme`` is the inverse: strips the stylesheet and
-uses white/black pyqtgraph defaults so the GUI reads as a standard
-light-mode Qt app.
+Both themes apply a full qdarkstyle stylesheet — ``DarkPalette`` for
+dark, ``LightPalette`` for light — so the look is **independent of the
+host's Qt palette**. The previous light theme set an empty stylesheet
+and fell back to the OS palette, which on a dark-desktop machine left
+"light mode" looking dark. Each also pushes matching pyqtgraph
+background / foreground defaults so plots blend with the chrome.
 
-Switched at runtime by ``MainWindow._set_theme``.
+Switched at runtime by ``MainWindow._set_theme`` (which also forces a
+live re-polish and refreshes existing plot colours — config options
+below only affect *newly* created pg items).
 """
 from __future__ import annotations
 
@@ -16,45 +19,58 @@ os.environ.setdefault("PYQTGRAPH_QT_LIB", "PySide6")
 
 import pyqtgraph as pg
 import qdarkstyle
+from qdarkstyle.dark.palette import DarkPalette
+from qdarkstyle.light.palette import LightPalette
 from PySide6.QtWidgets import QApplication
 
-# Background / foreground tuned to match qdarkstyle's panel colour so plot
-# widgets sit flush with their surrounding docks.
-PG_BACKGROUND = "#19232d"
-PG_FOREGROUND = "#dfe1e2"
+# pyqtgraph background / foreground per theme. Dark matches qdarkstyle's
+# panel colour (#19232d); light matches its panel colour (#fafafa) so the
+# plots sit flush with the surrounding docks in either theme.
+PG_DARK_BACKGROUND = "#19232d"
+PG_DARK_FOREGROUND = "#dfe1e2"
+PG_LIGHT_BACKGROUND = "#fafafa"
+PG_LIGHT_FOREGROUND = "#000000"
+
+# Look-up used by the runtime switcher to recolour already-built plots.
+PG_COLORS = {
+    "dark": (PG_DARK_BACKGROUND, PG_DARK_FOREGROUND),
+    "light": (PG_LIGHT_BACKGROUND, PG_LIGHT_FOREGROUND),
+}
+
+
+def pg_colors(theme: str) -> tuple[str, str]:
+    """``(background, foreground)`` for ``"dark"`` / ``"light"``."""
+    return PG_COLORS.get(theme, PG_COLORS["dark"])
+
+
+def _apply(app: QApplication, *, palette, background: str, foreground: str) -> None:
+    pg.setConfigOption("background", background)
+    pg.setConfigOption("foreground", foreground)
+    pg.setConfigOption("antialias", True)
+    app.setStyleSheet(
+        qdarkstyle.load_stylesheet(qt_api="pyside6", palette=palette) + _OVERRIDES
+    )
 
 
 def apply_dark_theme(app: QApplication) -> None:
-    pg.setConfigOption("background", PG_BACKGROUND)
-    pg.setConfigOption("foreground", PG_FOREGROUND)
-    pg.setConfigOption("antialias", True)
-    app.setStyleSheet(qdarkstyle.load_stylesheet(qt_api="pyside6") + _OVERRIDES)
-
-
-# Light-mode pyqtgraph defaults — white background, black axes / text.
-# Matches what pyqtgraph ships out of the box; restated here so the
-# light-theme switcher can revert from the dark configuration.
-PG_LIGHT_BACKGROUND = "w"
-PG_LIGHT_FOREGROUND = "k"
+    _apply(
+        app,
+        palette=DarkPalette,
+        background=PG_DARK_BACKGROUND,
+        foreground=PG_DARK_FOREGROUND,
+    )
 
 
 def apply_light_theme(app: QApplication) -> None:
-    """Strip the qdarkstyle stylesheet + flip pyqtgraph to white.
-
-    Existing widgets reread the global QApplication stylesheet, so
-    a runtime switch is mostly seamless. pyqtgraph plots use
-    ``pg.setConfigOption`` defaults at construction time — already-
-    constructed plots keep their dark palette until the next
-    ``setImage`` / replot, which most workflows trigger naturally
-    on the next frame change or file open.
-    """
-    pg.setConfigOption("background", PG_LIGHT_BACKGROUND)
-    pg.setConfigOption("foreground", PG_LIGHT_FOREGROUND)
-    pg.setConfigOption("antialias", True)
-    # Empty stylesheet → fall back to Qt's native (light) palette.
-    # Keep ``_OVERRIDES`` since the QComboBox icon-column fix is
-    # theme-agnostic.
-    app.setStyleSheet(_OVERRIDES)
+    """Apply qdarkstyle's **LightPalette** stylesheet + light pyqtgraph
+    defaults. A real light theme, not a strip-to-OS-default fallback, so
+    it reads as light on every desktop."""
+    _apply(
+        app,
+        palette=LightPalette,
+        background=PG_LIGHT_BACKGROUND,
+        foreground=PG_LIGHT_FOREGROUND,
+    )
 
 
 # Qt's default QComboBox reserves an icon column (PM_SmallIconSize, ~16 px)

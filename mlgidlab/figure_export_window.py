@@ -2,13 +2,16 @@
 
 Non-modal QMainWindow that drives
 ``mlgidbase.mlgidBASE.plot_analysis_results`` for a live, debounced
-preview and a final PNG export. Replaces the previous pyqtgraph
-``ImageExporter``-based Tools entry; the menu wiring lives in
+preview and a final figure export (PNG raster or SVG vector — the
+format follows the chosen file extension, which mlgidbase preserves and
+matplotlib's ``savefig`` writer keys off). Replaces the previous
+pyqtgraph ``ImageExporter``-based Tools entry; the menu wiring lives in
 ``main_window._action_export_figure``.
 
-The preview pipeline writes to a temp PNG and displays it via
-``QLabel`` pixmap so what's on screen is byte-identical to what
-``Save figure`` writes (same code path through ``plot_analysis_results``).
+The preview pipeline always writes a temp PNG and displays it via
+``QLabel`` pixmap (a raster preview regardless of the save format), but
+through the same ``plot_analysis_results`` code path the export uses, so
+the preview matches what ``Save figure`` writes.
 """
 from __future__ import annotations
 
@@ -524,7 +527,7 @@ class FigureExportWindow(QMainWindow):
         form = QFormLayout()
 
         self.path_edit = QLineEdit()
-        self.path_edit.setPlaceholderText("pick a destination .png")
+        self.path_edit.setPlaceholderText("pick a destination .png or .svg")
         browse = QPushButton("Browse…")
         browse.clicked.connect(self._browse_save_path)
         path_row = QHBoxLayout()
@@ -534,9 +537,10 @@ class FigureExportWindow(QMainWindow):
 
         self.btn_save = QPushButton("Save figure")
         self.btn_save.setToolTip(
-            "Write a PNG using the current settings. Saves to the "
-            "exact path you pick; with the Matched layer on, "
-            "mlgidbase writes one PNG per solution with '_sol_NNNN' "
+            "Write the figure using the current settings. The format "
+            "follows the file extension (.png raster or .svg vector). "
+            "Saves to the exact path you pick; with the Matched layer "
+            "on, mlgidbase writes one file per solution with '_sol_NNNN' "
             "appended to the filename."
         )
         self.btn_save.clicked.connect(self._on_save)
@@ -912,12 +916,17 @@ class FigureExportWindow(QMainWindow):
 
     def _browse_save_path(self) -> None:
         start = self.path_edit.text() or str(Path.home() / "figure.png")
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save figure", start, "PNG image (*.png)",
+        path, selected = QFileDialog.getSaveFileName(
+            self, "Save figure", start,
+            "PNG image (*.png);;SVG image (*.svg)",
         )
         if path:
-            if not path.lower().endswith(".png"):
-                path += ".png"
+            # Honour an explicit .png/.svg the user typed; otherwise
+            # append the extension implied by the chosen filter.
+            # matplotlib (via mlgidbase) picks the writer from the
+            # extension, so this is all that selects raster vs vector.
+            if not path.lower().endswith((".png", ".svg")):
+                path += ".svg" if "svg" in selected.lower() else ".png"
             self.path_edit.setText(path)
 
     def _on_save(self) -> None:
@@ -925,7 +934,7 @@ class FigureExportWindow(QMainWindow):
         if not target:
             QMessageBox.information(
                 self, "Pick a path",
-                "Pick a destination .png path before saving.",
+                "Pick a destination path (.png or .svg) before saving.",
             )
             return
         # Save goes through the same detach/reattach dance as the
@@ -951,7 +960,7 @@ class FigureExportWindow(QMainWindow):
         if self._save_error is not None:
             QMessageBox.critical(
                 self, "Save failed",
-                f"Could not write PNG:\n{self._save_error}",
+                f"Could not write the figure:\n{self._save_error}",
             )
             return
         # mlgidbase appends ``_<entry>_fr_<N>`` to the path; if the
@@ -975,7 +984,7 @@ class FigureExportWindow(QMainWindow):
             # Report directory + count rather than dumping every
             # path into the status bar.
             self.statusBar().showMessage(
-                f"Wrote {len(written)} solution PNGs to {written[0].parent}",
+                f"Wrote {len(written)} solution figures to {written[0].parent}",
                 8000,
             )
         else:

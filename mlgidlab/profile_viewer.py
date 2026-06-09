@@ -245,6 +245,27 @@ class ProfileViewer(QWidget):
         self._set_fit_cache(None, None)
         self.set_selected_peak(None)
 
+    def apply_theme_colors(self, background, foreground) -> None:
+        """Recolour both profile plots' background + axes live for a theme
+        switch (pyqtgraph bakes colours in at creation, so an explicit
+        push is needed for the already-built plots)."""
+        pen = pg.mkPen(foreground)
+        for plot in (self._radial_plot, self._angular_plot):
+            try:
+                plot.setBackground(background)
+            except Exception:
+                pass
+            pi = plot.getPlotItem()
+            for name in ("left", "bottom", "right", "top"):
+                ax = pi.getAxis(name)
+                if ax is None:
+                    continue
+                try:
+                    ax.setPen(pen)
+                    ax.setTextPen(pen)
+                except Exception:
+                    pass
+
     def set_2d_preview(
         self,
         box: tuple[float, float, float, float] | None,
