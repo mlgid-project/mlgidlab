@@ -4,6 +4,74 @@ All notable changes to mlgidLAB are recorded here. Versions follow
 [PEP 440](https://peps.python.org/pep-0440/); `aN` suffixes are alpha
 pre-releases.
 
+## 0.1.0a7 — seventh alpha (2026-06-12)
+
+Feature alpha on `0.1.0a6`. Large-file and raw-file performance,
+conversion-workflow upgrades, and file-management additions. No on-disk
+schema or backend changes; the `[pipeline]` pins are unchanged.
+
+### Added
+
+- **Raw files browse from the file browser.** Clicking a detector
+  dataset (or its scan group) displays it in the image viewer, exactly
+  like NeXus `entry_*` nodes.
+- **PONI autofill.** Loading a PONI file pre-fills the Manual-override
+  fields (centerX/centerY/SDD/wavelength) with the values pygid derives
+  from it — a readout you can tweak instead of blank fields.
+- **Append-frames conversion mode.** Converted images can be added as
+  new frames of an existing entry in the output file (entry dropdown in
+  the Output section), instead of always creating a new entry.
+- **File-browser Refresh** (button + `F5`). Re-syncs open files with
+  disk: deleted originals close (kept open with a warning when they
+  have unsaved changes), files changed on disk reload when clean, and
+  conflicts are reported without touching your edits.
+
+### Changed
+
+- **Conversion panel layout.** Flip horizontally/vertically moved out
+  of Manual overrides into the Experimental-parameters form (always
+  honoured when checked); Manual overrides is now a collapsible
+  subsection whose fields are value-driven — "(unset)" reads from the
+  PONI, a set value overrides it.
+- **Entry lists keep the file's own order** (acquisition order on
+  beamline masters) in the Display dropdown and Conversion selection
+  tree, instead of alphabetical sorting (`10.1` no longer sorts before
+  `2.1`).
+- **Switching between open files is instant.** The previous file is
+  restored from memory, on the entry you were viewing, with no
+  re-reading from disk.
+- **Re-opening an already-open file replaces the old instance** (e.g.
+  the conversion auto-open after appending to an open output file) —
+  one file, one entry in the browser. Unsaved changes still prompt.
+
+### Fixed
+
+- **Big raw files open without freezing the GUI.** Frames are read
+  lazily on demand instead of materializing the whole 3D stack; the
+  metadata walk runs off-thread with a real progress bar (scan progress
+  for raw files, MB-by-MB copy progress for converted ones), and all
+  opens — including from the Recent menu — go through the background
+  worker.
+- **LIMA/Eiger detector files are recognized as raw.** Files with
+  `entry_*`-style roots but no mlgid data layout previously
+  misclassified as NeXus and failed with "component not found".
+
+### Install
+
+```bash
+# GUI only (view + edit existing NeXus results, in-GUI pyFAI calibration)
+pip install "git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a7"
+
+# Full pipeline (adds detection / fitting / matching + raw conversion)
+pip install "mlgidlab[pipeline] @ git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a7"
+
+mlgidlab        # launch
+```
+
+The `[pipeline]` extra pins the same verified-good backend set as
+`0.1.0a1`: `mlgidbase==0.1.3`, `pygid==0.2.10`, `pygidfit==0.1.3`,
+`mlgidmatch==0.1.3`, `pygidsim==0.1.4`.
+
 ## 0.1.0a6 — sixth alpha (2026-06-09)
 
 Feature alpha on `0.1.0a5`. New image-viewer and export controls plus a
