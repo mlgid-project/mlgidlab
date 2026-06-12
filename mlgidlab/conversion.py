@@ -137,19 +137,35 @@ def execute(
         else:
             entry_counters[out_path] = _next_entry_index(out_path)
 
+    # Append-frames mode: every scan's frames extend ONE existing entry
+    # of ONE existing output file instead of landing in fresh entry_NNNN
+    # groups. pygid handles the mechanics (datasets are resizable along
+    # the frame axis; per-frame analysis groups are added for the new
+    # frames; on a frame-shape mismatch it diverts to a new sibling
+    # group with a warning rather than corrupting the stack).
+    if cfg.append_frames:
+        _validate_append_target(cfg, raw_file_outputs)
+
     for scan in scans:
         out_path = raw_file_outputs[scan.file_path]
-        idx = entry_counters[out_path]
-        entry_counters[out_path] = idx + 1
-        h5_group = _entry_group_name(idx)
+        if cfg.append_frames:
+            h5_group = cfg.append_entry
+        else:
+            idx = entry_counters[out_path]
+            entry_counters[out_path] = idx + 1
+            h5_group = _entry_group_name(idx)
 
         # ``overwrite_file`` may only fire once per output file: pygid
         # truncates the file on the first call, then the next call into
         # the same path must append into a fresh group. Track first-touch
-        # per output path.
+        # per output path. Append mode never overwrites anything.
         first_touch = out_path not in seen_paths
-        scan_overwrite_file = cfg.overwrite_file if first_touch else False
-        scan_overwrite_group = cfg.overwrite_dataset
+        if cfg.append_frames:
+            scan_overwrite_file = False
+            scan_overwrite_group = False
+        else:
+            scan_overwrite_file = cfg.overwrite_file if first_touch else False
+            scan_overwrite_group = cfg.overwrite_dataset
 
         analysis = pygid.Conversion(
             matrix=matrix,
@@ -185,6 +201,48 @@ def execute(
 
 
 # -------------- helpers --------------
+
+
+def _validate_append_target(
+    cfg: ConversionConfig, raw_file_outputs: dict[Path, Path]
+) -> None:
+    """Check that append-frames mode has a usable target.
+
+    Requirements: every scan resolves to ONE output file (separate-files
+    mode with multiple raw inputs is ambiguous — which file would the
+    frames extend?), that file exists, and ``cfg.append_entry`` names an
+    existing group in it. Raises ``ValueError`` with a user-readable
+    message otherwise. Pure h5py — callable without pygid (unit tests).
+    """
+    import h5py
+
+    targets = set(raw_file_outputs.values())
+    if len(targets) != 1:
+        raise ValueError(
+            "Append frames needs a single output file, but the current "
+            "output settings map the selected scans to "
+            f"{len(targets)} different files. Use 'Separate datasets in "
+            "single file' mode or select scans from one raw file."
+        )
+    target = next(iter(targets))
+    if not target.is_file():
+        raise ValueError(
+            f"Append frames: output file does not exist yet: {target}"
+        )
+    if not cfg.append_entry:
+        raise ValueError("Append frames: no target entry selected.")
+    try:
+        with h5py.File(target, "r") as f:
+            present = cfg.append_entry in f
+    except OSError as exc:
+        raise ValueError(
+            f"Append frames: could not open {target}: {exc}"
+        ) from exc
+    if not present:
+        raise ValueError(
+            f"Append frames: entry {cfg.append_entry!r} not found in "
+            f"{target.name}."
+        )
 
 
 def _entry_group_name(index: int) -> str:

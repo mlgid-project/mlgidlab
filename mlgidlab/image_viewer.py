@@ -1092,8 +1092,9 @@ class GIWAXSImageViewer(QWidget):
         self._display_params: _DisplayParams | None = None
         # Raw-mode preview state. Held separately from ``_stack`` because raw
         # detector frames have no q-axes — they're rendered in pixel
-        # coordinates and carry no overlays.
-        self._raw_image_stack: np.ndarray | None = None
+        # coordinates and carry no overlays. Either an ndarray (small
+        # stacks, tests) or a lazily-read file_model.LazyRawStack.
+        self._raw_image_stack: "np.ndarray | object | None" = None
         # Polar grid axes derived from the FrameSource. Stored as a
         # (lazy_polar_stack, radius, angle) tuple so consumers
         # (profile viewer, cursor readout) get a single-frame index
@@ -1214,7 +1215,7 @@ class GIWAXSImageViewer(QWidget):
         # ``_raw_image_stack`` belongs to a prior RawSession; clearing it
         # here ensures _render_active_mode never tries to re-render raw
         # pixel data over a NeXus stack.
-        self._raw_image_stack = None
+        self._drop_raw_stack()
         # If the previous session was raw, the mode flag is still
         # ``MODE_RAW`` even though raw rendering ignored the radios.
         # Snap back to whichever Cartesian / Polar radio is checked
@@ -1273,25 +1274,51 @@ class GIWAXSImageViewer(QWidget):
                 label.setVisible(visible)
                 break
 
-    def show_raw_stack(self, arr_3d: np.ndarray) -> None:
+    def show_raw_stack(self, arr_3d) -> None:
         """Render a raw detector stack in pixel coordinates.
 
         Used only for raw-mode (pre-conversion) preview. Wipes any prior
         NeXus-mode state — overlays, peaks, undo history — because none
         of it applies to a raw detector frame. The viewer's frame slider
         and timeline still drive frame navigation across the stack.
+
+        Accepts an ndarray (small stacks, tests) or a
+        ``file_model.LazyRawStack`` (the GUI's path — frames are read on
+        demand, so a tens-of-GB beamtime stack never gets materialized;
+        only ndarrays are copied contiguous here, a lazy stack would be
+        materialized by ``ascontiguousarray``).
         """
-        if arr_3d.ndim != 3:
+        if getattr(arr_3d, "ndim", None) != 3:
             raise ValueError(
-                f"show_raw_stack expects a 3D (N, H, W) array, got shape {arr_3d.shape}"
+                f"show_raw_stack expects a 3D (N, H, W) array, "
+                f"got shape {getattr(arr_3d, 'shape', None)}"
             )
         # Drop NeXus-mode state (peaks / matched / undo / cached polar).
         # ``clear()`` already covers everything except the raw-stack field
-        # itself.
+        # itself (and releases any prior lazy raw stack's handle).
         self.clear()
         self._mode = MODE_RAW
-        self._raw_image_stack = np.ascontiguousarray(arr_3d)
+        if isinstance(arr_3d, np.ndarray):
+            arr_3d = np.ascontiguousarray(arr_3d)
+        self._raw_image_stack = arr_3d
         self._render_active_mode()
+
+    def _drop_raw_stack(self) -> None:
+        """Forget the raw stack, closing a lazy stack's h5py handle.
+
+        ndarray stacks have nothing to release; ``LazyRawStack`` holds a
+        read handle on the raw file that must close before the session
+        is dropped (Windows can't delete an open file; on any OS a
+        leaked handle pins the LRU frames in memory).
+        """
+        stack = self._raw_image_stack
+        self._raw_image_stack = None
+        release = getattr(stack, "release", None)
+        if release is not None:
+            try:
+                release()
+            except Exception:
+                logger.debug("suppressed release in _drop_raw_stack", exc_info=True)
 
     def reset_zoom(self) -> None:
         """Auto-fit the viewbox to the current image."""
@@ -1759,7 +1786,7 @@ class GIWAXSImageViewer(QWidget):
             self._frame_source.release()
             self._frame_source = None
         self._stack = None
-        self._raw_image_stack = None
+        self._drop_raw_stack()
         self._polar_cache = None
         self._display_params = None
         self._user_levels = None

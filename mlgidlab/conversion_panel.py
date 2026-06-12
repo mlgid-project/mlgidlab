@@ -24,7 +24,6 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
-    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -43,7 +42,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from mlgidlab.file_model import RawEntry
+from mlgidlab.file_model import RawEntry, list_entry_names
 
 import logging
 logger = logging.getLogger(__name__)
@@ -146,6 +145,77 @@ class ConversionConfig:
     output_filename: str = ""
     overwrite_file: bool = True
     overwrite_dataset: bool = False
+    # Append mode: instead of creating a new entry_NNNN, append the
+    # converted frames to ``append_entry`` (an existing entry group) of
+    # the existing output file. Implies no file/group overwrite.
+    append_frames: bool = False
+    append_entry: str = ""
+
+
+def parse_poni_overrides(path: Path) -> dict[str, float]:
+    """Parse a pyFAI ``.poni`` file into override-field values.
+
+    Returns a subset of ``{"SDD", "wavelength", "centerX", "centerY"}``
+    in the panel's units (SDD in m, wavelength in Å, centers in px) —
+    whatever the file allows to be derived. The math mirrors
+    ``pygid.ExpParams`` exactly (``read_from_dict`` + ``_calc_center_``,
+    rotation-aware, single square ``px_size`` from ``pixel1``), so the
+    pre-filled values equal what pygid would compute internally from the
+    same PONI — sending them back as overrides is a no-op until edited.
+
+    Pure text parsing — no pyFAI/pygid import (their import chains take
+    seconds and the pipeline extra may be absent). Pixel size comes from
+    a ``pixel1`` / ``pixelsize1`` key or the ``Detector_config`` JSON;
+    a named detector without explicit pixel size yields only SDD +
+    wavelength. Raises ``OSError`` if the file can't be read; malformed
+    values just drop the affected outputs.
+    """
+    import json
+    import math
+
+    data: dict[str, str] = {}
+    with open(path) as f:
+        for line in f:
+            if line.startswith("#") or ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            data[key.strip().lower()] = value.strip()
+
+    def _float(key: str) -> float | None:
+        if key not in data:
+            return None
+        try:
+            return float(data[key])
+        except ValueError:
+            return None
+
+    out: dict[str, float] = {}
+    sdd = _float("distance")
+    if sdd is None:
+        sdd = _float("dist")
+    if sdd is not None:
+        out["SDD"] = sdd
+    wl = _float("wavelength")
+    if wl is not None:
+        out["wavelength"] = wl * 1e10  # m → Å (pygid's internal unit)
+
+    px = _float("pixel1")
+    if px is None:
+        px = _float("pixelsize1")
+    if px is None and "detector_config" in data:
+        try:
+            px = float(json.loads(data["detector_config"]).get("pixel1"))
+        except (ValueError, TypeError):
+            px = None
+    poni1, poni2 = _float("poni1"), _float("poni2")
+    rot1 = _float("rot1") or 0.0
+    rot2 = _float("rot2") or 0.0
+    if None not in (sdd, poni1, poni2, px) and px > 0:
+        # pygid.ExpParams._calc_center_ (no flips at this stage — flips
+        # are applied by pygid later, on top of these values).
+        out["centerY"] = (sdd * math.tan(rot2) / math.cos(rot1) + poni1) / px
+        out["centerX"] = (-sdd * math.tan(rot1) + poni2) / px
+    return out
 
 
 class _CollapsibleSection(QWidget):
@@ -474,6 +544,9 @@ class ConversionPanel(QWidget):
             self.poni_path, poni_browse, poni_create, poni_clear,
         ))
         self.poni_path.textChanged.connect(self._refresh_runnable)
+        # A hand-typed path autofills the override fields on focus-out /
+        # Enter; the Browse / Create flows call the autofill directly.
+        self.poni_path.editingFinished.connect(self._autofill_overrides_from_poni)
 
         self.mask_path = QLineEdit()
         self.mask_path.setPlaceholderText("Optional .npy / .tif / .edf mask")
@@ -506,31 +579,45 @@ class ConversionPanel(QWidget):
         self.ai_input.setSuffix(" °")
         form.addRow("Angle of incidence:", self.ai_input)
 
+        # Detector-orientation flips. These live in the main form (not the
+        # Manual-overrides subsection) because they're routine per-beamline
+        # settings used on most conversions; they're always honoured when
+        # checked.
+        self.flip_lr = QCheckBox("Flip horizontally (fliplr)")
+        self.flip_ud = QCheckBox("Flip vertically (flipud)")
+        flips = QHBoxLayout()
+        flips.setContentsMargins(0, 0, 0, 0)
+        flips.addWidget(self.flip_lr)
+        flips.addWidget(self.flip_ud)
+        flips.addStretch(1)
+        flips_widget = QWidget()
+        flips_widget.setLayout(flips)
+        form.addRow("Orientation:", flips_widget)
+
         section.body_layout.addLayout(form)
 
-        # Manual override fields. Hidden behind a small toggle to keep the
-        # default form compact; pygid reads everything from the PONI file
-        # if these stay blank.
-        self._override_box = QGroupBox("Manual overrides")
-        self._override_box.setCheckable(True)
-        self._override_box.setChecked(False)
-        ovl = _make_form(self._override_box)
-        ovl.setContentsMargins(8, 8, 8, 8)
+        # Manual override fields, in their own collapsible subsection to
+        # keep the default form compact. Value-driven: any field left at
+        # "(unset)" is simply not sent, so pygid reads it from the PONI
+        # file; a set field overrides the PONI. Loading a PONI pre-fills
+        # these with the values pygid would derive from it (see
+        # ``_autofill_overrides_from_poni``), so they double as a readout
+        # the user can tweak.
+        override_section = _CollapsibleSection("Manual overrides", expanded=False)
+        ovl = _make_form()
+        ovl.setContentsMargins(0, 0, 0, 0)
         self.over_centerX = _opt_spin(decimals=2, max_v=1e9)
         self.over_centerY = _opt_spin(decimals=2, max_v=1e9)
         self.over_SDD = _opt_spin(decimals=4, max_v=1e6, suffix=" m")
         self.over_wavelength = _opt_spin(decimals=6, max_v=1e3, suffix=" Å")
-        self.over_fliplr = QCheckBox("Flip horizontally (fliplr)")
-        self.over_flipud = QCheckBox("Flip vertically (flipud)")
         self.over_transp = QCheckBox("Transpose")
         ovl.addRow("centerX (px):", self.over_centerX)
         ovl.addRow("centerY (px):", self.over_centerY)
         ovl.addRow("SDD:", self.over_SDD)
         ovl.addRow("Wavelength:", self.over_wavelength)
-        ovl.addRow("", self.over_fliplr)
-        ovl.addRow("", self.over_flipud)
         ovl.addRow("", self.over_transp)
-        section.body_layout.addWidget(self._override_box)
+        override_section.body_layout.addLayout(ovl)
+        section.body_layout.addWidget(override_section)
 
         return section
 
@@ -541,6 +628,43 @@ class ConversionPanel(QWidget):
         )
         if path:
             self.poni_path.setText(path)
+            self._autofill_overrides_from_poni()
+
+    def _autofill_overrides_from_poni(self) -> None:
+        """Pre-fill the override fields with the loaded PONI's values.
+
+        The overrides exist to override the PONI, so showing the PONI's
+        own values (as pygid will derive them) gives the user a readout
+        to tweak instead of blank fields. Sending unedited values back
+        is a no-op — pygid computes the same numbers from the file.
+        Best-effort: an unreadable/foreign file leaves the fields alone.
+        """
+        text = self.poni_path.text().strip()
+        if not text:
+            return
+        path = Path(text)
+        if not path.is_file():
+            return
+        try:
+            values = parse_poni_overrides(path)
+        except Exception:
+            logger.debug("suppressed PONI parse in autofill", exc_info=True)
+            self.append_log(f"Could not parse {path.name} for override pre-fill.")
+            return
+        if not values:
+            return
+        fields = {
+            "centerX": self.over_centerX,
+            "centerY": self.over_centerY,
+            "SDD": self.over_SDD,
+            "wavelength": self.over_wavelength,
+        }
+        for key, value in values.items():
+            fields[key].setValue(value)
+        self.append_log(
+            f"Override fields pre-filled from {path.name}: "
+            + ", ".join(f"{k}={v:.6g}" for k, v in sorted(values.items()))
+        )
 
     def _browse_mask(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -625,9 +749,14 @@ class ConversionPanel(QWidget):
         # so the user can apply the freshly-saved paths without
         # closing the dialog (and can iterate — produce a second
         # PONI, click Add again, etc.).
-        dlg.applyPoniRequested.connect(self.poni_path.setText)
+        dlg.applyPoniRequested.connect(self._apply_poni_path)
         dlg.applyMaskRequested.connect(self.mask_path.setText)
         return dlg
+
+    def _apply_poni_path(self, path: str) -> None:
+        """Set the PONI path and pre-fill the override fields from it."""
+        self.poni_path.setText(path)
+        self._autofill_overrides_from_poni()
 
     def _create_poni(self) -> None:
         """Launch the calibration dialog on the Experiment task and,
@@ -641,7 +770,7 @@ class ConversionPanel(QWidget):
         if dlg is None:
             return
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.saved_poni_path is not None:
-            self.poni_path.setText(str(dlg.saved_poni_path))
+            self._apply_poni_path(str(dlg.saved_poni_path))
         if dlg.saved_mask_path is not None and not self.mask_path.text().strip():
             # Convenience: if the user happened to save a mask
             # while they were in the PONI dialog (the workflows
@@ -663,7 +792,7 @@ class ConversionPanel(QWidget):
             # Same convenience as ``_create_poni``: if they also
             # produced a PONI while in this dialog, pick it up
             # provided the field is empty.
-            self.poni_path.setText(str(dlg.saved_poni_path))
+            self._apply_poni_path(str(dlg.saved_poni_path))
 
     # ---------------- Section: Metadata ----------------
 
@@ -943,8 +1072,116 @@ class ConversionPanel(QWidget):
         flags_widget.setLayout(flags_row)
         form.addRow("Overwrite:", flags_widget)
 
+        # Append-frames mode: instead of landing in a fresh entry_NNNN,
+        # the converted frames extend an EXISTING entry's image stack
+        # (pygid resizes the dataset and adds the per-frame analysis
+        # groups). The combo lists the target file's entries and is
+        # refreshed whenever the resolved output path can change.
+        self.append_frames_chk = QCheckBox("Append frames to existing entry")
+        self.append_frames_chk.setToolTip(
+            "Add the converted image(s) as new frames of an entry that "
+            "already exists in the output file, instead of creating a "
+            "new entry. The frame shape must match the existing stack "
+            "(same q-grid); on mismatch pygid falls back to a new "
+            "sibling group and warns."
+        )
+        self.append_entry_combo = QComboBox()
+        self.append_entry_combo.setEnabled(False)
+        self.append_entry_combo.setMinimumWidth(140)
+        append_row = QHBoxLayout()
+        append_row.setContentsMargins(0, 0, 0, 0)
+        append_row.addWidget(self.append_frames_chk)
+        append_row.addWidget(self.append_entry_combo)
+        append_row.addStretch(1)
+        append_widget = QWidget()
+        append_widget.setLayout(append_row)
+        form.addRow("Append:", append_widget)
+        self.append_frames_chk.toggled.connect(self._on_append_frames_toggled)
+        # Anything that changes which file the output resolves to must
+        # refresh the entry list. The line edits use editingFinished
+        # (focus-out / Enter), NOT textChanged: refreshing per keystroke
+        # would re-open the output HDF5 on every character — a network
+        # round-trip per key when the output directory is remote.
+        self.output_dir.editingFinished.connect(self._refresh_append_entries)
+        self.output_filename.editingFinished.connect(self._refresh_append_entries)
+        self.output_mode_combo.currentTextChanged.connect(
+            self._refresh_append_entries
+        )
+
         section.body_layout.addLayout(form)
         return section
+
+    def _on_append_frames_toggled(self, checked: bool) -> None:
+        """Append mode must not truncate: lock the overwrite boxes off
+        while it's on, and populate the target-entry combo."""
+        self.append_entry_combo.setEnabled(checked)
+        self.overwrite_file_chk.setEnabled(not checked)
+        self.overwrite_dataset_chk.setEnabled(not checked)
+        if checked:
+            self.overwrite_file_chk.setChecked(False)
+            self.overwrite_dataset_chk.setChecked(False)
+            self._refresh_append_entries()
+
+    def _resolve_append_target(self) -> Path | None:
+        """The single output file appending would target, or None.
+
+        Reuses the engine's ``_plan_output_paths`` naming rules on the
+        currently checked scans; resolvable only when every scan maps to
+        ONE output path (always true in separate-datasets mode; true in
+        separate-files mode for a single raw file).
+        """
+        out_text = self.output_dir.text().strip()
+        if not out_text:
+            return None
+        from mlgidlab import conversion  # lazy: conversion imports this module
+
+        cfg = ConversionConfig()
+        cfg.output_mode = self.output_mode_combo.currentText()
+        cfg.output_filename = self.output_filename.text().strip()
+        try:
+            scans = self._collect_scans()
+        except ValueError:
+            scans = []
+        if not scans:
+            # No selection yet — only the shared-file mode has a
+            # selection-independent target.
+            if cfg.output_mode != OUTPUT_SEPARATE_DATASETS:
+                return None
+            scans = [RawScan(file_path=Path("_"), entry="_")]
+        try:
+            outputs = conversion._plan_output_paths(
+                scans, cfg, Path(out_text).expanduser()
+            )
+        except Exception:
+            logger.debug("suppressed output-path plan in append refresh", exc_info=True)
+            return None
+        targets = set(outputs.values())
+        return targets.pop() if len(targets) == 1 else None
+
+    def _refresh_append_entries(self, *_args) -> None:
+        """Repopulate the append-target entry combo from the output file.
+
+        Cheap: ``list_entry_names`` reads only the file's top-level link
+        names. Keeps the current selection when it survives the refresh;
+        otherwise defaults to the LAST entry (the most recent one).
+        """
+        if not self.append_frames_chk.isChecked():
+            return
+        previous = self.append_entry_combo.currentText()
+        self.append_entry_combo.clear()
+        target = self._resolve_append_target()
+        if target is None or not target.is_file():
+            return
+        try:
+            names = list_entry_names(target)
+        except Exception:
+            logger.debug("suppressed entry listing in append refresh", exc_info=True)
+            return
+        self.append_entry_combo.addItems(names)
+        if previous and previous in names:
+            self.append_entry_combo.setCurrentText(previous)
+        elif names:
+            self.append_entry_combo.setCurrentIndex(len(names) - 1)
 
     def _browse_output_dir(self) -> None:
         path = QFileDialog.getExistingDirectory(
@@ -952,6 +1189,9 @@ class ConversionPanel(QWidget):
         )
         if path:
             self.output_dir.setText(path)
+            # setText does not fire editingFinished — refresh explicitly
+            # so an enabled append combo tracks the new directory.
+            self._refresh_append_entries()
 
     def _update_output_filename_placeholder(self, mode: str) -> None:
         """Adjust the filename placeholder so the user knows what blank means."""
@@ -1100,25 +1340,28 @@ class ConversionPanel(QWidget):
         ai_value = self.ai_input.value()
         cfg.ai = float(ai_value) if ai_value > 0 else None
 
-        # Manual overrides — only forwarded when the box is checked.
-        if self._override_box.isChecked():
-            overrides: dict = {}
-            for attr, key in (
-                ("over_centerX", "centerX"),
-                ("over_centerY", "centerY"),
-                ("over_SDD", "SDD"),
-                ("over_wavelength", "wavelength"),
-            ):
-                v = _spin_or_none(getattr(self, attr))
-                if v is not None:
-                    overrides[key] = v
-            if self.over_fliplr.isChecked():
-                overrides["fliplr"] = True
-            if self.over_flipud.isChecked():
-                overrides["flipud"] = True
-            if self.over_transp.isChecked():
-                overrides["transp"] = True
-            cfg.expmeta_overrides = overrides
+        # Manual overrides — value-driven: any field left at "(unset)" is
+        # skipped (pygid reads it from the PONI); a set field is forwarded
+        # and wins. The orientation flips sit OUTSIDE the override
+        # subsection (routine per-beamline settings) but travel in the
+        # same dict because pygid takes them as ExpParams kwargs too.
+        overrides: dict = {}
+        for attr, key in (
+            ("over_centerX", "centerX"),
+            ("over_centerY", "centerY"),
+            ("over_SDD", "SDD"),
+            ("over_wavelength", "wavelength"),
+        ):
+            v = _spin_or_none(getattr(self, attr))
+            if v is not None:
+                overrides[key] = v
+        if self.over_transp.isChecked():
+            overrides["transp"] = True
+        if self.flip_lr.isChecked():
+            overrides["fliplr"] = True
+        if self.flip_ud.isChecked():
+            overrides["flipud"] = True
+        cfg.expmeta_overrides = overrides
 
         # Metadata.
         cfg.smplmeta_yaml = self.smpl_yaml.toPlainText()
@@ -1139,6 +1382,19 @@ class ConversionPanel(QWidget):
         cfg.output_filename = self.output_filename.text().strip()
         cfg.overwrite_file = self.overwrite_file_chk.isChecked()
         cfg.overwrite_dataset = self.overwrite_dataset_chk.isChecked()
+        cfg.append_frames = self.append_frames_chk.isChecked()
+        cfg.append_entry = self.append_entry_combo.currentText().strip()
+        if cfg.append_frames:
+            if not cfg.append_entry:
+                raise ValueError(
+                    "Append frames is checked but no target entry is "
+                    "selected — the output file must already exist and "
+                    "contain at least one entry."
+                )
+            # Appending must never truncate, whatever the boxes said
+            # before they were locked.
+            cfg.overwrite_file = False
+            cfg.overwrite_dataset = False
 
         return cfg
 

@@ -9,6 +9,19 @@ from typing import Literal
 SessionKind = Literal["nexus", "raw"]
 
 
+def _disk_signature(path: Path) -> tuple[int, int] | None:
+    """Cheap change-detection signature: ``(mtime_ns, size)``.
+
+    None when the file is unreadable/missing — callers treat that as
+    "can't tell", not "changed".
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
 class BaseSession:
     """Common state for any opened-file session.
 
@@ -51,6 +64,34 @@ class NexusSession(BaseSession):
         super().__init__()
         self._original_path = original_path
         self.temp_path = temp_path
+        # Snapshot of the original's on-disk state at open/save time, so
+        # the file-browser Refresh can tell "changed underneath us" from
+        # "still what we copied". Updated by save()/save_as()/reload.
+        self._disk_stat = _disk_signature(original_path)
+
+    def disk_changed(self) -> bool:
+        """Whether the original changed on disk since open/save/reload.
+
+        False when the original is unreadable (deletion is detected
+        separately via ``exists()``) or when no baseline was recorded.
+        """
+        sig = _disk_signature(self._original_path)
+        return (
+            sig is not None
+            and self._disk_stat is not None
+            and sig != self._disk_stat
+        )
+
+    def reload_from_disk(self) -> None:
+        """Re-copy the original over the temp working copy.
+
+        Discards any edits in the temp copy — callers guard on
+        ``dirty``. Refreshes the disk baseline so a follow-up Refresh
+        sees the session as up to date.
+        """
+        shutil.copy2(self._original_path, self.temp_path)
+        self.dirty = False
+        self._disk_stat = _disk_signature(self._original_path)
 
     @property
     def display_path(self) -> Path:  # type: ignore[override]
@@ -61,7 +102,19 @@ class NexusSession(BaseSession):
         self._original_path = value
 
     @classmethod
-    def open(cls, original_path: Path | str) -> NexusSession:
+    def open(
+        cls,
+        original_path: Path | str,
+        progress: "callable | None" = None,
+    ) -> NexusSession:
+        """Copy ``original_path`` into a fresh temp dir and wrap it.
+
+        ``progress(bytes_done, bytes_total)`` is called as the copy
+        advances — a converted NeXus file can be several GB, so the
+        copy is the dominant open cost and the open bar shows it as
+        real byte progress. Without a callback the copy is a plain
+        ``shutil.copy2``.
+        """
         original = Path(original_path).resolve()
         if not original.is_file():
             raise FileNotFoundError(original)
@@ -69,17 +122,39 @@ class NexusSession(BaseSession):
         temp_dir = Path(tempfile.mkdtemp(prefix="mlgidlab_"))
         temp_path = temp_dir / original.name
         try:
-            shutil.copy2(original, temp_path)
+            if progress is None:
+                shutil.copy2(original, temp_path)
+            else:
+                cls._copy_with_progress(original, temp_path, progress)
         except Exception:
             shutil.rmtree(temp_dir, ignore_errors=True)
             raise
 
         return cls(original_path=original, temp_path=temp_path)
 
+    @staticmethod
+    def _copy_with_progress(
+        src: Path, dst: Path, progress, chunk_size: int = 16 * 1024 * 1024
+    ) -> None:
+        """Chunked ``copy2`` equivalent (data + stat) with a byte tick
+        per chunk."""
+        total = src.stat().st_size
+        done = 0
+        with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+            while True:
+                buf = fsrc.read(chunk_size)
+                if not buf:
+                    break
+                fdst.write(buf)
+                done += len(buf)
+                progress(done, total)
+        shutil.copystat(src, dst)
+
     def save(self) -> None:
         """Overwrite the original from the temp file."""
         shutil.copy2(self.temp_path, self._original_path)
         self.dirty = False
+        self._disk_stat = _disk_signature(self._original_path)
 
     def save_as(self, new_path: Path | str) -> None:
         """Write the temp to a new path; adopt it as the new original.
@@ -97,6 +172,7 @@ class NexusSession(BaseSession):
 
         self._original_path = new
         self.dirty = False
+        self._disk_stat = _disk_signature(new)
 
     def close(self) -> None:
         """Delete the temp file and its per-session directory. Idempotent."""

@@ -94,21 +94,290 @@ class CifParseWorker(QObject):
 
 
 class CopyWorker(QObject):
-    """Runs Session.open in a worker thread."""
+    """Classify + (for NeXus) copy + pre-warm the first entry — all off the
+    GUI thread, so the Open click is instant and the window never freezes.
 
-    finished = Signal(object, object)  # (Session | None, Exception | None)
+    The open path NEVER resolves the master's external links (doing so
+    opens every linked scan, which is slow on network storage and holds
+    the GIL, freezing the GUI even from a worker thread). Entry names come
+    from a shallow ``list_entry_names`` read of the master, and only the
+    first entry's scan is opened — for the initial frame. Only NeXus files
+    are copied + warmed; raw files are classified and reported back for the
+    GUI to bundle. ``finished`` carries one result dict::
+
+        {"path", "kind", "session", "prewarm", "entries", "error"}
+
+    where ``kind`` is ``"nexus" | "raw" | None``, ``prewarm`` is
+    ``(first_entry, FrameSource)`` or ``None``, ``entries`` is the
+    (shallow, unresolved) entry-name list the GUI fills the combo from, or
+    ``None``, and ``raw_entries`` is the ``RawEntry`` list found while
+    classifying a raw file (cached so the GUI never re-walks the file's
+    full metadata on its own thread — on a big beamtime file that walk
+    took seconds and was the raw-open freeze).
+
+    ``progress(percent, label)`` drives the determinate bottom-left bar:
+    coarse stages for the cheap steps, granular ticks for the two costs
+    that actually take time (the temp copy, in bytes; the raw metadata
+    walk, in top-level groups).
+    """
+
+    finished = Signal(object)  # the result dict above
+    progress = Signal(int, str)  # (percent 0..100, status label)
 
     def __init__(self, original_path: Path):
         super().__init__()
         self._original_path = original_path
 
     def run(self) -> None:
+        result: dict = {
+            "path": self._original_path,
+            "kind": None,
+            "session": None,
+            "prewarm": None,
+            "prewarm_overlays": None,
+            "entries": None,
+            "raw_entries": None,
+            "error": None,
+        }
         try:
-            session = Session.open(self._original_path)
-            self.finished.emit(session, None)
+            from mlgidlab import file_model  # lazy: avoid import cycle at load
+            from mlgidlab.session import NexusSession
+
+            self.progress.emit(10, "Reading file")
+            # SHALLOW listing: read only the master's entry-group link names
+            # (``keys()`` does not dereference external links). The previous
+            # version opened every linked scan here to read its ``signal``
+            # attr — seconds-to-minutes on a network share, and h5py holds
+            # the GIL across those opens, so the GUI froze even though this
+            # runs off the GUI thread. Reading just the master is ~1 ms.
+            try:
+                names = file_model.list_entry_names(self._original_path)
+            except Exception:
+                logger.debug("suppressed shallow list in CopyWorker.run", exc_info=True)
+                names = []
+
+            if names and self._entries_are_mlgid(file_model, names):
+                # Entry_* group names alone aren't enough — LIMA/Eiger
+                # detector files also use ``entry_0000``-style roots but
+                # carry no mlgid signal, and feeding them to the NeXus
+                # loader fails with "component not found"; they must fall
+                # through to the raw classifier below. The signal probe
+                # resolves at most a couple of entries (one external link
+                # each on a master, same cost as the prewarm), never all.
+                result["kind"] = "nexus"
+                result["entries"] = names
+                self.progress.emit(40, "Copying file")
+                # Copy to temp with byte progress mapped into 40..90 —
+                # a converted file can be several GB, so the copy is
+                # where the open actually spends its time.
+                session = NexusSession.open(
+                    self._original_path,
+                    progress=self._make_copy_tick(),
+                )
+                result["session"] = session
+                # Only the FIRST entry's scan is opened here (frame 0, for
+                # the initial render) — one external link, not all of them.
+                self.progress.emit(90, "Loading first entry")
+                result["prewarm"] = self._prewarm_first_entry(
+                    session, file_model, names[0]
+                )
+                # Read the first frame's peaks off-thread too (via the
+                # prewarm source's open handle), so the GUI never does an
+                # SFTP read to populate overlays on open. Over high-latency
+                # SFTP even that small read on the GUI thread froze.
+                pw = result["prewarm"]
+                if pw is not None:
+                    try:
+                        peaks, matched = pw[1].read_frame_overlays(0)
+                        result["prewarm_overlays"] = (0, peaks, matched)
+                    except Exception:
+                        logger.debug("suppressed overlay prewarm in CopyWorker", exc_info=True)
+                self.progress.emit(100, "Done")
+            else:
+                # No entry_* groups → not a NeXus master. Fall back to the
+                # raw-detector walk. On a big beamtime file this visits
+                # every group's metadata (seconds), so it ticks the bar per
+                # top-level group AND its result is kept — the GUI used to
+                # re-run the same walk on its own thread to fill the combo
+                # + Conversion panel, which was the raw-open freeze.
+                self.progress.emit(20, "Scanning for raw detector data")
+                try:
+                    raw_entries = file_model.list_raw_entries(
+                        self._original_path, progress=self._make_scan_tick()
+                    )
+                except Exception:
+                    logger.debug("suppressed raw check in CopyWorker.run", exc_info=True)
+                    raw_entries = None
+                if raw_entries:
+                    result["kind"] = "raw"
+                    result["raw_entries"] = raw_entries
+                    self.progress.emit(100, "Done")
         except Exception as exc:
             logger.debug("suppressed exception in CopyWorker.run", exc_info=True)
-            self.finished.emit(None, exc)
+            result["error"] = exc
+        self.finished.emit(result)
+
+    def _make_copy_tick(self):
+        """Byte-progress callback for the temp copy, mapped into 40..90.
+
+        Emits only when the mapped percent changes so a many-chunk copy
+        doesn't flood the queued-signal connection.
+        """
+        last = [-1]
+
+        def tick(done: int, total: int) -> None:
+            pct = 40 + int(50 * done / max(total, 1))
+            if pct != last[0]:
+                last[0] = pct
+                mb_done, mb_total = done // 2**20, total // 2**20
+                self.progress.emit(
+                    pct, f"Copying file ({mb_done} / {mb_total} MB)"
+                )
+
+        return tick
+
+    def _make_scan_tick(self):
+        """Group-progress callback for the raw-detector walk, 20..95.
+
+        Same percent-dedup as the copy tick (a file can have thousands
+        of top-level groups).
+        """
+        last = [-1]
+
+        def tick(done: int, total: int) -> None:
+            pct = 20 + int(75 * done / max(total, 1))
+            if pct != last[0]:
+                last[0] = pct
+                self.progress.emit(
+                    pct, f"Scanning raw datasets ({done}/{total})"
+                )
+
+        return tick
+
+    def _entries_are_mlgid(self, file_model, names: list) -> bool:
+        """Whether the entry_* groups carry mlgid signals (NeXus output).
+
+        Probes up to the first three entries; the first one that
+        RESOLVES decides ("mlgid" → nexus, "foreign" layout → not).
+        Extra probes only run for unreadable entries (broken external
+        link), so a healthy file costs exactly one entry resolve. When
+        nothing is readable (master with its scans offline) the entry_*
+        names are trusted — the file still opens as nexus with its
+        entry list, and individual loads fail gracefully later.
+        """
+        for name in names[:3]:
+            verdict = file_model.classify_entry_data(self._original_path, name)
+            if verdict == "mlgid":
+                return True
+            if verdict == "foreign":
+                return False
+        return True
+
+    @staticmethod
+    def _prewarm_first_entry(session, file_model, first):
+        """Open ``first`` entry's FrameSource and pull frame 0 (+ its polar
+        resample, the default view) into its LRU — the slow read, done here
+        so the GUI installs the file instantly. Best-effort: returns None on
+        any failure (the GUI then falls back to a synchronous load)."""
+        try:
+            source = file_model.FrameSource(file_path=session.temp_path, entry=first)
+            source.acquire()
+            source.get_cartesian(0)
+            try:
+                source.get_polar(0)
+            except Exception:
+                logger.debug("suppressed polar prewarm in CopyWorker", exc_info=True)
+            return (first, source)
+        except Exception:
+            logger.debug("suppressed prewarm in CopyWorker", exc_info=True)
+            return None
+
+
+class EntryLoadWorker(QObject):
+    """Open + warm an entry's first frame off the GUI thread.
+
+    Switching entries on a master that links external scans means opening
+    that entry's (possibly remote) scan and reading a full detector frame
+    — seconds on a slow share, which froze the GUI when it ran inline on
+    every combo / file-browser click. This does that read on a worker
+    thread and hands the GUI a ready ``FrameSource`` (frame 0 cartesian +
+    polar already in its LRU), exactly like ``CopyWorker``'s prewarm; the
+    GUI installs it with ``file_model.stack_from_source`` without any
+    further disk I/O.
+
+    Persistent (one long-lived thread, driven by a queued ``load`` slot)
+    so rapid switching doesn't churn threads. Each request carries a
+    monotonic ``request_id``; the GUI ignores (and releases) results whose
+    id is stale, so only the latest switch renders.
+    """
+
+    # request_id, entry, FrameSource | None, overlays | None
+    # overlays = (frame, peaks_dict, matched_list) for the landed frame.
+    loaded = Signal(int, str, object, object)
+    # request_id, combo label, LazyRawStack | None — raw-mode counterpart
+    # of ``loaded`` (raw stacks have no overlays / polar view).
+    raw_loaded = Signal(int, str, object)
+
+    @Slot(str, str, int)
+    def load(self, file_path: str, entry: str, request_id: int) -> None:
+        from mlgidlab import file_model  # lazy: avoid import cycle at load
+
+        source = None
+        overlays = None
+        try:
+            source = file_model.FrameSource(file_path=Path(file_path), entry=entry)
+            source.acquire()
+            source.get_cartesian(0)
+            try:
+                source.get_polar(0)
+            except Exception:
+                logger.debug("suppressed polar warm in EntryLoadWorker", exc_info=True)
+            # Read frame 0's peaks here too (same open handle), so the GUI
+            # does ZERO SFTP I/O when it installs the entry — the peak read
+            # on the GUI thread was the residual per-switch freeze on a
+            # high-latency SFTP mount.
+            try:
+                peaks, matched = source.read_frame_overlays(0)
+                overlays = (0, peaks, matched)
+            except Exception:
+                logger.debug("suppressed overlay read in EntryLoadWorker", exc_info=True)
+        except Exception:
+            logger.debug("suppressed read in EntryLoadWorker.load", exc_info=True)
+            if source is not None:
+                try:
+                    source.release()
+                except Exception:
+                    logger.debug("suppressed release in EntryLoadWorker", exc_info=True)
+            source = None
+            overlays = None
+        self.loaded.emit(request_id, entry, source, overlays)
+
+    @Slot(object, int)
+    def load_raw(self, raw_entry, request_id: int) -> None:
+        """Open one raw detector dataset and warm its first frame.
+
+        Raw counterpart of ``load``: hands the GUI a ready
+        ``LazyRawStack`` (frame 0 already in its LRU) so a raw entry
+        click renders without any GUI-thread disk I/O — the eager
+        full-stack ``load_raw_dataset`` this replaces froze the window
+        for the duration of a whole-dataset read.
+        """
+        from mlgidlab import file_model  # lazy: avoid import cycle at load
+
+        stack = None
+        try:
+            stack = file_model.LazyRawStack(raw_entry)
+            stack.acquire()
+            stack.get_frame(0)
+        except Exception:
+            logger.debug("suppressed read in EntryLoadWorker.load_raw", exc_info=True)
+            if stack is not None:
+                try:
+                    stack.release()
+                except Exception:
+                    logger.debug("suppressed release in EntryLoadWorker.load_raw", exc_info=True)
+            stack = None
+        self.raw_loaded.emit(request_id, raw_entry.label, stack)
 
 
 class _SignalLogHandler(logging.Handler):

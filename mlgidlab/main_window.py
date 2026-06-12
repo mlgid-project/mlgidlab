@@ -11,6 +11,7 @@ import numpy as np
 from PySide6.QtCore import (
     QCoreApplication,
     QEvent,
+    QEventLoop,
     QMetaObject,
     QSettings,
     QSignalBlocker,
@@ -52,6 +53,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QFrame,
     QPlainTextEdit,
+    QProgressBar,
     QProgressDialog,
     QRadioButton,
     QDoubleSpinBox,
@@ -94,6 +96,7 @@ from mlgidlab.workers import (
     CifParseWorker,
     ConversionWorker,
     CopyWorker,
+    EntryLoadWorker,
     PipelineWorker,
     PrefetchWorker,
 )
@@ -576,6 +579,15 @@ class MainWindow(QMainWindow):
     _prefetchConfigure = Signal(str, str, int, int)
     _prefetchUpdate = Signal(int, bool, int)
     _prefetchRelease = Signal()
+    # Queued request to the persistent EntryLoadWorker: (file_path, entry,
+    # request_id). The worker opens + warms that entry's first frame off
+    # the GUI thread and emits ``loaded`` back; stale request_ids (rapid
+    # switching) are dropped on arrival. See ``_load_entry_async``.
+    _entryLoadRequest = Signal(str, str, int)
+    # Raw-mode counterpart: (RawEntry, request_id) → ``raw_loaded`` with a
+    # ready LazyRawStack. Shares the same request-id counter so raw and
+    # NeXus switches supersede each other. See ``_load_raw_entry_into_viewer``.
+    _rawLoadRequest = Signal(object, int)
 
     def __init__(self) -> None:
         super().__init__()
@@ -588,11 +600,39 @@ class MainWindow(QMainWindow):
         # Opens run serially through the existing single-thread CopyWorker
         # plumbing; extra paths from a multi-select dialog wait here.
         self._open_queue: list[Path] = []
+        # Classification is now done in the worker (off the GUI thread), so
+        # raw files and unclassifiable files are reported back as each
+        # worker finishes and collected here; the batch is finalized when
+        # the queue drains (raw files bundle into one RawSession).
+        self._pending_raw_paths: list[Path] = []
+        self._pending_rejected: list[Path] = []
+        # RawEntry lists CopyWorker found while classifying, keyed by
+        # str(path). Handed to the RawSession in ``_finalize_open_batch``
+        # so ``_populate_raw_entries`` never re-walks the file's metadata
+        # on the GUI thread (the walk takes seconds on a big beamtime
+        # file and was the raw-open freeze).
+        self._pending_raw_entry_cache: dict[str, list] = {}
         self._thread: QThread | None = None
         self._worker: CopyWorker | None = None
-        self._progress: QProgressDialog | None = None
         self._pipe_thread: QThread | None = None
         self._pipe_worker: PipelineWorker | None = None
+        # pygid normalization is lazy (deferred off the open path). This
+        # records which (temp-file, entry) pairs have already been
+        # normalized so ``_ensure_entry_normalized`` runs the scoped
+        # ``normalize_for_pygid`` at most once per entry. Keyed by the
+        # temp_path string (matches the file_path snapshotted into the
+        # pipeline queue); pruned in ``_close_session``.
+        self._normalized_entries: dict[str, set[str]] = {}
+        # Lazy per-frame peak loading (see ``_load_frame_peaks``). Peaks
+        # for a frame are pulled into the viewer the first time that frame
+        # is shown, not all up front. Reset on each entry (re)load.
+        self._loaded_peaks_entry: str | None = None
+        self._loaded_peak_frames: set[int] = set()
+        # A tree node clicked while the Data tab was hidden, held until the
+        # user switches to that tab (see ``_set_or_defer_data_node``). This
+        # keeps a single Image-tab click from eagerly resolving a huge
+        # external-linked dataset into a widget the user can't see.
+        self._pending_data_node = None
         # Tools → Export figure window. Built lazily on first open
         # (see ``_action_export_figure``); kept alive across re-opens
         # so settings persist. None until the user invokes Tools →
@@ -636,6 +676,15 @@ class MainWindow(QMainWindow):
         # signals on the class for the cross-thread wiring.
         self._prefetch_thread: QThread | None = None
         self._prefetch_worker: PrefetchWorker | None = None
+
+        # Persistent EntryLoadWorker: opens + warms an entry's first frame
+        # off the GUI thread so switching entries (combo or file browser)
+        # never blocks on a slow network read. Lazily spawned on the first
+        # interactive switch. ``_entry_req_id`` is bumped per switch so a
+        # late result from a superseded switch is dropped, not rendered.
+        self._entry_load_thread: QThread | None = None
+        self._entry_load_worker: EntryLoadWorker | None = None
+        self._entry_req_id: int = 0
 
         # Frame step per play-tick. Stays at 1 unless the requested
         # per-frame interval drops below ``PLAYBACK_TICK_FLOOR_MS``,
@@ -2078,21 +2127,23 @@ class MainWindow(QMainWindow):
         self._refresh_recent_files_menu()
 
     def _refresh_recent_files_menu(self) -> None:
-        """Rebuild the submenu, dropping entries whose files have moved."""
+        """Rebuild the submenu from the persisted list.
+
+        Existence is intentionally NOT checked here: this runs on the
+        menu's ``aboutToShow`` (GUI thread), and ``Path.exists()`` over a
+        slow / network share froze the window just opening the submenu. A
+        file that has since moved is handled when the user clicks it
+        (``_open_recent`` warns + prunes), so stale rows cost nothing
+        until then.
+        """
         self._recent_menu.clear()
         items = self._load_recent_files()
-        # Filter to existing files and rewrite the persisted list
-        # if any are missing — keeps the user from being surprised
-        # by stale entries reappearing the next session.
-        present = [i for i in items if Path(i["path"]).exists()]
-        if len(present) != len(items):
-            self._save_recent_files(present)
-        if not present:
+        if not items:
             empty = QAction("(no recent files)", self)
             empty.setEnabled(False)
             self._recent_menu.addAction(empty)
             return
-        for entry in present:
+        for entry in items:
             path = entry["path"]
             kind = entry["type"]
             basename = Path(path).name
@@ -2119,12 +2170,21 @@ class MainWindow(QMainWindow):
     def _open_recent(self, path: str, kind: str) -> None:
         """Open a file from the Recent-files submenu.
 
-        Routes by recorded ``kind`` (``"nexus"`` or ``"raw"``) so we
-        don't depend on extension sniffing. Drops the entry from the
-        list if the file has gone missing since it was recorded.
+        ``kind`` is the recorded classification — kept for the menu
+        labels, but the open itself goes through the same worker queue
+        for both kinds (the worker re-classifies by content). Drops the
+        entry from the list if the file has gone missing since it was
+        recorded.
         """
         p = Path(path)
+        # Show the indicator BEFORE the existence stat. On an SFTP mount the
+        # recent file may be on slow/cold storage, so ``p.exists()`` (a
+        # network round-trip) and the load that follows can briefly freeze
+        # the window; painting the indicator first means the click visibly
+        # registers instead of looking like nothing happened.
+        self._show_open_progress(p.name)
         if not p.exists():
+            self._dismiss_open_progress()
             QMessageBox.warning(
                 self,
                 "Recent files",
@@ -2135,25 +2195,15 @@ class MainWindow(QMainWindow):
             self._save_recent_files(items)
             self._refresh_recent_files_menu()
             return
-        if kind == "nexus":
-            self._open_queue.append(p)
-            self._process_open_queue()
-            return
-        # Raw mode — synchronous open through RawSession; same shape
-        # as the unified _open_paths raw branch but without the
-        # classification step (kind was recorded with the recent
-        # entry, so we already know).
-        try:
-            session = RawSession.open([p])
-        except Exception as exc:
-            QMessageBox.critical(self, "Open failed", str(exc))
-            return
-        model = self.tree.findHdf5TreeModel()
-        for raw_path in session.raw_paths:
-            model.insertFile(str(raw_path))
-        self._sessions.append(session)
-        self._set_active_session(session)
-        self._refresh_tree_raw_paths()
+        # Both kinds route through the CopyWorker queue. Raw recents used
+        # to take a synchronous shortcut here (RawSession.open + insertFile
+        # + activate inline) — on a big beamtime file that froze the whole
+        # window for the metadata walk and the first full-stack read. The
+        # worker re-classifies (cheap relative to the work it moves off
+        # this thread) and its raw-entry walk doubles as the combo /
+        # Conversion-panel listing, so nothing is scanned twice.
+        self._open_queue.append(p)
+        self._process_open_queue()
 
     def _build_central(self) -> None:
         self.viewer = GIWAXSImageViewer(self)
@@ -2173,6 +2223,9 @@ class MainWindow(QMainWindow):
         )
         self.tabs.addTab(self.viewer, "Image")
         self.tabs.addTab(self.data_viewer, "Data")
+        # Render a deferred (clicked-while-hidden) tree node when the user
+        # switches to the Data tab — see ``_set_or_defer_data_node``.
+        self.tabs.currentChanged.connect(self._on_main_tab_changed)
         self.setCentralWidget(self.tabs)
 
     def _build_docks(self) -> None:
@@ -2188,7 +2241,19 @@ class MainWindow(QMainWindow):
         # Left: HDF5 tree (silx) — subclass swaps the root icon for raw
         # sessions so NeXus and raw files are distinguishable at a glance.
         self.tree = _MlgidHdf5TreeView(self)
-        self.tree.setSortingEnabled(True)
+        # Sorting is DISABLED on purpose. silx's NexusSortFilterProxyModel
+        # sorts the NAME column by resolving each node — ``lessThan`` calls
+        # ``__isNXentry`` (reads ``node.obj.attrs['NX_class']``) and
+        # ``childDatasetLessThan(..., 'start_time')``, both of which
+        # DEREFERENCE the external link. Expanding a master that links 226
+        # external scans therefore opened all 226 scans on the GUI thread
+        # (h5py holds the GIL across those network opens) — the freeze that
+        # made the file browser unusable and entry clicks unresponsive.
+        # With sorting off, ``lessThan`` is never called, so only the rows
+        # actually scrolled into view resolve (for their icon), lazily.
+        # Entries show in the file's native order (acquisition order for the
+        # track_order pygid masters this targets).
+        self.tree.setSortingEnabled(False)
         # Single-click silently updates Data tab; double-click jumps to it.
         self.tree.selectionModel().selectionChanged.connect(
             self._on_tree_selection_changed
@@ -2197,10 +2262,37 @@ class MainWindow(QMainWindow):
         # Delete (browser-focused) removes the selected file from the tree,
         # mirroring File → Close (Ctrl+W). See _remove_selected_file_from_browser.
         self.tree.deleteFileRequested.connect(self._remove_selected_file_from_browser)
+        # Small header row above the tree with the manual Refresh action:
+        # re-sync every open session with the filesystem (close deleted
+        # originals, reload changed ones). Also on F5.
+        self._tree_refresh_btn = QToolButton()
+        self._tree_refresh_btn.setText("⟳ Refresh")
+        self._tree_refresh_btn.setAutoRaise(True)
+        self._tree_refresh_btn.setToolTip(
+            "Re-check every open file on disk (F5): close files whose "
+            "original was deleted (unsaved changes are kept open), "
+            "reload files that changed on disk (unless they have "
+            "unsaved changes)."
+        )
+        self._tree_refresh_btn.clicked.connect(self._refresh_file_tree)
+        tree_header = QHBoxLayout()
+        tree_header.setContentsMargins(2, 2, 2, 0)
+        tree_header.addWidget(self._tree_refresh_btn)
+        tree_header.addStretch(1)
+        tree_box = QWidget(self)
+        tree_box_layout = QVBoxLayout(tree_box)
+        tree_box_layout.setContentsMargins(0, 0, 0, 0)
+        tree_box_layout.setSpacing(0)
+        tree_box_layout.addLayout(tree_header)
+        tree_box_layout.addWidget(self.tree)
         self._tree_dock = QDockWidget("File browser", self)
-        self._tree_dock.setWidget(self.tree)
+        self._tree_dock.setWidget(tree_box)
         self._tree_dock.setObjectName("FileBrowserDock")
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self._tree_dock)
+        refresh_action = QAction("Refresh file browser", self)
+        refresh_action.setShortcut(QKeySequence("F5"))
+        refresh_action.triggered.connect(self._refresh_file_tree)
+        self.addAction(refresh_action)
 
         # Right: entry selector + overlay toggles
         panel = QWidget(self)
@@ -2794,75 +2886,31 @@ class MainWindow(QMainWindow):
             return
         self._open_paths([Path(p) for p in paths])
 
-    def _classify_h5_path(self, path: Path) -> str | None:
-        """Return ``"nexus"``, ``"raw"``, or ``None`` from file content.
-
-        NeXus is detected by the presence of at least one entry whose
-        ``data`` group has ``signal == "img_gid_q"`` (the same filter
-        used everywhere else in the GUI). Raw detection falls back to
-        any 3D detector-shaped dataset. Both readers swallow their
-        exceptions so a non-HDF5 file or a permissions error returns
-        ``None`` rather than crashing the open.
-        """
-        try:
-            if file_model.list_entries(path):
-                return "nexus"
-        except Exception:
-            logger.debug("suppressed exception in MainWindow._classify_h5_path", exc_info=True)
-            pass
-        try:
-            if file_model.list_raw_entries(path):
-                return "raw"
-        except Exception:
-            logger.debug("suppressed exception in MainWindow._classify_h5_path", exc_info=True)
-            pass
-        return None
-
     def _open_paths(self, paths: list[Path]) -> None:
-        """Open a mixed batch of NeXus + raw files, auto-classifying each.
+        """Open a mixed batch of NeXus + raw files, classifying each in the
+        background.
 
-        Used by both the unified File → Open action and the drag-and-drop
-        handler. NeXus paths queue through the existing copy worker;
-        raw paths are bundled into one ``RawSession`` so the Conversion
-        panel can apply one config to the whole batch.
+        The Open click is instant: existing paths are queued and the
+        worker is started immediately (with the bottom-left loading bar).
+        Each ``CopyWorker`` classifies its file off the GUI thread and, for
+        NeXus, copies + pre-warms it. NeXus files install as they finish;
+        raw and unclassifiable files are collected and handled once the
+        queue drains (``_finalize_open_batch`` — raw bundles into one
+        ``RawSession`` so the Conversion panel applies one config to the
+        batch). Used by both File → Open and the drag-and-drop handler.
         """
-        nexus_paths: list[Path] = []
-        raw_paths: list[Path] = []
-        rejected: list[Path] = []
+        queued = False
         for p in paths:
-            if not p.is_file():
-                rejected.append(p)
-                continue
-            kind = self._classify_h5_path(p)
-            if kind == "nexus":
-                nexus_paths.append(p)
-            elif kind == "raw":
-                raw_paths.append(p)
+            if p.is_file():
+                self._open_queue.append(p)
+                queued = True
             else:
-                rejected.append(p)
-        if rejected:
-            self.pipeline_panel.append_log(
-                "Could not classify (no q-signal entries, no raw 3D "
-                "detector datasets): "
-                + ", ".join(str(p) for p in rejected)
-            )
-        if nexus_paths:
-            self._open_queue.extend(nexus_paths)
+                self._pending_rejected.append(p)
+        if queued:
             self._process_open_queue()
-        if raw_paths:
-            try:
-                session = RawSession.open(raw_paths)
-            except Exception as exc:
-                QMessageBox.critical(self, "Open failed", str(exc))
-                return
-            model = self.tree.findHdf5TreeModel()
-            for raw_path in session.raw_paths:
-                model.insertFile(str(raw_path))
-            self._sessions.append(session)
-            self._set_active_session(session)
-            for raw_path in session.raw_paths:
-                self._add_recent_file(raw_path, "raw")
-            self._refresh_tree_raw_paths()
+        elif self._pending_rejected:
+            # Nothing to load (no worker will run) — flush the rejects now.
+            self._finalize_open_batch()
 
     def _refresh_tree_raw_paths(self) -> None:
         """Push the active set of raw filesystem paths into the tree model.
@@ -2885,30 +2933,84 @@ class MainWindow(QMainWindow):
     def _process_open_queue(self) -> None:
         """Kick off the next queued open if no copy is in flight.
 
-        When the queue is exhausted the shared progress dialog is finally
-        closed and destroyed — see the comment in ``_open_path`` for why
-        we keep one dialog spanning the batch instead of creating a fresh
-        one per file.
+        When the queue is exhausted the batch is finalized (raw files
+        bundled, rejects logged, loading bar hidden).
         """
         if self._thread is not None:
             return
         if not self._open_queue:
-            self._dismiss_open_progress()
+            self._finalize_open_batch()
             return
         self._open_path(self._open_queue.pop(0))
 
+    def _finalize_open_batch(self) -> None:
+        """Once the open queue drains: bundle any raw files into one
+        ``RawSession``, log unclassifiable files, and hide the loading bar.
+        The detector-dataset lists CopyWorker found per file ride along on
+        the session (``_raw_entries_cache``) so activation reads metadata
+        the worker already has instead of re-walking the files."""
+        if self._pending_rejected:
+            self.pipeline_panel.append_log(
+                "Could not classify (no q-signal entries, no raw 3D "
+                "detector datasets): "
+                + ", ".join(str(p) for p in self._pending_rejected)
+            )
+            self._pending_rejected = []
+        # Dismiss BEFORE bundling: raw activation dispatches an async
+        # first-entry load that re-shows the bar ("Loading <entry>…"),
+        # and ``_on_raw_entry_loaded`` dismisses it when the frame lands.
+        # Dismissing last would hide that in-flight indicator.
+        self._dismiss_open_progress()
+        if self._pending_raw_paths:
+            raw_paths = self._pending_raw_paths
+            self._pending_raw_paths = []
+            entry_cache = self._pending_raw_entry_cache
+            self._pending_raw_entry_cache = {}
+            try:
+                session = RawSession.open(raw_paths)
+            except Exception as exc:
+                QMessageBox.critical(self, "Open failed", str(exc))
+            else:
+                session._raw_entries_cache = entry_cache  # type: ignore[attr-defined]
+                model = self.tree.findHdf5TreeModel()
+                for raw_path in session.raw_paths:
+                    model.insertFile(str(raw_path))
+                self._sessions.append(session)
+                self._set_active_session(session)
+                for raw_path in session.raw_paths:
+                    self._add_recent_file(raw_path, "raw")
+                self._refresh_tree_raw_paths()
+
+    def _show_open_progress(self, name: str) -> None:
+        """Show the bottom-left open indicator and force it to paint NOW.
+
+        The synchronous ``repaint`` matters on a high-latency (SFTP) mount:
+        the file stat + worker startup that follow can briefly starve the
+        event loop, so a plain ``show()`` (which only schedules a paint for
+        the next event-loop pass) would leave the user staring at an
+        unchanged window — "no progress bar". Painting the widgets here,
+        while the GUI thread is still free, guarantees the indicator is
+        visible the instant the open is requested.
+        """
+        self._sb_open_label.setText(f"Loading {name}…")
+        self._sb_open_label.show()
+        # Indeterminate until the worker's first real tick (a prior open
+        # may have left the bar determinate at 100).
+        self._sb_open_bar.setRange(0, 0)
+        self._sb_open_bar.show()
+        # Flush layout + paint events (NOT user input — ExcludeUserInputEvents
+        # avoids re-entrancy from a stray click/key) so the just-shown
+        # widgets are laid out and drawn NOW, before the blocking stat /
+        # worker startup, rather than on the next event-loop pass.
+        QApplication.processEvents(
+            QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents
+        )
+
     def _dismiss_open_progress(self) -> None:
-        """Hide + destroy the shared open-progress dialog, if any."""
-        if self._progress is None:
-            return
-        self._progress.close()
-        # ``close()`` only hides the dialog and keeps it parented to the
-        # MainWindow as a hidden child; the WindowModal overlay state on
-        # the parent isn't fully released until the dialog is destroyed.
-        # ``deleteLater`` schedules destruction on the next event-loop
-        # turn, which is what un-dims the window.
-        self._progress.deleteLater()
-        self._progress = None
+        """Hide the bottom-left open-progress bar once the queue drains."""
+        self._sb_open_label.hide()
+        self._sb_open_bar.hide()
+        self._sb_open_label.setText("")
 
     def _action_save(self) -> None:
         self._save(confirm=True)
@@ -3000,28 +3102,44 @@ class MainWindow(QMainWindow):
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.finished.connect(self._on_open_finished)
+        # Queued (cross-thread) stage ticks update the bar's LABEL while the
+        # indeterminate bar marches; the worker phase is GUI-responsive so
+        # the march stays smooth.
+        self._worker.progress.connect(self._on_open_progress)
 
-        # One shared progress dialog spans the whole open queue. Creating
-        # a new WindowModal QProgressDialog per file (and only ``close()``-
-        # ing the previous one) used to leave the parent visibly dimmed
-        # across the entire batch — Qt re-applied the modal overlay
-        # before the previous dialog's hide had finished painting, and
-        # the parented hidden dialogs accumulated as zombie children.
-        if self._progress is None:
-            self._progress = QProgressDialog("Opening file…", "", 0, 0, self)
-            self._progress.setWindowTitle(APP_NAME)
-            self._progress.setWindowModality(Qt.WindowModality.WindowModal)
-            self._progress.setCancelButton(None)
-            self._progress.setMinimumDuration(0)
-            self._progress.show()
-        # Per-file label so the user can see which file is being copied.
-        self._progress.setLabelText(f"Opening {path.name}…")
+        # Non-modal progress: a small bar + label in the bottom-left status
+        # bar (NOT a window-modal dialog). The window stays fully usable
+        # while the file scans + copies and its first frame warms off the
+        # GUI thread; the file appears in the browser only once the load
+        # finishes (``_on_open_finished``). Replaces the old WindowModal
+        # ``QProgressDialog`` that dimmed + froze the whole window — for a
+        # huge external-link master that froze long enough to trip the OS
+        # "force quit or wait" prompt.
+        self._show_open_progress(path.name)
 
         self._thread.start()
 
-    def _on_open_finished(
-        self, session: Session | None, error: Exception | None
-    ) -> None:
+    def _on_open_progress(self, percent: int, label: str) -> None:
+        """Update the bottom-left open bar from a ``CopyWorker`` progress
+        tick (queued from the worker thread).
+
+        The bar starts indeterminate (``_show_open_progress``) and flips
+        determinate on the first worker tick — the worker reports real
+        fractions (copy bytes, raw-scan groups), so the user sees actual
+        progress instead of an endless march.
+        """
+        if label:
+            self._sb_open_label.setText(label)
+        if 0 <= percent <= 100:
+            if self._sb_open_bar.maximum() == 0:
+                self._sb_open_bar.setRange(0, 100)
+            self._sb_open_bar.setValue(percent)
+
+    def _on_open_finished(self, result: dict) -> None:
+        """Handle one ``CopyWorker`` result (classify + open done off the
+        GUI thread). NeXus files install + render now (from the warm
+        pre-load); raw and unclassifiable files are collected for
+        ``_finalize_open_batch`` when the queue drains."""
         if self._thread is not None:
             self._thread.quit()
             self._thread.wait()
@@ -3030,36 +3148,50 @@ class MainWindow(QMainWindow):
         if self._worker is not None:
             self._worker.deleteLater()
             self._worker = None
-        # Progress dialog is *not* closed per file — it spans the whole
-        # queue and is dismissed by ``_process_open_queue`` once the
-        # queue is empty. Closing here would re-trigger the modal flicker
-        # that this consolidation was meant to avoid.
+        # The loading bar spans the whole queue; it's hidden in
+        # ``_finalize_open_batch`` once the queue empties.
+
+        error = result.get("error")
+        kind = result.get("kind")
+        session = result.get("session")
+        prewarm = result.get("prewarm")
+        path = result.get("path")
 
         if error is not None:
             QMessageBox.critical(self, "Open failed", str(error))
-        elif session is not None:
-            # Patch any pygid-incompatible metadata in the temp copy
-            # (e.g. 0-D angle_of_incidence) before silx + the pipeline
-            # see it. Failure here is non-fatal — the file might still
-            # work for normal viewing even if a pipeline run later
-            # complains.
-            try:
-                patched = file_model.normalize_for_pygid(session.temp_path)
-            except Exception:
-                logger.debug("suppressed exception in MainWindow._on_open_finished", exc_info=True)
-                patched = {"angle": [], "frames": []}
-            if patched["angle"]:
-                self.pipeline_panel.append_log(
-                    "Normalized 0-D angle_of_incidence in: "
-                    + ", ".join(patched["angle"])
-                )
-            if patched["frames"]:
-                self.pipeline_panel.append_log(
-                    "Created missing per-frame analysis groups in: "
-                    + ", ".join(patched["frames"])
-                )
+            if prewarm is not None:  # opened-but-unused source would leak
+                self._release_prewarm(prewarm)
+        elif kind == "nexus" and session is not None:
+            # ``prewarm`` is ``(first_entry, FrameSource)`` warmed off the
+            # GUI thread by CopyWorker (or None). Stash it on the session so
+            # the first ``_load_entry_into_viewer`` renders from the warm
+            # handle instead of re-reading frame 0 on the GUI thread.
+            session._prewarm = prewarm  # type: ignore[attr-defined]
+            # The worker already listed the q-entries (off the GUI thread,
+            # the same external-link scan that drives the bar). Stash them
+            # so ``_populate_entries`` fills the combo without re-scanning
+            # every external scan on the GUI thread — that GUI-thread
+            # re-scan was the residual open freeze on big masters.
+            entries = result.get("entries")
+            if entries is not None:
+                session._entries_cache = entries  # type: ignore[attr-defined]
+            # First frame's peaks, read off-thread by the worker, so the
+            # initial render installs overlays without an SFTP read on the
+            # GUI thread (consumed in ``_load_entry_into_viewer``).
+            session._prewarm_overlays = result.get("prewarm_overlays")  # type: ignore[attr-defined]
+            # pygid normalization (0-D angle_of_incidence → 1-D, per-frame
+            # analysis groups) is NOT done here — it's deferred and run
+            # lazily for one entry just before its first pipeline run (see
+            # ``_ensure_entry_normalized``), so opening never touches every
+            # linked scan.
             self._sessions.append(session)
             self.tree.findHdf5TreeModel().insertFile(str(session.temp_path))
+            # Re-opening a path that's already open REPLACES the old
+            # instance: its temp copy predates the new bytes (the
+            # conversion append/overwrite-then-auto-open case), and two
+            # instances of one file only confuse. A dirty old instance
+            # gets the usual save prompt first; cancelling keeps both.
+            self._close_duplicate_sessions(session)
             # Newly-opened file becomes the active one — the user almost
             # always wants to inspect what they just opened.
             self._set_active_session(session)
@@ -3067,10 +3199,62 @@ class MainWindow(QMainWindow):
             # reopens the file at its real location next session.
             self._add_recent_file(session.original_path, "nexus")
             self._refresh_tree_raw_paths()
+            # If the pre-warm wasn't consumed (e.g. no q-entries to land
+            # on), release its handle so it doesn't leak.
+            leftover = getattr(session, "_prewarm", None)
+            if leftover is not None:
+                self._release_prewarm(leftover)
+                session._prewarm = None  # type: ignore[attr-defined]
+        elif kind == "raw" and path is not None:
+            # Bundled into one RawSession when the batch finishes. The
+            # worker already walked the file for its detector datasets —
+            # keep that list so activation never re-walks on the GUI
+            # thread (``_populate_raw_entries`` consumes it).
+            self._pending_raw_paths.append(path)
+            raw_entries = result.get("raw_entries")
+            if raw_entries is not None:
+                self._pending_raw_entry_cache[str(path)] = raw_entries
+        elif path is not None:
+            self._pending_rejected.append(path)
 
         # Keep draining the queue regardless of this open's outcome so a
         # single bad file in a batch doesn't strand the rest.
         self._process_open_queue()
+
+    def _close_duplicate_sessions(self, session: BaseSession) -> None:
+        """Close any OLDER NeXus session open on ``session``'s original path.
+
+        Re-opening a file (typically: the conversion just appended an
+        entry/frames to, or replaced, an output file that was already
+        open, and the auto-open re-opened it) must not leave two
+        instances — the old one's working copy is stale. Dirty old
+        instances get the standard save/discard/cancel prompt; on
+        cancel the old instance is kept alongside the new one.
+        """
+        try:
+            target = session.original_path.resolve()
+        except OSError:
+            return
+        for old in list(self._sessions):
+            if old is session or old.kind != "nexus":
+                continue
+            try:
+                old_path = old.display_path.resolve()
+            except OSError:
+                continue
+            if old_path != target:
+                continue
+            if not self._confirm_discard_changes(old):
+                continue  # user cancelled — keep the old instance too
+            self._close_session(old)
+
+    @staticmethod
+    def _release_prewarm(prewarm: object) -> None:
+        """Release a ``(entry, FrameSource)`` pre-warm that won't be used."""
+        try:
+            prewarm[1].release()  # type: ignore[index]
+        except Exception:
+            logger.debug("suppressed exception releasing prewarm", exc_info=True)
 
     def _close_session(self, session: BaseSession) -> None:
         """Remove ``session`` from the window: tear down its tree entry,
@@ -3085,6 +3269,14 @@ class MainWindow(QMainWindow):
         if was_active:
             self._pause_playback()
         self._sessions.remove(session)
+        # An inactive session may hold a stashed FrameSource (parked for
+        # instant re-activation) — release it before the temp dir goes.
+        stash = getattr(session, "_prewarm", None)
+        if stash is not None:
+            self._release_prewarm(stash)
+            session._prewarm = None  # type: ignore[attr-defined]
+        # Drop this file's lazy-normalization record (keyed by temp_path).
+        self._normalized_entries.pop(str(session.temp_path), None)
         # silx exposes no "remove single file" API on Hdf5TreeModel, so we
         # rebuild the tree from the remaining sessions. Cheap — sessions
         # are typically <5 and the model just re-opens HDF5 files.
@@ -3112,6 +3304,120 @@ class MainWindow(QMainWindow):
                 self._update_title()
                 self._update_actions()
 
+    def _refresh_file_tree(self) -> None:
+        """Manually re-sync every open session with the filesystem (the
+        file-browser Refresh button / F5).
+
+        Per session: a DELETED original closes the session (temp copy
+        cleaned up) unless it has unsaved changes — those stay open, with
+        a warning, so the user can Save As to rescue the edits. An
+        original that CHANGED on disk is reloaded into the temp copy when
+        the session is clean; with unsaved changes it is left untouched
+        and the conflict is reported. Raw sessions close when every one
+        of their input files is gone (partially-missing batches are
+        reported but kept). Blocked while a pipeline run is in flight —
+        reloading the active temp file under the worker would corrupt
+        the run.
+        """
+        if self._pipe_thread is not None:
+            self.statusBar().showMessage(
+                "Refresh skipped — a pipeline run is in progress.", 5000
+            )
+            return
+        closed: list[str] = []
+        reloaded: list[str] = []
+        deleted_dirty: list[str] = []
+        conflicts: list[str] = []
+        partial_raw: list[str] = []
+        for session in list(self._sessions):
+            if session.kind == "raw":
+                missing = [p for p in session.raw_paths if not p.exists()]  # type: ignore[attr-defined]
+                if missing and len(missing) == len(session.raw_paths):  # type: ignore[attr-defined]
+                    self._close_session(session)
+                    closed.append(session.display_path.name)
+                elif missing:
+                    partial_raw.extend(p.name for p in missing)
+                continue
+            original = session.display_path
+            if not original.exists():
+                if session.dirty:
+                    deleted_dirty.append(original.name)
+                else:
+                    self._close_session(session)
+                    closed.append(original.name)
+                continue
+            if session.disk_changed():  # type: ignore[attr-defined]
+                if session.dirty:
+                    conflicts.append(original.name)
+                else:
+                    self._reload_session_from_disk(session)
+                    reloaded.append(original.name)
+        parts: list[str] = []
+        if closed:
+            parts.append(f"closed (deleted on disk): {', '.join(closed)}")
+        if reloaded:
+            parts.append(f"reloaded from disk: {', '.join(reloaded)}")
+        if deleted_dirty or conflicts or partial_raw:
+            lines: list[str] = []
+            if deleted_dirty:
+                lines.append(
+                    "Deleted on disk but kept open (unsaved changes — "
+                    "use Save As to keep them):\n  "
+                    + "\n  ".join(deleted_dirty)
+                )
+            if conflicts:
+                lines.append(
+                    "Changed on disk but NOT reloaded (your unsaved "
+                    "changes were kept):\n  " + "\n  ".join(conflicts)
+                )
+            if partial_raw:
+                lines.append(
+                    "Raw inputs missing from disk (session kept open):"
+                    "\n  " + "\n  ".join(partial_raw)
+                )
+            if parts:
+                lines.append("Also: " + "; ".join(parts) + ".")
+            QMessageBox.warning(self, "Refresh", "\n\n".join(lines))
+        elif parts:
+            self.statusBar().showMessage(
+                "Refresh: " + "; ".join(parts) + ".", 8000
+            )
+        else:
+            self.statusBar().showMessage(
+                "Refresh: all files are up to date.", 5000
+            )
+
+    def _reload_session_from_disk(self, session: BaseSession) -> None:
+        """Re-copy a clean session's original over its temp working copy
+        and rebuild every cache/handle that pointed at the old bytes."""
+        assert isinstance(session, NexusSession)
+        # Parked re-activation handle (inactive sessions) targets the temp
+        # file we're about to overwrite — release before the copy.
+        stash = getattr(session, "_prewarm", None)
+        if stash is not None:
+            self._release_prewarm(stash)
+            session._prewarm = None  # type: ignore[attr-defined]
+        session._prewarm_overlays = None  # type: ignore[attr-defined]
+        session._entries_cache = None  # type: ignore[attr-defined]
+        is_active = session is self._active_session
+        if is_active:
+            self._pause_playback()
+            self._entry_req_id += 1  # drop in-flight async loads of old bytes
+            self.viewer.clear()
+            self.viewer.clear_history()
+            self.profile_viewer.clear()
+            self.peaks_table_panel.clear()
+        # The detached scope releases the silx model + viewer/prefetch
+        # handles on the temp file so the overwrite never races a reader;
+        # reattach re-inserts the files.
+        with self._detached_silx_tree():
+            session.reload_from_disk()
+        # The old normalization record described the overwritten bytes.
+        self._normalized_entries.pop(str(session.temp_path), None)
+        if is_active:
+            self._populate_entries()
+            self._update_title()
+
     def _set_active_session(self, session: BaseSession | None) -> None:
         """Make ``session`` the active one and reload viewer-side state.
 
@@ -3124,9 +3430,34 @@ class MainWindow(QMainWindow):
             return
         if self._pipe_thread is not None:
             return
+        # Invalidate any in-flight async entry load: its result targets the
+        # session we're leaving, so a late arrival must not install into the
+        # new one (``_on_entry_loaded`` drops superseded request ids).
+        self._entry_req_id += 1
         # Stop playback before swapping so the timer doesn't tick into
         # the new session's viewer state mid-construction.
         self._pause_playback()
+        # Stash the outgoing NeXus session's live FrameSource as that
+        # session's prewarm (entry name + warm handle): switching back
+        # reinstalls it from memory, with the user's entry preserved.
+        # Releasing it here (the old behaviour) made every re-activation
+        # re-open the file and re-read frame 0 + peaks on the GUI thread,
+        # which froze the window on big/remote masters. The handle is
+        # read-only and writes only ever target the ACTIVE session, so a
+        # parked handle on an inactive session's file is safe.
+        outgoing = self._active_session
+        src = self.viewer._frame_source
+        if (
+            outgoing is not None
+            and outgoing.kind == "nexus"
+            and src is not None
+            and src.is_open
+        ):
+            outgoing._prewarm = (src.entry, src)  # type: ignore[attr-defined]
+            # Overlays belong to the frame shown at stash time; the restore
+            # lands on frame 0 and reloads peaks through the open handle.
+            outgoing._prewarm_overlays = None  # type: ignore[attr-defined]
+            self.viewer._frame_source = None  # clear() must not release it
         # Tear down viewer-side state belonging to the prior active session
         # before swapping — the new session's overlays must replace, not
         # accumulate on top of, whatever was previously shown.
@@ -3270,6 +3601,10 @@ class MainWindow(QMainWindow):
         except Exception:
             logger.debug("suppressed exception in MainWindow._detach_silx_tree", exc_info=True)
             pass
+        # Drop any deferred tree node too — it belongs to the tree we're
+        # tearing down, so rendering it later would reference a stale /
+        # closed silx item.
+        self._pending_data_node = None
         self.viewer.release_frame_source()
         # Tell the background prefetch worker to drop its own h5py
         # handle too. mlgidbase opens the same file r+ in the worker
@@ -3360,21 +3695,43 @@ class MainWindow(QMainWindow):
         if self.session.kind == "raw":
             self._populate_raw_entries()
             return
-        try:
-            entries = file_model.list_entries(self.session.temp_path)
-        except Exception as exc:
-            QMessageBox.warning(self, "Read failed", f"Could not list entries: {exc}")
-            return
+        # Prefer the entry list the open worker already computed (consumed
+        # once); otherwise read the names shallowly now. Both paths use the
+        # master's link names only and never resolve the external scans —
+        # resolving them is what froze the GUI when opening a big master
+        # (it opens every linked scan and holds the GIL while doing so).
+        entries = getattr(self.session, "_entries_cache", None)
+        if entries is not None:
+            self.session._entries_cache = None  # type: ignore[attr-defined]
+        else:
+            try:
+                entries = file_model.list_entry_names(self.session.temp_path)
+            except Exception as exc:
+                QMessageBox.warning(
+                    self, "Read failed", f"Could not list entries: {exc}"
+                )
+                return
         self.entry_combo.blockSignals(True)
         self.entry_combo.clear()
         self.entry_combo.addItems(entries)
+        # Land on the prewarmed entry when one is queued: on first open
+        # that is entries[0] (CopyWorker's warm frame 0); on RE-activation
+        # it is whatever entry the user was on when they switched away —
+        # ``_set_active_session`` stashes the live FrameSource as the
+        # outgoing session's prewarm, so switching back restores their
+        # place from memory instead of re-reading the file.
+        target = entries[0] if entries else ""
+        prewarm = getattr(self.session, "_prewarm", None)
+        if prewarm is not None and prewarm[0] in entries:
+            target = prewarm[0]
+            self.entry_combo.setCurrentText(target)
         self.entry_combo.blockSignals(False)
         # Push the same entry list into the pipeline panel's per-section
         # scope dropdowns so the user can pick a specific entry instead
         # of being limited to ACTIVE / ALL.
         self.pipeline_panel.set_available_entries(entries)
         if entries:
-            self._load_entry_into_viewer(entries[0])
+            self._load_entry_into_viewer(target)
         else:
             # Empty entry combo isn't always "empty file" — it's much more
             # often "file has entries but none are 2D q-images". Tell the
@@ -3398,19 +3755,29 @@ class MainWindow(QMainWindow):
         self._raw_entries: dict[str, file_model.RawEntry] = {}
         labels: list[str] = []
         panel_inputs: list[tuple[Path, list[file_model.RawEntry]]] = []
+        # Per-file entry lists are cached on the session: CopyWorker fills
+        # the cache when the file is opened, and a GUI-thread fallback walk
+        # fills it once for sessions that arrived without one. Activation
+        # is on the GUI thread, so this must not re-walk a big beamtime
+        # file's metadata every time the user switches back to the session.
+        cache: dict[str, list] = getattr(self.session, "_raw_entries_cache", None) or {}
         for raw_path in self.session.raw_paths:
-            try:
-                entries = file_model.list_raw_entries(raw_path)
-            except Exception as exc:
-                self.conversion_panel.append_log(
-                    f"Could not read {raw_path.name}: {exc}"
-                )
-                panel_inputs.append((raw_path, []))
-                continue
+            entries = cache.get(str(raw_path))
+            if entries is None:
+                try:
+                    entries = file_model.list_raw_entries(raw_path)
+                except Exception as exc:
+                    self.conversion_panel.append_log(
+                        f"Could not read {raw_path.name}: {exc}"
+                    )
+                    panel_inputs.append((raw_path, []))
+                    continue
+                cache[str(raw_path)] = entries
             panel_inputs.append((raw_path, entries))
             for re in entries:
                 self._raw_entries[re.label] = re
                 labels.append(re.label)
+        self.session._raw_entries_cache = cache  # type: ignore[attr-defined]
         # Push the same data into the Conversion panel for its selection
         # tree. Done before populating the combo so the panel paint
         # happens once on activation.
@@ -3437,22 +3804,51 @@ class MainWindow(QMainWindow):
         """Load the picked raw entry into the viewer in pixel coords.
 
         ``label`` is the combo's display string (file::dataset/path).
-        Resolved through ``self._raw_entries`` to a ``RawEntry`` so
-        the loader can pull the right dataset.
+        Resolved through ``self._raw_entries`` to a ``RawEntry`` and
+        dispatched to the EntryLoadWorker, which opens the dataset and
+        warms frame 0 off the GUI thread (``_on_raw_entry_loaded``
+        installs the result). The old synchronous path materialized the
+        WHOLE 3D dataset on this thread — a multi-GB read that froze
+        the window for its duration on big beamtime files.
         """
         raw_entry = getattr(self, "_raw_entries", {}).get(label)
         if raw_entry is None:
             return
-        try:
-            arr = file_model.load_raw_dataset(raw_entry)
-        except Exception as exc:
-            QMessageBox.warning(
-                self, "Load failed",
-                f"Could not load {raw_entry.label}: {exc}",
-            )
+        self._entry_req_id += 1
+        self._ensure_entry_load_worker()
+        self._sb_open_label.setText(f"Loading {label}…")
+        self._sb_open_label.show()
+        self._sb_open_bar.setRange(0, 0)  # indeterminate: a single read, no stages
+        self._sb_open_bar.show()
+        self._rawLoadRequest.emit(raw_entry, self._entry_req_id)
+
+    def _on_raw_entry_loaded(self, request_id: int, label: str, stack) -> None:
+        """Install the raw stack the worker just opened, unless a newer
+        switch superseded it (then its handle is released). Mirrors
+        ``_on_entry_loaded``."""
+        if request_id != self._entry_req_id:
+            if stack is not None:
+                try:
+                    stack.release()
+                except Exception:
+                    logger.debug("suppressed stale raw-stack release", exc_info=True)
             return
-        self.viewer.show_raw_stack(arr)
+        self._dismiss_open_progress()
+        if stack is None:
+            QMessageBox.warning(self, "Load failed", f"Could not load {label}")
+            return
+        # The active session may have changed between dispatch and arrival
+        # (file closed / switched to a NeXus session) — never install an
+        # orphaned stack.
+        if self.session is None or self.session.kind != "raw":
+            try:
+                stack.release()
+            except Exception:
+                logger.debug("suppressed orphan raw-stack release", exc_info=True)
+            return
+        self.viewer.show_raw_stack(stack)
         self._refresh_frame_slider()
+        self._update_status_frame()
 
     def _warn_no_q_entries(self) -> None:
         """Diagnose why the entry combo ended up empty.
@@ -3499,10 +3895,15 @@ class MainWindow(QMainWindow):
             return
         if self.session.kind == "raw":
             self._load_raw_entry_into_viewer(entry)
+            self._update_status_entry()
+            self._update_status_frame()
         else:
-            self._load_entry_into_viewer(entry)
-        self._update_status_entry()
-        self._update_status_frame()
+            # Interactive NeXus switch (combo or file-browser click): read
+            # the entry's frame OFF the GUI thread so a big detector frame
+            # over a slow share never freezes the window. The status bar is
+            # refreshed in ``_on_entry_loaded`` once the frame is in.
+            self._load_entry_async(entry)
+            self._update_status_entry()
 
     def _on_frame_slider_changed(self, value: int) -> None:
         """User dragged the Display-dock slider — push to the viewer.
@@ -3520,6 +3921,14 @@ class MainWindow(QMainWindow):
         the new play-head into the background prefetch worker so
         its sliding window slides with the user.
         """
+        # Lazily pull this frame's peaks into the viewer (entry switch
+        # loads only the landed frame; navigating loads the rest here on
+        # demand). Runs before the peaks-table / matched-panel frame
+        # slots — they're connected after this one — so they see the
+        # freshly-installed peaks.
+        entry = self.entry_combo.currentText()
+        if entry:
+            self._load_frame_peaks(entry, int(frame))
         self.frame_label.setText(self._frame_label_text(frame))
         if self.frame_slider.value() != frame:
             self.frame_slider.blockSignals(True)
@@ -3987,7 +4396,15 @@ class MainWindow(QMainWindow):
         if not nodes:
             return
         node = nodes[0]
-        self.data_viewer.setData(node)
+        # Switch active session + entry FIRST, before touching the Data
+        # viewer. silx's ``DataViewerFrame.setData`` eagerly resolves the
+        # clicked entry's external-linked NXdata signal to pick a view —
+        # slow enough on a big multi-scan master to freeze the GUI, and
+        # because it used to run first it aborted the entry switch
+        # entirely (the file-browser click appeared to "do nothing").
+        # Doing the cheap entry switch first makes a tree click behave
+        # exactly like the Entry combo.
+        #
         # Multiple files may be loaded — clicking into a different file's
         # subtree promotes that file to the active session so the entry
         # combo, image viewer, and per-file actions follow the user's
@@ -3997,16 +4414,53 @@ class MainWindow(QMainWindow):
         # entry. The entry-combo signal already triggers the viewer
         # reload, so we just push the new value here.
         self._activate_entry_for_node(node)
+        # Feed the Data viewer only when its tab is actually visible;
+        # otherwise stash the node and render it lazily on tab switch, so
+        # a single click on the Image tab never pays the external-link
+        # resolve for a dataset the user can't even see.
+        self._set_or_defer_data_node(node)
 
     def _on_tree_activated(self, *_: object) -> None:
         nodes = self._safe_selected_h5_nodes()
         if not nodes:
             return
         node = nodes[0]
-        self.data_viewer.setData(node)
-        self.tabs.setCurrentWidget(self.data_viewer)
         self._activate_session_for_node(node)
         self._activate_entry_for_node(node)
+        # Double-click means "inspect this in the Data tab": switch to it
+        # and render now — the user explicitly asked to see the data, so
+        # the resolve cost is expected here (and only here).
+        self.tabs.setCurrentWidget(self.data_viewer)
+        self._set_data_node(node)
+
+    def _set_or_defer_data_node(self, node) -> None:
+        """Render ``node`` in the Data viewer if that tab is showing, else
+        remember it and render on the next switch to the Data tab."""
+        if self.tabs.currentWidget() is self.data_viewer:
+            self._set_data_node(node)
+        else:
+            self._pending_data_node = node
+
+    def _set_data_node(self, node) -> None:
+        """Push ``node`` into the silx Data viewer, guarded so a slow / bad
+        external-link resolve can't propagate out of a tree click."""
+        self._pending_data_node = None
+        try:
+            self.data_viewer.setData(node)
+        except Exception:
+            logger.debug(
+                "suppressed exception in MainWindow._set_data_node", exc_info=True
+            )
+
+    def _on_main_tab_changed(self, _index: int) -> None:
+        """When the user switches to the Data tab, render any node that was
+        clicked while the tab was hidden (deferred to keep Image-tab clicks
+        from paying the external-link resolve)."""
+        if (
+            self.tabs.currentWidget() is self.data_viewer
+            and self._pending_data_node is not None
+        ):
+            self._set_data_node(self._pending_data_node)
 
     def _activate_entry_for_node(self, node) -> None:
         """If the clicked node is inside an ``entry_*`` group, switch the
@@ -4017,7 +4471,15 @@ class MainWindow(QMainWindow):
         in the combo — that would mean it's a non-q entry filtered out
         by ``list_entries``, where the viewer can't render anything
         useful anyway.
+
+        Raw sessions take their own resolver: their combo holds detector-
+        dataset candidates (``file::dataset/path``), not ``entry_*``
+        groups. ``_activate_session_for_node`` ran first, so the active
+        session's kind matches the clicked file.
         """
+        if self.session is not None and self.session.kind == "raw":
+            self._activate_raw_entry_for_node(node)
+            return
         entry = self._node_entry_name(node)
         if entry is None:
             return
@@ -4027,6 +4489,68 @@ class MainWindow(QMainWindow):
             return
         # Triggers _on_entry_changed → _load_entry_into_viewer.
         self.entry_combo.setCurrentText(entry)
+
+    def _activate_raw_entry_for_node(self, node) -> None:
+        """Map a clicked tree node to a raw detector dataset and select
+        it in the entry combo — raw files browse from the file browser
+        exactly like NeXus ``entry_*`` groups (the combo change triggers
+        the async ``EntryLoadWorker.load_raw``).
+
+        A node matches a candidate when it IS the candidate's dataset or
+        an ancestor group of one (clicking a scan group like ``1.1``
+        selects the first candidate inside it, mirroring how clicking
+        anywhere inside an ``entry_*`` group selects that entry). Clicks
+        on the file root or on non-candidate nodes (axes, metadata)
+        no-op.
+        """
+        raw_entries = getattr(self, "_raw_entries", {})
+        if not raw_entries:
+            return
+        fname = self._node_filename(node)
+        rel = self._node_h5_path(node)
+        if fname is None or not rel:
+            return
+        try:
+            target = fname.resolve()
+        except OSError:
+            target = fname
+        for label, raw_entry in raw_entries.items():
+            if not (
+                raw_entry.dataset_path == rel
+                or raw_entry.dataset_path.startswith(rel + "/")
+            ):
+                continue
+            try:
+                entry_file = raw_entry.file_path.resolve()
+            except OSError:
+                entry_file = raw_entry.file_path
+            if entry_file != target:
+                continue
+            if self.entry_combo.currentText() != label:
+                # Triggers _on_entry_changed → _load_raw_entry_into_viewer.
+                self.entry_combo.setCurrentText(label)
+            return
+
+    @staticmethod
+    def _node_h5_path(node) -> str | None:
+        """The node's path inside its HDF5 file ('' for the file root).
+
+        Prefers silx's ``local_name`` (the master-side path — reading it
+        never resolves an external link); falls back to the h5py
+        object's name for silx versions without it.
+        """
+        for getter in (
+            lambda n: getattr(n, "local_name", None),
+            lambda n: n.h5py_object.name,
+        ):
+            try:
+                p = getter(node)
+            except Exception:
+                logger.debug("suppressed exception in MainWindow._node_h5_path", exc_info=True)
+                continue
+            if p:
+                return str(p).strip("/")
+        return None
 
     @staticmethod
     def _node_entry_name(node) -> str | None:
@@ -4840,6 +5364,38 @@ class MainWindow(QMainWindow):
         file_path, command = self._pipeline_queue.pop(0)
         self._on_pipeline_run(file_path, command)
 
+    def _ensure_entry_normalized(self, file_path: Path, entry: str | None) -> None:
+        """Run pygid normalization for ``entry`` once per (file, entry).
+
+        Normalization is deferred off the open path (see
+        ``_on_open_finished``); this runs it lazily, scoped to the one
+        entry a pipeline command targets. **Must be called with the silx
+        tree detached** (no read handle on ``file_path``) — it writes new
+        groups, which can't race the viewer's reads. Idempotent on repeat
+        calls; a failure is non-fatal (the pipeline surfaces its own
+        error if the file is genuinely unusable).
+        """
+        if not entry:
+            return
+        done = self._normalized_entries.setdefault(str(file_path), set())
+        if entry in done:
+            return
+        try:
+            patched = file_model.normalize_for_pygid(file_path, entry=entry)
+        except Exception:
+            logger.debug("suppressed exception in MainWindow._ensure_entry_normalized", exc_info=True)
+            patched = {"angle": [], "frames": []}
+        if patched.get("angle"):
+            self.pipeline_panel.append_log(
+                "Normalized 0-D angle_of_incidence in: " + ", ".join(patched["angle"])
+            )
+        if patched.get("frames"):
+            self.pipeline_panel.append_log(
+                "Created missing per-frame analysis groups in: "
+                + ", ".join(patched["frames"])
+            )
+        done.add(entry)
+
     def _on_pipeline_run(self, file_path: Path, command: PipelineCommand) -> None:
         if self.session is None or self._pipe_thread is not None:
             return
@@ -4875,6 +5431,12 @@ class MainWindow(QMainWindow):
         # Release silx's read handles on every loaded temp file so mlgidbase
         # can open the active one r+. Sibling files are reattached on finish.
         self._detach_silx_tree()
+
+        # Normalize this entry for pygid now — lazily, once per entry.
+        # Done here (tree detached, before the worker's r+ open) so the
+        # group-creating write can't race the viewer's reads. Replaces the
+        # old normalize-every-entry-on-open that froze huge files.
+        self._ensure_entry_normalized(file_path, command.kwargs.get("entry"))
 
         # Stash the active command so the status-bar progress mirror
         # (``_on_pipeline_frame_progress``) can rebuild the status text
@@ -6835,6 +7397,46 @@ class MainWindow(QMainWindow):
                 self.session.mark_dirty()
                 self._update_title()
 
+    def _load_frame_peaks(self, entry: str, frame: int) -> None:
+        """Load + install one frame's detected/fitted/matched peaks into
+        the viewer, at most once per frame per entry load.
+
+        Peak datasets are tiny, so loading the frame the user is actually
+        looking at on demand is cheap — far cheaper than the old
+        load-every-frame-up-front loop, which dominated entry-switch lag.
+        Reset via ``_loaded_peak_frames`` on each entry (re)load.
+        """
+        if self.session is None or frame < 0:
+            return
+        if entry != getattr(self, "_loaded_peaks_entry", None):
+            return
+        if frame in self._loaded_peak_frames:
+            return
+        # Read through the viewer's already-open FrameSource handle when it
+        # matches this entry: its master handle has the entry's external
+        # link resolved, so reading the tiny peak tables is an in-file
+        # navigation, NOT a fresh multi-second network ``h5py.File`` open.
+        # That synchronous open per frame/entry was the freeze on big
+        # external-link masters (the off-thread frame read alone wasn't
+        # enough — this peak read still ran on the GUI thread). Fall back to
+        # open-by-path only when no live handle is available.
+        src = self.viewer._frame_source
+        try:
+            if src is not None and src.is_open and src.entry == entry:
+                peaks, matched = src.read_frame_overlays(frame)
+            else:
+                peaks = file_model.load_peaks(self.session.temp_path, entry, frame)
+                matched = file_model.load_matched_peaks(
+                    self.session.temp_path, entry, frame, peaks.get("fitted")
+                )
+        except Exception:
+            logger.debug("suppressed exception in MainWindow._load_frame_peaks", exc_info=True)
+            peaks = {kind: None for kind in OVERLAY_KINDS}
+            matched = []
+        self.viewer.set_peaks(frame, peaks)
+        self.viewer.set_matched_structures(frame, matched)
+        self._loaded_peak_frames.add(frame)
+
     def _load_entry_into_viewer(
         self, entry: str, *, preserve_view: bool = False
     ) -> None:
@@ -6847,33 +7449,66 @@ class MainWindow(QMainWindow):
         viewer auto-ranges to the new axes.
         """
         assert self.session is not None
-        try:
-            stack = file_model.load_entry(self.session.temp_path, entry)
-        except Exception as exc:
-            QMessageBox.warning(self, "Load failed", f"Could not load {entry}: {exc}")
-            return
+        # Reuse a pre-warmed FrameSource (opened + frame-0 read off the GUI
+        # thread by CopyWorker) when one is queued for this entry, so the
+        # first render never blocks on a slow read. Otherwise load
+        # synchronously — the path tests and entry switches use.
+        overlays = None
+        prewarm = getattr(self.session, "_prewarm", None)
+        if prewarm is not None and prewarm[0] == entry:
+            self.session._prewarm = None  # type: ignore[attr-defined]
+            stack = file_model.stack_from_source(prewarm[1])
+            # Consume the worker-read first-frame peaks alongside the frame.
+            overlays = getattr(self.session, "_prewarm_overlays", None)
+            self.session._prewarm_overlays = None  # type: ignore[attr-defined]
+        else:
+            try:
+                stack = file_model.load_entry(self.session.temp_path, entry)
+            except Exception as exc:
+                QMessageBox.warning(self, "Load failed", f"Could not load {entry}: {exc}")
+                return
+        self._install_stack_into_viewer(
+            entry, stack, preserve_view=preserve_view, overlays=overlays
+        )
+
+    def _install_stack_into_viewer(
+        self, entry: str, stack, *, preserve_view: bool = False, overlays=None
+    ) -> None:
+        """Render an already-built ``EntryStack`` and wire up the per-entry
+        viewer state (slider, peaks, polar profile, prefetch, peaks dock).
+
+        Split out of ``_load_entry_into_viewer`` so the slow disk read (the
+        ``FrameSource`` open + frame-0 read) can be done off the GUI thread
+        — by ``CopyWorker`` (prewarm) or ``EntryLoadWorker`` (interactive
+        switch) — and only this fast, GUI-thread install runs here. The
+        viewer's ``show_stack`` releases the previous entry's FrameSource
+        before adopting the new one (image_viewer.py), so this also frees
+        the old handle.
+        """
         self.viewer.show_stack(stack, preserve_view=preserve_view)
         # Match the slider to the new stack's frame range. preserve_view
         # already restores the prior frame index inside show_stack; we
         # only need to repopulate the slider's bounds + label here.
         self._refresh_frame_slider()
-        for frame in range(stack.n_frames):
-            try:
-                peaks = file_model.load_peaks(self.session.temp_path, entry, frame)
-            except Exception:
-                logger.debug("suppressed exception in MainWindow._load_entry_into_viewer", exc_info=True)
-                peaks = {kind: None for kind in OVERLAY_KINDS}
-            self.viewer.set_peaks(frame, peaks)
-            # Matched solutions reference fitted_peaks indices — pass them in
-            # so the loader can resolve geometry without a second file read.
-            try:
-                matched = file_model.load_matched_peaks(
-                    self.session.temp_path, entry, frame, peaks.get("fitted")
-                )
-            except Exception:
-                logger.debug("suppressed exception in MainWindow._load_entry_into_viewer", exc_info=True)
-                matched = []
-            self.viewer.set_matched_structures(frame, matched)
+        # Peaks load lazily, per frame, not all up front. The old
+        # all-frames loop did N HDF5 opens per entry switch (hundreds on a
+        # many-frame entry) — a big part of the switch lag. Load only the
+        # frame the viewer landed on; other frames load on demand in
+        # ``_on_viewer_frame_changed`` via ``_load_frame_peaks``. The
+        # ``_peaks_loaded`` set is reset here so a post-pipeline reload
+        # (preserve_view=True) re-reads fresh peaks as frames are revisited.
+        self._loaded_peaks_entry = entry
+        self._loaded_peak_frames = set()
+        cur = self.viewer.current_frame
+        if overlays is not None and overlays[0] == cur:
+            # Peaks for the landed frame were read off-thread (worker) — install
+            # them directly so the GUI does no SFTP read here. Other frames
+            # still load on demand via ``_load_frame_peaks``.
+            self.viewer.set_peaks(cur, overlays[1])
+            self.viewer.set_matched_structures(cur, overlays[2])
+            self._loaded_peak_frames.add(cur)
+        else:
+            self._load_frame_peaks(entry, cur)
         # Initial panel state for whichever frame the viewer is showing now.
         self._refresh_matched_panel(
             self.viewer.current_frame,
@@ -6901,6 +7536,95 @@ class MainWindow(QMainWindow):
         # previous session — in which case no frameChanged fires and
         # the panel would otherwise keep stale rows.
         self._refresh_peaks_table()
+
+    # -- Async entry switching (off-GUI-thread frame read) --
+
+    def _ensure_entry_load_worker(self) -> None:
+        """Spawn the persistent EntryLoadWorker + thread on first use.
+
+        Idempotent; mirrors ``_ensure_prefetch_worker``. The worker reads
+        an entry's first frame off the GUI thread and hands back a ready
+        ``FrameSource`` so a switch never blocks on a slow network read.
+        """
+        if self._entry_load_worker is not None:
+            return
+        self._entry_load_thread = QThread(self)
+        self._entry_load_worker = EntryLoadWorker()
+        self._entry_load_worker.moveToThread(self._entry_load_thread)
+        self._entryLoadRequest.connect(
+            self._entry_load_worker.load, Qt.ConnectionType.QueuedConnection,
+        )
+        self._entry_load_worker.loaded.connect(
+            self._on_entry_loaded, Qt.ConnectionType.QueuedConnection,
+        )
+        # Raw-mode pair: same worker/thread, separate slot + result signal
+        # (a raw load hands back a LazyRawStack, not a FrameSource).
+        self._rawLoadRequest.connect(
+            self._entry_load_worker.load_raw, Qt.ConnectionType.QueuedConnection,
+        )
+        self._entry_load_worker.raw_loaded.connect(
+            self._on_raw_entry_loaded, Qt.ConnectionType.QueuedConnection,
+        )
+        self._entry_load_thread.start()
+
+    def _load_entry_async(self, entry: str) -> None:
+        """Switch to ``entry`` without blocking the GUI.
+
+        A pre-warm queued for this entry (the just-opened first entry) is
+        consumed synchronously — it is already in memory, so there is
+        nothing to wait for. Otherwise the read is dispatched to the
+        EntryLoadWorker and the bottom-left bar marches until it returns;
+        ``_entry_req_id`` is bumped so a superseded switch's late result is
+        dropped.
+        """
+        if self.session is None:
+            return
+        prewarm = getattr(self.session, "_prewarm", None)
+        if prewarm is not None and prewarm[0] == entry:
+            # Already warmed (open path) — install immediately, no worker.
+            self._load_entry_into_viewer(entry)
+            self._update_status_frame()
+            return
+        self._entry_req_id += 1
+        self._ensure_entry_load_worker()
+        self._sb_open_label.setText(f"Loading {entry}…")
+        self._sb_open_label.show()
+        self._sb_open_bar.setRange(0, 0)  # indeterminate: one read, no stages
+        self._sb_open_bar.show()
+        self._entryLoadRequest.emit(
+            str(self.session.temp_path), entry, self._entry_req_id,
+        )
+
+    def _on_entry_loaded(self, request_id: int, entry: str, source, overlays=None) -> None:
+        """Install the entry whose frame + peaks the worker just read, unless
+        a newer switch has superseded it (then the source is released)."""
+        if request_id != self._entry_req_id:
+            # Superseded by a later switch — drop the stale source.
+            if source is not None:
+                try:
+                    source.release()
+                except Exception:
+                    logger.debug("suppressed stale-source release", exc_info=True)
+            return
+        self._dismiss_open_progress()
+        if source is None:
+            QMessageBox.warning(self, "Load failed", f"Could not load {entry}")
+            return
+        # The active session may have changed between dispatch and arrival
+        # (file closed / switched); guard so we never install a source from
+        # a stale file. ``_set_active_session`` bumps the id, so a mismatch
+        # here means this result is orphaned.
+        if self.session is None or self.session.kind != "nexus":
+            try:
+                source.release()
+            except Exception:
+                logger.debug("suppressed orphan-source release", exc_info=True)
+            return
+        stack = file_model.stack_from_source(source)
+        self._install_stack_into_viewer(
+            entry, stack, preserve_view=False, overlays=overlays
+        )
+        self._update_status_frame()
 
     # -- UI state --
 
@@ -7232,6 +7956,28 @@ class MainWindow(QMainWindow):
         self._sb_cursor.setMinimumWidth(360)
         self.viewer.cursorMoved.connect(self._on_status_cursor_moved)
         self._status_cursor_visible = True
+        # Bottom-left, non-modal open-progress: a small busy (indeterminate)
+        # bar + a stage label, shown while a file loads in the background
+        # (copy + first frame warmed off the GUI thread by CopyWorker). The
+        # bar is indeterminate on purpose: the open no longer resolves the
+        # external links, so there is no granular per-entry progress to
+        # show — a continuously marching bar reads as "smoothly loading"
+        # during the (GUI-responsive) worker phase, whereas a determinate
+        # bar would just jump between a couple of coarse stages. The
+        # worker's ``progress`` ticks drive the LABEL ("Copying file",
+        # "Loading first entry"). Non-modal so the window stays usable; the
+        # file only appears in the browser once the load finishes
+        # (_on_open_finished). addWidget puts these on the left, before the
+        # transient showMessage text.
+        self._sb_open_label = QLabel("")
+        self._sb_open_bar = QProgressBar()
+        self._sb_open_bar.setRange(0, 0)          # indeterminate "busy" march
+        self._sb_open_bar.setMaximumWidth(110)
+        self._sb_open_bar.setTextVisible(False)
+        self._sb_open_label.hide()
+        self._sb_open_bar.hide()
+        sb.addWidget(self._sb_open_label)
+        sb.addWidget(self._sb_open_bar)
 
     def _update_status_file(self) -> None:
         if self.session is None:
@@ -7255,6 +8001,12 @@ class MainWindow(QMainWindow):
         viewer is in NeXus mode, or when the raw stack hasn't been
         populated yet — the dialog then opens with an empty image
         slot and the user can browse to a file from inside it.
+
+        Lazy stacks (``LazyRawStack``) are averaged over at most the
+        first 20 frames, read one at a time — a calibrant scan is
+        short, and materializing an arbitrary beamtime stack here
+        would re-introduce the multi-GB GUI-thread read the lazy
+        path exists to avoid.
         """
         try:
             stack = getattr(self.viewer, "_raw_image_stack", None)
@@ -7263,6 +8015,21 @@ class MainWindow(QMainWindow):
             return None
         if stack is None:
             return None
+        if not isinstance(stack, np.ndarray):
+            try:
+                n = int(stack.shape[0])
+                if n == 0:
+                    return None
+                if n == 1:
+                    return np.asarray(stack[0])
+                take = min(n, 20)
+                acc = np.zeros(stack.shape[1:], dtype=np.float64)
+                for i in range(take):
+                    acc += stack[i]
+                return acc / take
+            except Exception:
+                logger.debug("suppressed exception in MainWindow._active_raw_frame_for_calibration", exc_info=True)
+                return None
         try:
             arr = np.asarray(stack)
             if arr.ndim != 3 or arr.shape[0] == 0:
@@ -7501,7 +8268,23 @@ class MainWindow(QMainWindow):
             self._prefetch_worker = None
             self._prefetch_thread.deleteLater()
             self._prefetch_thread = None
+        # Shut the async entry-load worker down. Bump the request id first
+        # so any result still in the queue is treated as stale (its source
+        # released) rather than installed into a tearing-down viewer.
+        if self._entry_load_worker is not None:
+            self._entry_req_id += 1
+            self._entry_load_thread.quit()
+            self._entry_load_thread.wait()
+            self._entry_load_worker.deleteLater()
+            self._entry_load_worker = None
+            self._entry_load_thread.deleteLater()
+            self._entry_load_thread = None
         for s in list(self._sessions):
+            # Inactive sessions may hold a stashed (parked) FrameSource —
+            # release the handle before the temp file is deleted.
+            stash = getattr(s, "_prewarm", None)
+            if stash is not None:
+                self._release_prewarm(stash)
             s.close()
         self._sessions.clear()
         self._active_session = None

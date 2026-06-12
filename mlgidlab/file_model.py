@@ -131,9 +131,60 @@ def list_entries(file_path: Path) -> list[str]:
 
     The filter mirrors pygid's reading convention: each entry's ``data``
     group has a ``signal`` attribute naming the active image dataset.
+
+    WARNING: this resolves every entry's ``data`` group, which on a master
+    that links external scans means opening *every* linked scan file. On
+    slow / network storage that is seconds-to-minutes and holds the Python
+    GIL while it runs, so it must NOT be called on the open path — use
+    ``list_entry_names`` there. Kept for callers that genuinely need the
+    q-filter on a local / already-resolved file.
     """
     return [name for name, signal in list_entry_signals(file_path).items()
             if signal == "img_gid_q"]
+
+
+def list_entry_names(file_path: Path) -> list[str]:
+    """Return entry-group link names from the master WITHOUT resolving them.
+
+    h5py's ``keys()`` iterates a group's *links* and does not dereference
+    external links, so this reads only the (small) master file: ~1 ms even
+    for a 226-scan / 123 GB master, versus the seconds-to-minutes (and
+    GIL-held, GUI-freezing) cost of ``list_entries`` / ``list_entry_signals``,
+    which open every linked scan to read its ``signal`` attribute. This is
+    what lets the open path populate the entry combo + classify the file
+    without ever touching the linked scans on either the GUI or the worker
+    thread.
+
+    Unlike ``list_entries`` it does NOT filter to ``img_gid_q`` (that check
+    needs the link resolved); a non-renderable entry is handled gracefully
+    when it is actually selected (``_load_entry_into_viewer`` warns). For a
+    pygid master every entry is a q-image scan, so the two agree there.
+    """
+    with h5py.File(file_path, "r") as f:
+        return [name for name in f.keys() if is_entry_group_name(name)]
+
+
+def classify_h5_path(file_path: Path) -> str | None:
+    """Classify an HDF5 file by content: ``"nexus"``, ``"raw"`` or ``None``.
+
+    NeXus = at least one entry whose ``data`` group has
+    ``signal == "img_gid_q"``; raw = any 3-D detector-shaped dataset.
+    Both readers open the file, so this is called **off the GUI thread**
+    (in ``CopyWorker``) — opening a master that links many external scans
+    over slow storage is exactly what froze the open click. Exceptions are
+    swallowed so a non-HDF5 / unreadable file returns ``None``.
+    """
+    try:
+        if list_entries(file_path):
+            return "nexus"
+    except Exception:
+        logger.debug("suppressed exception in classify_h5_path (nexus)", exc_info=True)
+    try:
+        if list_raw_entries(file_path):
+            return "raw"
+    except Exception:
+        logger.debug("suppressed exception in classify_h5_path (raw)", exc_info=True)
+    return None
 
 
 def read_geometry_for_entry(
@@ -222,6 +273,51 @@ def count_frames(file_path: Path, entry: str) -> int:
         return 0
 
 
+# Signal names pygid's writer emits (datasaver key list). A file whose
+# entries carry one of these is mlgid NeXus output; an entry_* group with
+# a foreign/absent signal is some other instrument's layout (e.g. a LIMA
+# detector file's ``entry_0000/measurement/data``) and must classify as
+# RAW so the Conversion workflow gets it — feeding it to the NeXus
+# loader fails with "component not found".
+MLGID_SIGNALS = frozenset({
+    "img_gid_q", "img_q", "img_gid_pol", "img_pol",
+    "img_gid_pseudopol", "img_pseudopol",
+    "rad_cut_gid", "azim_cut_gid", "horiz_cut_gid", "vert_cut_gid",
+    "rad_cut", "azim_cut",
+})
+
+
+def classify_entry_data(file_path: Path, entry: str) -> str:
+    """Probe ONE entry's layout: ``"mlgid"``, ``"foreign"`` or
+    ``"unreadable"``.
+
+    Single-entry counterpart of ``list_entry_signals`` for the open-path
+    classifier — it resolves at most this one entry (one external link
+    on a master, the same link the prewarm opens right after), never the
+    whole file. ``"mlgid"``: the entry has a ``data`` group whose
+    ``signal`` is one pygid writes. ``"foreign"``: the entry RESOLVES
+    but doesn't have that layout (e.g. a LIMA detector file's
+    ``entry_0000/measurement/data``) — proof the file is not mlgid
+    NeXus. ``"unreadable"``: the entry itself can't be opened (broken
+    external link, offline share) — proof of nothing.
+    """
+    try:
+        with h5py.File(file_path, "r") as f:
+            try:
+                obj = f[entry]
+            except (KeyError, OSError):
+                return "unreadable"
+            data = obj.get("data") if isinstance(obj, h5py.Group) else None
+            if not isinstance(data, h5py.Group):
+                return "foreign"
+            signal = data.attrs.get("signal")
+    except OSError:
+        return "unreadable"
+    if isinstance(signal, bytes):
+        signal = signal.decode("utf-8", errors="replace")
+    return "mlgid" if signal in MLGID_SIGNALS else "foreign"
+
+
 def list_entry_signals(file_path: Path) -> dict[str, str | None]:
     """Return ``{entry_name: signal_or_None}`` for every entry_* group.
 
@@ -235,6 +331,10 @@ def list_entry_signals(file_path: Path) -> dict[str, str | None]:
     Entry combo lists scans in the order they were collected. Files
     written without ``track_order`` fall back to HDF5's default
     alphanumeric order, which matches the previous behaviour.
+
+    Like ``list_entries`` this reads each entry's ``data`` group and so
+    resolves external links — NOT for the open path (use
+    ``list_entry_names`` there); this stays for empty-file diagnostics.
     """
     out: dict[str, str | None] = {}
     with h5py.File(file_path, "r") as f:
@@ -313,9 +413,18 @@ def load_entry(file_path: Path, entry: str) -> EntryStack:
     """
     source = FrameSource(file_path=Path(file_path), entry=entry)
     source.acquire()
-    lazy = _LazyImageStack(source)
+    return stack_from_source(source)
+
+
+def stack_from_source(source: "FrameSource") -> EntryStack:
+    """Build an ``EntryStack`` around an already-``acquire``d FrameSource.
+
+    Used when the source was opened + warmed off the GUI thread (by
+    ``CopyWorker``) so the GUI reuses that open handle and warm caches
+    instead of re-opening the file. ``source`` must already be acquired.
+    """
     return EntryStack(
-        image_stack=lazy,  # type: ignore[arg-type]  # duck-types as ndarray
+        image_stack=_LazyImageStack(source),  # type: ignore[arg-type]  # duck-types as ndarray
         q_xy=source.q_xy,
         q_z=source.q_z,
     )
@@ -370,6 +479,31 @@ class FrameSource:
     @property
     def is_open(self) -> bool:
         return self._file is not None
+
+    @property
+    def entry(self) -> str:
+        return self._entry
+
+    def read_frame_overlays(
+        self, frame: int
+    ) -> tuple[dict[PeakKind, "PeakTable | None"], list["MatchedStructure"]]:
+        """Read one frame's detected/fitted/matched peaks through THIS
+        source's already-open handle.
+
+        The handle's master file already has ``entry``'s external link
+        resolved (acquire opened it for the image), so reading the tiny
+        peak tables here is an in-file navigation — no fresh ``h5py.File``
+        open, hence no multi-second network round-trip. The GUI thread uses
+        this so entry switches / frame scrubs don't block. Requires the
+        source to be open.
+        """
+        if self._file is None:
+            raise RuntimeError("FrameSource not acquired")
+        peaks = read_peaks(self._file, self._entry, frame)
+        matched = read_matched_peaks(
+            self._file, self._entry, frame, peaks.get("fitted")
+        )
+        return peaks, matched
 
     def acquire(self) -> None:
         """Open the h5py file and load axes + shape.
@@ -743,39 +877,74 @@ class RawEntry:
         return f"{self.file_path.name}::{self.dataset_path}"
 
 
-def list_raw_entries(file_path: Path) -> list[RawEntry]:
+def list_raw_entries(
+    file_path: Path,
+    progress: "callable | None" = None,
+) -> list[RawEntry]:
     """Walk a raw HDF5 file and return every 3D detector-image candidate.
 
     A dataset qualifies when it is 3D ``(N, H, W)`` with both spatial
-    dimensions ≥ ``RAW_MIN_DETECTOR_HW`` and a numeric dtype. The walker
-    recurses through every group so unusual beamline layouts work too.
-    Datasets are sorted by path for stable UI ordering.
+    dimensions ≥ ``RAW_MIN_DETECTOR_HW`` and a numeric dtype. Candidates
+    keep the FILE's own order (``keys()`` iterates in link-creation
+    order for ``track_order`` files — acquisition order on Bliss/pygid
+    masters — and in name order otherwise). Sorting alphabetically here
+    scrambled beamline scan numbering in every entry list built from
+    this walk (``10.1`` sorts before ``2.1``).
 
-    Reads only metadata (shape + dtype) — pixel data is not loaded
-    until ``load_raw_dataset`` is called for a specific entry.
+    The walk iterates the TOP-LEVEL keys explicitly (resolving each —
+    this follows soft/external links one level deep, so beamline masters
+    whose scans are external links, e.g. ESRF Bliss ``1.1``/``2.1``
+    groups, are discovered) and ``visititems`` within each resolved
+    group (``visititems`` itself never follows links). Paths are
+    composed master-side (``key/subpath``) so ``load_raw_dataset`` /
+    ``LazyRawStack`` can re-resolve them through the master file.
+    Broken links are skipped.
+
+    ``progress(done, total)`` is called after each top-level key —
+    drives the determinate open bar (a beamtime file can hold hundreds
+    of scans, so this walk is the dominant open cost and the one worth
+    showing). Reads only metadata (shape + dtype); pixel data is not
+    loaded until a frame is actually requested.
     """
     out: list[RawEntry] = []
-    with h5py.File(file_path, "r") as f:
-        def visit(_name, obj):
-            if not isinstance(obj, h5py.Dataset):
-                return
-            if obj.ndim != 3:
-                return
-            n, h, w = obj.shape
-            if h < RAW_MIN_DETECTOR_HW or w < RAW_MIN_DETECTOR_HW:
-                return
-            if obj.dtype.kind not in ("i", "u", "f"):
-                return
-            out.append(
-                RawEntry(
-                    file_path=file_path,
-                    dataset_path=obj.name.lstrip("/"),
-                    shape=(int(n), int(h), int(w)),
-                    dtype=str(obj.dtype),
-                )
+
+    def check(ds, path: str) -> None:
+        if not isinstance(ds, h5py.Dataset) or ds.ndim != 3:
+            return
+        n, h, w = ds.shape
+        if h < RAW_MIN_DETECTOR_HW or w < RAW_MIN_DETECTOR_HW:
+            return
+        if ds.dtype.kind not in ("i", "u", "f"):
+            return
+        out.append(
+            RawEntry(
+                file_path=file_path,
+                dataset_path=path,
+                shape=(int(n), int(h), int(w)),
+                dtype=str(ds.dtype),
             )
-        f.visititems(visit)
-    out.sort(key=lambda e: e.dataset_path)
+        )
+
+    with h5py.File(file_path, "r") as f:
+        keys = list(f.keys())
+        total = len(keys)
+        for done, key in enumerate(keys, start=1):
+            try:
+                obj = f[key]
+            except (KeyError, OSError):
+                logger.debug(
+                    "skipping unresolvable top-level link %r in %s",
+                    key, file_path, exc_info=True,
+                )
+                obj = None
+            if isinstance(obj, h5py.Dataset):
+                check(obj, key)
+            elif isinstance(obj, h5py.Group):
+                obj.visititems(
+                    lambda name, o, _key=key: check(o, f"{_key}/{name}")
+                )
+            if progress is not None:
+                progress(done, total)
     return out
 
 
@@ -785,6 +954,12 @@ def load_raw_dataset(entry: RawEntry) -> np.ndarray:
     Returns a contiguous float32 array; integer detector data is
     upcast so pyqtgraph's intensity scaling and the same percentile-
     based level helpers used for converted data work uniformly.
+
+    Materializes the WHOLE stack — only safe for small datasets (tests,
+    conversion previews). The viewer renders raw stacks through
+    ``LazyRawStack`` instead: a beamtime raw file can hold a stack of
+    tens of GB, and reading it all just to show frame 0 froze the GUI
+    for minutes and exhausted RAM.
     """
     with h5py.File(entry.file_path, "r") as f:
         ds = f[entry.dataset_path]
@@ -794,22 +969,164 @@ def load_raw_dataset(entry: RawEntry) -> np.ndarray:
     return np.ascontiguousarray(arr)
 
 
+class LazyRawStack:
+    """``(N, H, W)`` indexable view over one raw detector dataset.
+
+    Frames are read from disk on demand (small LRU) instead of
+    materializing the full 3D stack — the eager ``load_raw_dataset``
+    froze the GUI for the duration of a full-stack read on big raw
+    files. Mirrors ``_LazyImageStack``'s surface (``shape`` / ``ndim``
+    / ``dtype`` / ``len`` / ``stack[i]`` / ``stack[frame, r, c]``) so
+    the viewer's raw mode renders it like an ndarray; deliberately not
+    an ndarray subclass and no ``__array__`` so accidental whole-stack
+    reads fail loudly.
+
+    Owns a persistent read-only h5py handle (``acquire`` / ``release``);
+    raw inputs are never written by the GUI, so the handle can stay
+    open for the session without the silx detach/reattach dance.
+    Frames are upcast to float32 like ``load_raw_dataset`` so contrast
+    helpers behave identically.
+    """
+
+    _LRU_MAX = 8
+
+    def __init__(self, entry: RawEntry) -> None:
+        self._entry = entry
+        self._file: h5py.File | None = None
+        self._dataset: h5py.Dataset | None = None
+        self._lru: OrderedDict[int, np.ndarray] = OrderedDict()
+
+    @property
+    def entry(self) -> RawEntry:
+        return self._entry
+
+    @property
+    def is_open(self) -> bool:
+        return self._dataset is not None
+
+    def acquire(self) -> None:
+        """Open the file and resolve the dataset path. Idempotent."""
+        if self._dataset is not None:
+            return
+        self._file = h5py.File(self._entry.file_path, "r")
+        try:
+            self._dataset = self._file[self._entry.dataset_path]
+        except Exception:
+            self._file.close()
+            self._file = None
+            raise
+
+    def release(self) -> None:
+        """Close the handle and drop cached frames. Idempotent."""
+        self._dataset = None
+        if self._file is not None:
+            try:
+                self._file.close()
+            except Exception:
+                logger.debug("suppressed close in LazyRawStack.release", exc_info=True)
+            self._file = None
+        self._lru.clear()
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return self._entry.shape
+
+    @property
+    def ndim(self) -> int:
+        return 3
+
+    @property
+    def dtype(self) -> np.dtype:
+        # Frames are served upcast — report the served dtype, not the
+        # on-disk one, so level/contrast helpers see what they'll get.
+        kind = np.dtype(self._entry.dtype).kind
+        return np.dtype(np.float32) if kind in ("i", "u") else np.dtype(self._entry.dtype)
+
+    def __len__(self) -> int:
+        return self._entry.shape[0]
+
+    def get_frame(self, i: int) -> np.ndarray:
+        """One ``(H, W)`` frame, float32-upcast, LRU-cached."""
+        if self._dataset is None:
+            raise RuntimeError("LazyRawStack not acquired")
+        if i in self._lru:
+            self._lru.move_to_end(i)
+            return self._lru[i]
+        arr = np.asarray(self._dataset[i])
+        if arr.dtype.kind in ("i", "u"):
+            arr = arr.astype(np.float32, copy=False)
+        arr = np.ascontiguousarray(arr)
+        self._lru[i] = arr
+        while len(self._lru) > self._LRU_MAX:
+            self._lru.popitem(last=False)
+        return arr
+
+    def __array__(self, *args, **kwargs):
+        """Refuse whole-stack materialization, loudly.
+
+        Without this, ``np.asarray(stack)`` would silently iterate
+        ``stack[0..N-1]`` and read the entire dataset — the exact
+        full-stack read this class exists to prevent.
+        """
+        raise TypeError(
+            "LazyRawStack cannot be materialized as a full array; "
+            "read frames individually via stack[i]."
+        )
+
+    def __getitem__(self, key):
+        """``stack[i]`` → 2D frame; ``stack[frame, r, c]`` → one pixel
+        (cursor readout). Slices intentionally raise — same contract as
+        ``_LazyImageStack``."""
+        if isinstance(key, (int, np.integer)):
+            return self.get_frame(int(key))
+        if isinstance(key, tuple) and len(key) == 3:
+            frame, r, c = key
+            if (
+                isinstance(frame, (int, np.integer))
+                and isinstance(r, (int, np.integer))
+                and isinstance(c, (int, np.integer))
+            ):
+                return self.get_frame(int(frame))[int(r), int(c)]
+        raise TypeError(
+            f"LazyRawStack supports stack[i] or stack[frame, r, c] "
+            f"only; got {key!r}."
+        )
+
+
+def read_peaks(
+    f: "h5py.File | h5py.Group", entry: str, frame: int
+) -> dict[PeakKind, PeakTable | None]:
+    """Read detected/fitted peak tables for one frame from an ALREADY-OPEN
+    handle; missing tables → None.
+
+    Takes an open handle so callers that already hold one (the viewer's
+    ``FrameSource``, whose master handle has the entry's external link
+    resolved) can read the tiny peak tables without a fresh ``h5py.File``
+    open. Opening a master that links external scans costs a multi-second
+    network round-trip; navigating the already-open handle does not. The
+    GUI thread reads peaks through this path so entry switches / frame
+    scrubs never block on that open. ``load_peaks`` is the open-by-path
+    wrapper for callers without a live handle.
+    """
+    frame_key = FRAME_KEY_FMT.format(frame)
+    out: dict[PeakKind, PeakTable | None] = {"detected": None, "fitted": None}
+    group_path = f"{entry}/{ANALYSIS_REL}/{frame_key}"
+    if group_path not in f:
+        return out
+    group = f[group_path]
+    if "detected_peaks" in group:
+        out["detected"] = PeakTable.from_dataset(group["detected_peaks"])
+    if "fitted_peaks" in group:
+        out["fitted"] = PeakTable.from_dataset(group["fitted_peaks"])
+    return out
+
+
 def load_peaks(
     file_path: Path, entry: str, frame: int
 ) -> dict[PeakKind, PeakTable | None]:
-    """Read detected/fitted peak tables for one frame; missing tables → None."""
-    frame_key = FRAME_KEY_FMT.format(frame)
-    out: dict[PeakKind, PeakTable | None] = {"detected": None, "fitted": None}
+    """Open ``file_path`` and read one frame's peak tables (see ``read_peaks``)."""
     with h5py.File(file_path, "r") as f:
-        group_path = f"{entry}/{ANALYSIS_REL}/{frame_key}"
-        if group_path not in f:
-            return out
-        group = f[group_path]
-        if "detected_peaks" in group:
-            out["detected"] = PeakTable.from_dataset(group["detected_peaks"])
-        if "fitted_peaks" in group:
-            out["fitted"] = PeakTable.from_dataset(group["fitted_peaks"])
-    return out
+        return read_peaks(f, entry, frame)
 
 
 @dataclass
@@ -849,83 +1166,98 @@ class MatchedStructure:
         return f"{self.cif} {ori}  p={self.probability:.2f}"
 
 
+def read_matched_peaks(
+    f: "h5py.File | h5py.Group",
+    entry: str,
+    frame: int,
+    fitted_peaks: PeakTable | None,
+) -> list[MatchedStructure]:
+    """Read all ``matched_*`` solutions for a frame from an ALREADY-OPEN
+    handle (the handle-reusing counterpart of ``load_matched_peaks`` — see
+    ``read_peaks`` for why the open handle matters)."""
+    if fitted_peaks is None or len(fitted_peaks) == 0:
+        return []
+    frame_key = FRAME_KEY_FMT.format(frame)
+    n_fit = len(fitted_peaks)
+    out: list[MatchedStructure] = []
+    group_path = f"{entry}/{ANALYSIS_REL}/{frame_key}"
+    if group_path not in f:
+        return out
+    group = f[group_path]
+    for name in sorted(group.keys()):
+        if not name.startswith("matched_"):
+            continue
+        ds = group[name]
+        arr = ds[()]
+        for i in range(len(arr)):
+            cif_raw = arr["CIF"][i]
+            cif_str = (
+                cif_raw.decode("utf-8", errors="replace")
+                if isinstance(cif_raw, bytes)
+                else str(cif_raw)
+            )
+            # Strip the .cif extension for display.
+            if cif_str.lower().endswith(".cif"):
+                cif_str = cif_str[:-4]
+            idx = np.asarray(arr["peak_list"][i], dtype=int)
+            # Tolerate stale matches: drop indices that no longer exist
+            # in fitted_peaks (e.g. fitting was re-run after matching).
+            # Physics-audit F-04 is closed at the *write* side — the
+            # ``pipeline.execute`` pre-flight clears matched_* on every
+            # entry/frame before run_fitting rewrites fitted_peaks, so
+            # this clamp should never fire on files produced by the
+            # current GUI. Kept as defence-in-depth for files written
+            # by older GUI builds (or external tooling) where matches
+            # may still reference stale fitted positions.
+            idx = idx[(idx >= 0) & (idx < n_fit)]
+            if idx.size == 0:
+                continue
+            subset = PeakTable(
+                q_xy=fitted_peaks.q_xy[idx],
+                q_z=fitted_peaks.q_z[idx],
+                angle=fitted_peaks.angle[idx],
+                radius=fitted_peaks.radius[idx],
+                angle_width=fitted_peaks.angle_width[idx],
+                radius_width=fitted_peaks.radius_width[idx],
+                is_ring=fitted_peaks.is_ring[idx],
+                ids=fitted_peaks.ids[idx],
+                score=fitted_peaks.score[idx],
+                amplitude=fitted_peaks.amplitude[idx],
+            )
+            out.append(
+                MatchedStructure(
+                    solution_field=name,
+                    local_idx=i,
+                    cif=cif_str,
+                    h=int(arr["h"][i]),
+                    k=int(arr["k"][i]),
+                    l=int(arr["l"][i]),
+                    probability=float(arr["probability"][i]),
+                    peaks=subset,
+                    peak_list=idx,
+                )
+            )
+    return out
+
+
 def load_matched_peaks(
     file_path: Path,
     entry: str,
     frame: int,
     fitted_peaks: PeakTable | None,
 ) -> list[MatchedStructure]:
-    """Read all ``matched_*`` solutions for a frame.
+    """Open ``file_path`` and read a frame's matched solutions.
 
     Each row of each ``matched_*`` dataset becomes one ``MatchedStructure``.
-    Returns an empty list when the file has no matches for this frame, or when
-    ``fitted_peaks`` is None — peak_list indices reference the frame's
-    fitted_peaks, so without them the matched peaks have no geometry.
+    Returns an empty list when the file has no matches for this frame, or
+    when ``fitted_peaks`` is None — peak_list indices reference the frame's
+    fitted_peaks, so without them the matched peaks have no geometry. See
+    ``read_matched_peaks`` for the open-handle variant the viewer uses.
     """
     if fitted_peaks is None or len(fitted_peaks) == 0:
         return []
-    frame_key = FRAME_KEY_FMT.format(frame)
-    n_fit = len(fitted_peaks)
-    out: list[MatchedStructure] = []
     with h5py.File(file_path, "r") as f:
-        group_path = f"{entry}/{ANALYSIS_REL}/{frame_key}"
-        if group_path not in f:
-            return out
-        group = f[group_path]
-        for name in sorted(group.keys()):
-            if not name.startswith("matched_"):
-                continue
-            ds = group[name]
-            arr = ds[()]
-            for i in range(len(arr)):
-                cif_raw = arr["CIF"][i]
-                cif_str = (
-                    cif_raw.decode("utf-8", errors="replace")
-                    if isinstance(cif_raw, bytes)
-                    else str(cif_raw)
-                )
-                # Strip the .cif extension for display.
-                if cif_str.lower().endswith(".cif"):
-                    cif_str = cif_str[:-4]
-                idx = np.asarray(arr["peak_list"][i], dtype=int)
-                # Tolerate stale matches: drop indices that no longer exist
-                # in fitted_peaks (e.g. fitting was re-run after matching).
-                # Physics-audit F-04 is closed at the *write* side — the
-                # ``pipeline.execute`` pre-flight clears matched_* on every
-                # entry/frame before run_fitting rewrites fitted_peaks, so
-                # this clamp should never fire on files produced by the
-                # current GUI. Kept as defence-in-depth for files written
-                # by older GUI builds (or external tooling) where matches
-                # may still reference stale fitted positions.
-                idx = idx[(idx >= 0) & (idx < n_fit)]
-                if idx.size == 0:
-                    continue
-                subset = PeakTable(
-                    q_xy=fitted_peaks.q_xy[idx],
-                    q_z=fitted_peaks.q_z[idx],
-                    angle=fitted_peaks.angle[idx],
-                    radius=fitted_peaks.radius[idx],
-                    angle_width=fitted_peaks.angle_width[idx],
-                    radius_width=fitted_peaks.radius_width[idx],
-                    is_ring=fitted_peaks.is_ring[idx],
-                    ids=fitted_peaks.ids[idx],
-                    score=fitted_peaks.score[idx],
-                    amplitude=fitted_peaks.amplitude[idx],
-                )
-                out.append(
-                    MatchedStructure(
-                        solution_field=name,
-                        local_idx=i,
-                        cif=cif_str,
-                        h=int(arr["h"][i]),
-                        k=int(arr["k"][i]),
-                        l=int(arr["l"][i]),
-                        probability=float(arr["probability"][i]),
-                        peaks=subset,
-                        peak_list=idx,
-                    )
-                )
-    return out
+        return read_matched_peaks(f, entry, frame, fitted_peaks)
 
 
 def _add_peak_row(
@@ -1088,8 +1420,18 @@ def add_detected_peak_row(
     )
 
 
-def normalize_for_pygid(file_path: Path) -> dict[str, list[str]]:
-    """Patch every entry so pygid's per-frame writers / readers behave.
+def normalize_for_pygid(
+    file_path: Path, entry: str | None = None
+) -> dict[str, list[str]]:
+    """Patch entries so pygid's per-frame writers / readers behave.
+
+    With ``entry`` given, only that one entry is normalized; with
+    ``entry=None`` every entry is. Scoping to one entry is what keeps a
+    huge master file fast to open: reading ``data[signal].shape[0]``
+    opens that entry's external-linked scan, so doing it for all 226
+    entries up front is what froze the GUI. The GUI now normalizes
+    lazily — one entry, just before its first pipeline run (see
+    ``MainWindow._ensure_entry_normalized``).
 
     Two normalizations are applied to the temp copy (the original file
     is never touched):
@@ -1117,7 +1459,11 @@ def normalize_for_pygid(file_path: Path) -> dict[str, list[str]]:
     patched_angle: list[str] = []
     patched_frames: list[str] = []
     with h5py.File(file_path, "r+") as f:
-        for entry_name in list(f.keys()):
+        if entry is not None:
+            names = [entry] if entry in f else []
+        else:
+            names = list(f.keys())
+        for entry_name in names:
             if not is_entry_group_name(entry_name):
                 continue
             entry = f[entry_name]

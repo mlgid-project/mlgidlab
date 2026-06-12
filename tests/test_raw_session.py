@@ -41,11 +41,12 @@ def test_raw_session_open_happy(synthetic_raw):
     assert session.temp_path == synthetic_raw.resolve()
 
 
-@pytest.mark.gui
-def test_classify_h5_path(main_window, synthetic_nexus, synthetic_raw, tmp_path):
-    assert main_window._classify_h5_path(synthetic_nexus) == "nexus"
-    assert main_window._classify_h5_path(synthetic_raw) == "raw"
+def test_classify_h5_path(synthetic_nexus, synthetic_raw, tmp_path):
+    # Classification now lives in file_model (called off the GUI thread by
+    # CopyWorker), not on MainWindow.
+    assert file_model.classify_h5_path(synthetic_nexus) == "nexus"
+    assert file_model.classify_h5_path(synthetic_raw) == "raw"
 
     not_h5 = tmp_path / "garbage.txt"
     not_h5.write_text("not an hdf5 file")
-    assert main_window._classify_h5_path(Path(not_h5)) is None
+    assert file_model.classify_h5_path(Path(not_h5)) is None
