@@ -13,7 +13,8 @@ visual control.
 > rough edges and report issues. See [`CHANGELOG.md`](CHANGELOG.md) for
 > highlights.
 
-<!-- TODO: add a screenshot here, e.g. docs/img/overview.png -->
+A short walktrough: raw detector image to reciprocal space, then ML analysis pipeline (detect, fit, match).
+https://github.com/user-attachments/assets/4834b4b9-7297-45fb-bbeb-df201ae4b243
 
 ## Install & launch
 
