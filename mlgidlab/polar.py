@@ -152,12 +152,21 @@ def cartesian_to_polar(
     col = (Q_xy - float(q_xy[0])) / dx
     row = (Q_z - float(q_z[0])) / dy
 
+    # Out-of-box samples (polar grid points the Cartesian image does not
+    # cover) are filled with NaN, not 0. pygid already writes masked /
+    # uncovered detector pixels as NaN, so keeping the same sentinel here
+    # means "no data" is a single consistent value end to end. The viewer
+    # renders NaN as transparent and computes levels / log over finite
+    # pixels only; filling with 0 instead would paint these regions as a
+    # solid colormap-bottom (black) block, inconsistent with the NaN
+    # regions in the same frame. order=1 still smears NaN one pixel along
+    # mask/box edges, which is acceptable for display.
     polar = map_coordinates(
         image.astype(np.float32, copy=False),
         [row, col],
         order=1,
         mode="constant",
-        cval=0.0,
+        cval=np.nan,
     )
     return PolarImage(image=polar, radius=radius, angle=angle)
 

@@ -4,6 +4,21 @@ All notable changes to mlgidLAB are recorded here. Versions follow
 [PEP 440](https://peps.python.org/pep-0440/); `aN` suffixes are alpha
 pre-releases.
 
+## 0.1.0a8 — eighth alpha (2026-06-29)
+
+Bugfix alpha on `0.1.0a7`. No on-disk schema or backend changes; the
+`[pipeline]` pins are unchanged.
+
+### Fixed
+
+- **Polar view no longer mixes solid-black and transparent masked
+  regions.** Grid points outside the converted image's data box are now
+  filled with NaN (rendered transparent) instead of 0 (which painted a
+  solid colormap-bottom block), matching the NaN-masked detector pixels
+  already produced upstream. "No data" is now a single consistent value
+  end to end. Affects the polar display only; the Cartesian view is
+  unchanged.
+
 ## 0.1.0a7 — seventh alpha (2026-06-12)
 
 Feature alpha on `0.1.0a6`. Large-file and raw-file performance,
