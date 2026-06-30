@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import atexit
+import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -7,6 +10,84 @@ from typing import Literal
 
 
 SessionKind = Literal["nexus", "raw"]
+
+# NexusSession copies each opened file into its own per-session temp dir named
+# ``mlgidlab_<pid>_*`` under the system temp dir; all edits target that working
+# copy and Save copies it back. Three layers keep these from piling up in /tmp:
+#   - close()/closeEvent removes the dir on a graceful exit (the common path);
+#   - the registry + atexit handler below catch normal-exit / unhandled
+#     exceptions (anything that runs Python's atexit);
+#   - sweep_stale_temp_dirs(), called once at GUI startup, reclaims dirs left by
+#     a previous run that was killed before either of the above could run.
+# The dir name embeds the creating PID so the sweep only ever deletes dirs whose
+# owning process is gone — a concurrently running instance's dirs are untouched.
+_TEMP_DIR_PREFIX = "mlgidlab_"
+_active_temp_dirs: set[str] = set()
+_atexit_armed = False
+
+
+def _arm_atexit() -> None:
+    global _atexit_armed
+    if not _atexit_armed:
+        atexit.register(cleanup_registered_temp_dirs)
+        _atexit_armed = True
+
+
+def _register_temp_dir(path: Path) -> None:
+    _active_temp_dirs.add(str(path))
+    _arm_atexit()
+
+
+def _unregister_temp_dir(path: Path) -> None:
+    _active_temp_dirs.discard(str(path))
+
+
+def cleanup_registered_temp_dirs() -> None:
+    """Remove every still-open session temp dir.
+
+    Registered with ``atexit`` and also called explicitly by the test suite,
+    which exits via ``os._exit`` (skipping atexit)."""
+    for p in list(_active_temp_dirs):
+        shutil.rmtree(p, ignore_errors=True)
+    _active_temp_dirs.clear()
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if a process with ``pid`` exists (signal 0 probes without sending)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # PermissionError etc. -> exists but not ours
+    return True
+
+
+def sweep_stale_temp_dirs() -> int:
+    """Delete ``mlgidlab_<pid>_*`` temp dirs whose owning process is gone.
+
+    Call once at GUI startup to reclaim working copies leaked by a previous run
+    that exited without ``close()`` (crash / kill / power loss). Only PID-tagged
+    dirs whose PID is no longer alive are removed, so a concurrently running
+    instance is never disturbed. Returns the number of dirs removed."""
+    root = Path(tempfile.gettempdir())
+    me = os.getpid()
+    pat = re.compile(r"^mlgidlab_(\d+)_")
+    removed = 0
+    try:
+        candidates = list(root.glob(_TEMP_DIR_PREFIX + "*"))
+    except OSError:
+        return 0
+    for d in candidates:
+        m = pat.match(d.name)
+        if m is None or not d.is_dir():
+            continue
+        pid = int(m.group(1))
+        if pid == me or _pid_alive(pid):
+            continue
+        shutil.rmtree(d, ignore_errors=True)
+        removed += 1
+    return removed
 
 
 def _disk_signature(path: Path) -> tuple[int, int] | None:
@@ -119,7 +200,7 @@ class NexusSession(BaseSession):
         if not original.is_file():
             raise FileNotFoundError(original)
 
-        temp_dir = Path(tempfile.mkdtemp(prefix="mlgidlab_"))
+        temp_dir = Path(tempfile.mkdtemp(prefix=f"{_TEMP_DIR_PREFIX}{os.getpid()}_"))
         temp_path = temp_dir / original.name
         try:
             if progress is None:
@@ -130,6 +211,7 @@ class NexusSession(BaseSession):
             shutil.rmtree(temp_dir, ignore_errors=True)
             raise
 
+        _register_temp_dir(temp_dir)
         return cls(original_path=original, temp_path=temp_path)
 
     @staticmethod
@@ -176,12 +258,9 @@ class NexusSession(BaseSession):
 
     def close(self) -> None:
         """Delete the temp file and its per-session directory. Idempotent."""
-        parent = self.temp_path.parent
-        self.temp_path.unlink(missing_ok=True)
-        try:
-            parent.rmdir()
-        except (OSError, FileNotFoundError):
-            pass
+        temp_dir = self.temp_path.parent
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        _unregister_temp_dir(temp_dir)
 
 
 class RawSession(BaseSession):

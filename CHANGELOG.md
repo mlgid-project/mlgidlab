@@ -4,6 +4,36 @@ All notable changes to mlgidLAB are recorded here. Versions follow
 [PEP 440](https://peps.python.org/pep-0440/); `aN` suffixes are alpha
 pre-releases.
 
+## 0.1.0a9 — ninth alpha (2026-06-30)
+
+Feature + bugfix alpha on `0.1.0a8`. No on-disk schema or backend
+changes; the `[pipeline]` pins are unchanged. Converted files written by
+older mlgid versions now load and show their peaks, and ML detection
+uses the GPU by default.
+
+### Added
+
+- **Loads converted files from older mlgid versions.** Entries are now
+  recognised by `NX_class == "NXentry"`, not just an `entry`/`entry_*`
+  name, so files whose entry is named after the sample (mlgidFIT writes
+  `<sample>`) open and list their entry. Detected and fitted peaks are
+  read from the older analysis layout (`analysis/NNNNN`,
+  `detected_peaks/results`, columnar `fitted_peaks`) in addition to the
+  current pygid structured format. The current format is unchanged and
+  external-link masters stay on the fast open path.
+- **ML detection runs on the GPU by default.** When onnxruntime's CUDA
+  provider is available the detector now uses it (~0.13 s/frame vs
+  ~3.9 s on CPU) instead of being pinned to the CPU by a torch-only
+  availability check. The matching step's device handling is unchanged.
+
+### Fixed
+
+- **Per-session temporary working copies no longer pile up in the system
+  temp dir.** They are PID-tagged, removed on exit (including abnormal
+  exit, via an `atexit` handler), and any left by a killed prior run are
+  swept on startup. The test suite likewise cleans its per-run config
+  root, which previously leaked one directory per run.
+
 ## 0.1.0a8 — eighth alpha (2026-06-29)
 
 Bugfix alpha on `0.1.0a7`. No on-disk schema or backend changes; the

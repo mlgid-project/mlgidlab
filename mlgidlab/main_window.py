@@ -4572,8 +4572,17 @@ class MainWindow(QMainWindow):
                 continue
             if p:
                 parts = str(p).lstrip("/").split("/")
-                if parts and file_model.is_entry_group_name(parts[0]):
+                if not parts:
+                    return None
+                if file_model.is_entry_group_name(parts[0]):
                     return parts[0]
+                # Entry named off-convention (mlgidFIT names it <sample>):
+                # confirm parts[0] is an NXentry group via the node's file.
+                try:
+                    if parts[0] in file_model.entry_group_names(node.h5py_object.file):
+                        return parts[0]
+                except Exception:
+                    logger.debug("suppressed exception in MainWindow._node_entry_name (nxentry)", exc_info=True)
                 return None
         return None
 

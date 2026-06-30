@@ -25,8 +25,9 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 
-# A per-process temp config root. Kept for the whole session; the OS
-# cleans /tmp, and we never want test runs sharing QSettings state.
+# A per-process temp config root so test runs never share QSettings state.
+# Removed in pytest_unconfigure: that hook ends in os._exit (skipping atexit),
+# so without an explicit rmtree these would pile up in /tmp run after run.
 _CONFIG_ROOT = tempfile.mkdtemp(prefix="mlgidlab-test-config-")
 os.environ["XDG_CONFIG_HOME"] = _CONFIG_ROOT
 
@@ -89,6 +90,16 @@ def pytest_unconfigure(config):
     for a short-lived test process (no coverage plugin in the dev
     deps).
     """
+    # os._exit below skips atexit, so reclaim temp artifacts explicitly here
+    # (the final hook): the per-run config root and any session working-copy
+    # dirs a test left open. Otherwise they accumulate in /tmp across runs.
+    import shutil
+    shutil.rmtree(_CONFIG_ROOT, ignore_errors=True)
+    try:
+        from mlgidlab import session
+        session.cleanup_registered_temp_dirs()
+    except Exception:
+        pass
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(_PYTEST_EXIT_STATUS)
@@ -159,6 +170,21 @@ def main_window(qtbot):
             # genuine teardown regression still fails the suite.
             if "already deleted" not in str(exc):
                 raise
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_session_temp_dirs():
+    """Remove any NexusSession working-copy temp dir a test left open.
+
+    Many tests build ``NexusSession.open(...)`` directly without ``close()``;
+    each otherwise leaks an ``mlgidlab_*`` dir under the system temp dir
+    (atexit can't help -- ``pytest_unconfigure`` exits via ``os._exit``)."""
+    yield
+    try:
+        from mlgidlab import session
+        session.cleanup_registered_temp_dirs()
+    except Exception:
+        pass
 
 
 @pytest.fixture

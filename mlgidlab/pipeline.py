@@ -5,6 +5,8 @@ No Qt imports — keep this module independently testable.
 """
 from __future__ import annotations
 
+import contextlib
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -26,6 +28,59 @@ def is_mlgidbase_available() -> bool:
         return True
     except ImportError:
         return False
+
+
+_ONNX_GPU_PRELOADED = False
+
+
+@contextlib.contextmanager
+def detection_on_gpu():
+    """Run mlgidDETECT on the GPU whenever an onnxruntime CUDA provider exists.
+
+    mlgidDETECT decides CPU vs GPU with
+    ``"CUDAExecutionProvider" in available_providers and torch.cuda.is_available()
+    and not config.MODEL_FORCE_CPU`` (mlgiddetect/inference/inference.py). But
+    detection runs on onnxruntime, which is independent of torch: in this env
+    torch is CPU-only while ``onnxruntime-gpu`` + the CUDA/cuDNN wheels are
+    installed, so the ``torch.cuda.is_available()`` guard wrongly pins detection
+    to the CPU (~3.9 s/frame vs ~0.13 s on the GPU).
+
+    When the CUDA provider is present this (1) loads its libs via
+    ``onnxruntime.preload_dlls()`` (so no ``LD_LIBRARY_PATH`` shim is needed) and
+    (2) reports CUDA as available for the duration of the call so mlgidDETECT
+    selects ``CUDAExecutionProvider``, then restores the original. The patch is
+    scoped to detection; run_matching keeps its own (torch-based) device path,
+    which still needs a real CUDA-torch build to use the GPU.
+    """
+    try:
+        import onnxruntime as ort
+        if "CUDAExecutionProvider" not in ort.get_available_providers():
+            yield
+            return
+    except Exception:
+        yield
+        return
+
+    global _ONNX_GPU_PRELOADED
+    if not _ONNX_GPU_PRELOADED:
+        try:
+            ort.preload_dlls()  # onnxruntime >= 1.21; loads bundled nvidia libs
+        except Exception:
+            logger.debug("onnxruntime.preload_dlls() unavailable/failed", exc_info=True)
+        _ONNX_GPU_PRELOADED = True
+
+    try:
+        import torch
+    except Exception:
+        yield
+        return
+    original = torch.cuda.is_available
+    torch.cuda.is_available = lambda: True
+    logger.info("Detection: onnxruntime CUDA provider available -> using GPU")
+    try:
+        yield
+    finally:
+        torch.cuda.is_available = original
 
 
 def add_peak_kwargs_for(peak) -> dict:
@@ -211,7 +266,11 @@ def execute(file_path: Path, command: PipelineCommand) -> Any:
                 logger.debug("suppressed exception in execute", exc_info=True)
                 pass
     method = getattr(analysis, command.op_name)
-    result = method(**kwargs)
+    if command.op_name == "run_detection":
+        with detection_on_gpu():
+            result = method(**kwargs)
+    else:
+        result = method(**kwargs)
 
     # Consolidate matched_<type>_NNNN groups produced by mlgidmatch.
     # mlgidmatch returns one "solution" per consistent combination of
@@ -272,13 +331,13 @@ def _backfill_fitted_peaks_polar_to_cartesian(
     import h5py
 
     from mlgidlab import polar
-    from mlgidlab.file_model import is_entry_group_name
+    from mlgidlab.file_model import entry_group_names
 
     if entry is not None:
         entries = [entry]
     else:
         with h5py.File(file_path, "r") as f:
-            entries = sorted(k for k in f.keys() if is_entry_group_name(k))
+            entries = sorted(entry_group_names(f))
 
     patched_total = 0
     with h5py.File(file_path, "r+") as f:
@@ -365,7 +424,7 @@ def _dedupe_matched_groups(
     import h5py
     import numpy as np
 
-    from mlgidlab.file_model import is_entry_group_name
+    from mlgidlab.file_model import entry_group_names
 
     prefix = f"matched_{peaks_type}_"
 
@@ -373,7 +432,7 @@ def _dedupe_matched_groups(
         entries = [entry]
     else:
         with h5py.File(file_path, "r") as f:
-            entries = sorted(k for k in f.keys() if is_entry_group_name(k))
+            entries = sorted(entry_group_names(f))
 
     consolidated_total = 0
     with h5py.File(file_path, "r+") as f:
@@ -669,7 +728,7 @@ def _exp_params_from_nexus(
     import h5py
     import numpy as np
 
-    from mlgidlab.file_model import is_entry_group_name
+    from mlgidlab.file_model import entry_group_names
 
     # File / entry resolution: any failure at this layer is whole-
     # file-level (path bad, no q-entries inside) and falls back to
@@ -697,9 +756,7 @@ def _exp_params_from_nexus(
                 )
                 return ExpParameters(**defaults)
             else:
-                entry_names = sorted(
-                    k for k in f.keys() if is_entry_group_name(k)
-                )
+                entry_names = sorted(entry_group_names(f))
                 if not entry_names:
                     logger.warning(
                         "Geometry fallback: no entry groups in %s; "

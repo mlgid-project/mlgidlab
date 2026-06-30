@@ -7,8 +7,10 @@ returned so MainWindow can auto-open the freshly-converted file in NeXus
 mode.
 
 Group naming follows the NeXus convention the rest of mlgidLAB's
-NeXus reader expects: ``entry_NNNN`` (zero-padded, four digits). Anything
-else gets filtered out by ``file_model.is_entry_group_name``.
+NeXus reader expects: ``entry_NNNN`` (zero-padded, four digits). The reader
+also accepts off-convention names (e.g. mlgidFIT writes ``<sample>``) as
+long as the group is ``NX_class == 'NXentry'`` -- see
+``file_model.entry_group_names``.
 
 Imports of ``pygid`` are deferred so the GUI can run without it installed
 (``pipeline`` extra). No Qt imports — keep this module independently
@@ -248,10 +250,10 @@ def _validate_append_target(
 def _entry_group_name(index: int) -> str:
     """Format an HDF5 entry-group name in mlgidLAB's NeXus shape.
 
-    The downstream reader (``file_model.is_entry_group_name``) accepts
-    only ``entry`` and ``entry_*``. Every group we write must follow
-    that convention or the converted file's entries will be invisible
-    to the rest of the GUI.
+    Our own writer always uses the ``entry_NNNN`` convention. (The reader,
+    ``file_model.entry_group_names``, is more lenient and also accepts an
+    off-convention name carrying ``NX_class == 'NXentry'`` -- e.g. mlgidFIT
+    output named after the sample.)
     """
     return f"entry_{index:04d}"
 

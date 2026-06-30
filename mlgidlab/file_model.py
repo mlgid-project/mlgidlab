@@ -41,6 +41,45 @@ def is_entry_group_name(name: str) -> bool:
     don't follow the numeric-suffix convention.
     """
     return name == "entry" or name.startswith(ENTRY_PREFIX)
+
+
+def entry_group_names(f: h5py.File) -> list[str]:
+    """Top-level NeXus entry-group names, in the file's native order.
+
+    The fast path is the name convention (``entry`` / ``entry_*``), which
+    also avoids resolving external links on a master (its linked scans are
+    external links that always follow that convention). A top-level group
+    whose name does NOT follow the convention is still recognised as an
+    entry when it is a LOCAL group (never an external / soft link) carrying
+    ``NX_class == 'NXentry'`` -- e.g. a converted file whose single entry is
+    named after the sample (mlgidFIT writes ``<sample>`` rather than
+    ``entry_0000``). External links are skipped without being resolved, so
+    the open-path cost on big masters is unchanged.
+    """
+    names: list[str] = []
+    for name in f.keys():
+        if is_entry_group_name(name):
+            names.append(name)
+            continue
+        # Off-convention name: inspect ONLY local groups. getlink does not
+        # dereference, so an external/soft link (master scan) is rejected
+        # cheaply without opening it.
+        if not isinstance(f.get(name, getlink=True), h5py.HardLink):
+            continue
+        try:
+            grp = f[name]
+        except Exception:
+            continue
+        if not isinstance(grp, h5py.Group):
+            continue
+        nx_class = grp.attrs.get("NX_class")
+        if isinstance(nx_class, bytes):
+            nx_class = nx_class.decode("utf-8", errors="replace")
+        if nx_class == "NXentry":
+            names.append(name)
+    return names
+
+
 ANALYSIS_REL = "data/analysis"
 IMG_REL = "data/img_gid_q"
 QXY_REL = "data/q_xy"
@@ -161,7 +200,7 @@ def list_entry_names(file_path: Path) -> list[str]:
     pygid master every entry is a q-image scan, so the two agree there.
     """
     with h5py.File(file_path, "r") as f:
-        return [name for name in f.keys() if is_entry_group_name(name)]
+        return entry_group_names(f)
 
 
 def classify_h5_path(file_path: Path) -> str | None:
@@ -338,9 +377,7 @@ def list_entry_signals(file_path: Path) -> dict[str, str | None]:
     """
     out: dict[str, str | None] = {}
     with h5py.File(file_path, "r") as f:
-        for name in f.keys():
-            if not is_entry_group_name(name):
-                continue
+        for name in entry_group_names(f):
             data = f.get(f"{name}/data")
             if data is None:
                 out[name] = None
@@ -1093,6 +1130,78 @@ class LazyRawStack:
         )
 
 
+def _frame_analysis_group(
+    f: "h5py.File | h5py.Group", entry: str, frame: int
+) -> "h5py.Group | None":
+    """Return the per-frame analysis group, tolerating the frame-key naming of
+    the current pygid output (``frameNNNNN``) and of older mlgid output
+    (``NNNNN``)."""
+    base = f"{entry}/{ANALYSIS_REL}"
+    if base not in f:
+        return None
+    analysis = f[base]
+    for key in (FRAME_KEY_FMT.format(frame), f"{frame:05d}", str(frame)):
+        if key in analysis:
+            return analysis[key]
+    return None
+
+
+def _detected_table(group: "h5py.Group") -> "PeakTable | None":
+    """Read a frame's detected peaks from either layout: ``detected_peaks`` as
+    a structured dataset (current pygid output) or ``detected_peaks/results``
+    (older mlgid output)."""
+    obj = group.get("detected_peaks")
+    if isinstance(obj, h5py.Dataset):
+        return PeakTable.from_dataset(obj)
+    if isinstance(obj, h5py.Group) and isinstance(obj.get("results"), h5py.Dataset):
+        return PeakTable.from_dataset(obj["results"])
+    return None
+
+
+def _fitted_table(group: "h5py.Group") -> "PeakTable | None":
+    """Read a frame's fitted peaks from either layout: ``fitted_peaks`` as a
+    structured dataset (current pygid output) or a ``fitted_peaks`` group of
+    separate 1-D column datasets (older mlgid output)."""
+    obj = group.get("fitted_peaks")
+    if isinstance(obj, h5py.Dataset):
+        return PeakTable.from_dataset(obj)
+    if isinstance(obj, h5py.Group):
+        return _fitted_table_from_columns(obj)
+    return None
+
+
+def _fitted_table_from_columns(g: "h5py.Group") -> "PeakTable | None":
+    """Build a PeakTable from the older mlgid ``fitted_peaks`` group, whose
+    fields live in separate 1-D datasets (``peaks_qxy``, ``peaks_qz``,
+    ``angle``, ``radius``, …) instead of one structured array. Positions come
+    from ``peaks_qxy`` / ``peaks_qz``; ``confidence_level`` maps to ``score``;
+    ids are assigned by row order (the columnar layout has no id column)."""
+    if not (isinstance(g.get("peaks_qxy"), h5py.Dataset)
+            and isinstance(g.get("peaks_qz"), h5py.Dataset)):
+        return None
+    q_xy = np.asarray(g["peaks_qxy"][()], dtype=float)
+    n = q_xy.shape[0]
+
+    def col(name: str, dtype=float) -> np.ndarray:
+        ds = g.get(name)
+        if isinstance(ds, h5py.Dataset):
+            return np.asarray(ds[()], dtype=dtype)
+        return np.zeros(n, dtype=dtype)
+
+    return PeakTable(
+        q_xy=q_xy,
+        q_z=np.asarray(g["peaks_qz"][()], dtype=float),
+        angle=col("angle"),
+        radius=col("radius"),
+        angle_width=col("angle_width"),
+        radius_width=col("radius_width"),
+        is_ring=col("is_ring", bool),
+        ids=np.arange(n, dtype=int),
+        score=col("confidence_level"),
+        amplitude=col("amplitude"),
+    )
+
+
 def read_peaks(
     f: "h5py.File | h5py.Group", entry: str, frame: int
 ) -> dict[PeakKind, PeakTable | None]:
@@ -1107,17 +1216,17 @@ def read_peaks(
     GUI thread reads peaks through this path so entry switches / frame
     scrubs never block on that open. ``load_peaks`` is the open-by-path
     wrapper for callers without a live handle.
+
+    Tolerates both the current pygid analysis layout and the older mlgid
+    layout (see ``_frame_analysis_group`` / ``_detected_table`` /
+    ``_fitted_table``).
     """
-    frame_key = FRAME_KEY_FMT.format(frame)
     out: dict[PeakKind, PeakTable | None] = {"detected": None, "fitted": None}
-    group_path = f"{entry}/{ANALYSIS_REL}/{frame_key}"
-    if group_path not in f:
+    group = _frame_analysis_group(f, entry, frame)
+    if group is None:
         return out
-    group = f[group_path]
-    if "detected_peaks" in group:
-        out["detected"] = PeakTable.from_dataset(group["detected_peaks"])
-    if "fitted_peaks" in group:
-        out["fitted"] = PeakTable.from_dataset(group["fitted_peaks"])
+    out["detected"] = _detected_table(group)
+    out["fitted"] = _fitted_table(group)
     return out
 
 
@@ -1177,13 +1286,11 @@ def read_matched_peaks(
     ``read_peaks`` for why the open handle matters)."""
     if fitted_peaks is None or len(fitted_peaks) == 0:
         return []
-    frame_key = FRAME_KEY_FMT.format(frame)
     n_fit = len(fitted_peaks)
     out: list[MatchedStructure] = []
-    group_path = f"{entry}/{ANALYSIS_REL}/{frame_key}"
-    if group_path not in f:
+    group = _frame_analysis_group(f, entry, frame)
+    if group is None:
         return out
-    group = f[group_path]
     for name in sorted(group.keys()):
         if not name.startswith("matched_"):
             continue
@@ -1462,10 +1569,8 @@ def normalize_for_pygid(
         if entry is not None:
             names = [entry] if entry in f else []
         else:
-            names = list(f.keys())
+            names = entry_group_names(f)
         for entry_name in names:
-            if not is_entry_group_name(entry_name):
-                continue
             entry = f[entry_name]
             # Look up n_frames from the entry's primary signal dataset.
             data = entry.get("data")

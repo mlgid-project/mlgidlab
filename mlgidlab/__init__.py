@@ -15,7 +15,7 @@ os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 
 from PySide6.QtWidgets import QApplication
 
-__version__ = "0.1.0a8"
+__version__ = "0.1.0a9"
 
 
 def main() -> int:
@@ -25,6 +25,19 @@ def main() -> int:
     from mlgidlab.theme import apply_dark_theme, apply_light_theme
 
     app = QApplication(sys.argv)
+    # Reclaim working-copy temp dirs leaked by a previous run that was killed
+    # before its graceful close ran (see mlgidlab.session). Only removes dirs
+    # whose owning PID is dead, so a second running instance is left alone.
+    try:
+        import logging
+        from mlgidlab import session as _session
+        _n = _session.sweep_stale_temp_dirs()
+        if _n:
+            logging.getLogger("mlgidlab").info(
+                "Reclaimed %d stale temp working-copy dir(s) from a prior run.", _n
+            )
+    except Exception:
+        pass
     # Set both org + app names so QSettings has a stable key path on
     # every platform (used by the Recent files menu, may grow other
     # persisted preferences over time).
